@@ -1,0 +1,231 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 23:17:42 +0000
+Subject: [PATCH 115/138] media: apple: t7000 ISP: IO command send, mailbox
+ IRQ, poll worker
+
+WIP piece 2: isp_cmd_send() on the type 0 IO ring (words 1/2 then word0 =
+fw-rel packet address, doorbell, done when the fw sets bit0; bounded wait
+that keeps servicing the other rings), the hand-mapped AIC IRQ 91 (hard
+half acks 0x40100 -> 0xc050c, storm guard) and the delayed-work poller.
+All-zero fw->host slots are treated as not yet initialised.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../media/platform/apple/isp-t7000/isp-ipc.c  | 180 +++++++++++++++++-
+ drivers/media/platform/apple/isp-t7000/isp.h  |   1 -
+ 2 files changed, 179 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-ipc.c b/drivers/media/platform/apple/isp-t7000/isp-ipc.c
+index e27830d9f..ae471bbcb 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-ipc.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-ipc.c
+@@ -122,6 +122,14 @@ static int isp_drain(struct t7000_isp *isp, struct isp_chan *c)
+ 		dma_rmb();
+ 		w1 = READ_ONCE(m[1]);
+ 		w2 = READ_ONCE(m[2]);
++		/*
++		 * The kext never initialises fw->host rings (only type 0 ones), so
++		 * the fw must write word0 = 1 into them. An all-zero slot means it
++		 * has not done that yet: leave the ring alone instead of treating
++		 * zeroed memory as a NULL alloc / NULL string.
++		 */
++		if (!w0 && !w1 && !w2)
++			break;
+ 		c->msgs++;
+ 		done++;
+ 		if (c->type == CHAN_REPORT) {
+@@ -163,10 +171,180 @@ int isp_service(struct t7000_isp *isp)
+ 	for (i = 0; i < isp->nchans; i++) {
+ 		struct isp_chan *c = &isp->chans[i];
+ 
+-		if (c->skip || !c->ring || c->type == CHAN_CMD)
++		if (!c->ring || c->type == CHAN_CMD)
+ 			continue;
+ 		n += isp_drain(isp, c);
+ 	}
+ 	isp_dart_fault(isp);
+ 	return n;
+ }
++
++/*
++ * Send one command on the IO ring. @pkt must hold max(insize, outsize) bytes
++ * (opcode u16 at +4); with @wait the fw's output is copied back into it and the
++ * u16 status at +6 is returned in @status. While waiting (isp_cmd_timeout_ms,
++ * iOS: 2 s) the other rings keep being serviced, so SHAREDMALLOC requests made
++ * while handling the command are answered. Called with isp->lock held.
++ */
++int isp_cmd_send(struct t7000_isp *isp, void *pkt, u32 insize, u32 outsize,
++		 bool wait, u16 *status)
++{
++	struct isp_chan *c = isp->io;
++	unsigned long start, end;
++	u32 *m, rel, w0, slot, seq;
++	u8 *buf;
++	u16 op;
++
++	if (!c || !isp->ipc)
++		return -ENODEV;
++	if (isp->io_dead) {
++		dev_err(isp->dev, "IO: the fw stopped answering earlier, not sending\n");
++		return -EIO;
++	}
++	if (insize < 8 || insize > ISP_CMD_BUF_SIZE || outsize > ISP_CMD_BUF_SIZE)
++		return -EINVAL;
++	op = ((u16 *)pkt)[2];
++	seq = ++isp->cmd_seq;
++	slot = c->idx;
++	m = isp_slot(c, slot);
++	w0 = READ_ONCE(m[0]);
++	if (!(w0 & 1)) {
++		dev_err(isp->dev, "cmd #%u opcode 0x%04x: IO slot %u still owned by the fw (word0 0x%08x)\n",
++			seq, op, slot, w0);
++		return -EBUSY;
++	}
++	buf = (u8 *)isp->ipc->virt + isp->cmd_off;
++	rel = isp_rel(isp->ipc->iova + isp->cmd_off);	/* 64-byte aligned: bit0 = 0 */
++	memset(buf, 0, max(insize, outsize));
++	memcpy(buf, pkt, insize);
++	WRITE_ONCE(m[1], insize);
++	WRITE_ONCE(m[2], outsize);
++	dma_wmb();
++	WRITE_ONCE(m[0], rel);		/* word0 last: hands the slot to the fw */
++	isp_doorbell(isp, c);
++	c->idx = (slot + 1) % c->num;
++	c->msgs++;
++	dev_info(isp->dev, "cmd #%u opcode 0x%04x: IO slot %u, packet fw-rel 0x%08x, in 0x%x out 0x%x%s\n",
++		 seq, op, slot, rel, insize, outsize, wait ? "" : " (not waiting)");
++	if (!wait)
++		return 0;
++
++	start = jiffies;
++	end = start + msecs_to_jiffies(isp_cmd_timeout_ms);
++	for (;;) {
++		w0 = READ_ONCE(m[0]);
++		if (w0 & 1)
++			break;
++		isp_service(isp);
++		if (isp_dart_fault(isp)) {
++			dev_err(isp->dev, "cmd #%u opcode 0x%04x: DART fault while waiting\n", seq, op);
++			isp->io_dead = true;
++			isp_log_window(isp, "on cmd fault");
++			return -EIO;
++		}
++		if (time_after(jiffies, end)) {
++			dev_err(isp->dev, "cmd #%u opcode 0x%04x: TIMEOUT after %u ms, IO slot %u word0 0x%08x mbox pending 0x%08x\n",
++				seq, op, isp_cmd_timeout_ms, slot, w0,
++				isp_rd(isp, ISP_MBOX_PENDING));
++			isp->io_dead = true;
++			isp_log_window(isp, "on cmd timeout");
++			isp_dart_log(isp, "on cmd timeout");
++			return -ETIMEDOUT;
++		}
++		usleep_range(1000, 2000);
++	}
++	dma_rmb();
++	if (outsize)
++		memcpy(pkt, buf, outsize);
++	op = ((u16 *)buf)[2];
++	if (status)
++		*status = ((u16 *)buf)[3];
++	dev_info(isp->dev, "cmd #%u opcode 0x%04x: done after %u ms, word0 0x%08x w1 0x%x w2 0x%x, status 0x%04x\n",
++		 seq, op, jiffies_to_msecs(jiffies - start), w0, READ_ONCE(m[1]),
++		 READ_ONCE(m[2]), ((u16 *)buf)[3]);
++	isp_service(isp);
++	return 0;
++}
++
++/* Hard half: ack the mailbox (as the kext ISR does) and hand off to the thread. */
++static irqreturn_t isp_irq_hard(int irq, void *data)
++{
++	struct t7000_isp *isp = data;
++	u32 pending = isp_rd(isp, ISP_MBOX_PENDING);
++
++	if (!pending)
++		return IRQ_NONE;
++	isp_wr(isp, ISP_MBOX_ACK, pending);
++	if (atomic_inc_return(&isp->irq_count) == ISP_IRQ_STORM) {
++		disable_irq_nosync(irq);
++		dev_err(isp->dev, "IRQ %d: %d interrupts, disabling it (the poll worker keeps going)\n",
++			irq, ISP_IRQ_STORM);
++	}
++	return IRQ_WAKE_THREAD;
++}
++
++static irqreturn_t isp_irq_thread(int irq, void *data)
++{
++	struct t7000_isp *isp = data;
++
++	mutex_lock(&isp->lock);
++	isp_service(isp);
++	mutex_unlock(&isp->lock);
++	return IRQ_HANDLED;
++}
++
++/* AIC IRQ 91 by hand: there is no DT node in standalone mode. */
++static int isp_irq_setup(struct t7000_isp *isp)
++{
++	struct of_phandle_args args = {
++		.args_count = 3,
++		.args = { 0 /* AIC_IRQ */, ISP_AIC_IRQ, IRQ_TYPE_LEVEL_HIGH },
++	};
++	unsigned int virq;
++	int ret;
++
++	args.np = of_find_compatible_node(NULL, NULL, "apple,aic");
++	if (!args.np) {
++		dev_err(isp->dev, "irq=1: no apple,aic node\n");
++		return -ENODEV;
++	}
++	virq = irq_create_of_mapping(&args);
++	of_node_put(args.np);
++	if (!virq) {
++		dev_err(isp->dev, "irq=1: mapping AIC IRQ %d failed\n", ISP_AIC_IRQ);
++		return -ENXIO;
++	}
++	ret = request_threaded_irq(virq, isp_irq_hard, isp_irq_thread, IRQF_ONESHOT,
++				   "apple-isp-t7000", isp);
++	if (ret) {
++		dev_err(isp->dev, "irq=1: request_threaded_irq(%u) = %d\n", virq, ret);
++		irq_dispose_mapping(virq);
++		return ret;
++	}
++	isp->irq = virq;
++	dev_info(isp->dev, "AIC IRQ %d = virq %u requested\n", ISP_AIC_IRQ, virq);
++	return 0;
++}
++
++static uint isp_poll_interval(struct t7000_isp *isp)
++{
++	return isp->irq >= 0 ? ISP_IRQ_SAFETY_MS : max_t(uint, isp_poll_ms, 5);
++}
++
++static void isp_poll_fn(struct work_struct *work)
++{
++	struct t7000_isp *isp = container_of(to_delayed_work(work), struct t7000_isp,
++					     poll_work);
++	int n = 0;
++
++	mutex_lock(&isp->lock);
++	if (READ_ONCE(isp->poll_on))
++		n = isp_service(isp);
++	mutex_unlock(&isp->lock);
++	if (n && isp->irq >= 0)
++		dev_info_ratelimited(isp->dev, "safety poll handled %d message(s) the IRQ did not (irqs so far: %d)\n",
++				     n, atomic_read(&isp->irq_count));
++	if (READ_ONCE(isp->poll_on))
++		schedule_delayed_work(&isp->poll_work,
++				      msecs_to_jiffies(isp_poll_interval(isp)));
++}
+diff --git a/drivers/media/platform/apple/isp-t7000/isp.h b/drivers/media/platform/apple/isp-t7000/isp.h
+index f3369d4b3..38a6aa0fb 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp.h
++++ b/drivers/media/platform/apple/isp-t7000/isp.h
+@@ -115,7 +115,6 @@ struct isp_chan {
+ 	u8 *ring;		/* CPU view of num * 0x40 bytes */
+ 	u32 idx;		/* next slot to send (cmd) or to look at (reply/report) */
+ 	unsigned long msgs;
+-	bool skip;		/* ring looked uninitialised at stage 7: not serviced */
+ };
+ 
+ struct t7000_isp {

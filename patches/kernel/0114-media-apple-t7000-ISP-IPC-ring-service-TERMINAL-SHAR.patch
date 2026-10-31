@@ -1,0 +1,238 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 23:16:06 +0000
+Subject: [PATCH 114/138] media: apple: t7000 ISP: IPC ring service (TERMINAL,
+ SHAREDMALLOC)
+
+WIP piece 1 of the stage 7-9 IPC code: slot helpers, TERMINAL printing
+(bounded to 0x80 bytes), SHAREDMALLOC alloc/free through the mini DART,
+generic type 1/2 drain and the service pass (mailbox ack 0x40100 ->
+0xc050c).
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../media/platform/apple/isp-t7000/isp-ipc.c  | 172 ++++++++++++++++++
+ drivers/media/platform/apple/isp-t7000/isp.h  |  10 +-
+ 2 files changed, 181 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/media/platform/apple/isp-t7000/isp-ipc.c
+
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-ipc.c b/drivers/media/platform/apple/isp-t7000/isp-ipc.c
+new file mode 100644
+index 000000000..e27830d9f
+--- /dev/null
++++ b/drivers/media/platform/apple/isp-t7000/isp-ipc.c
+@@ -0,0 +1,172 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Apple A8 (T7000) ISP: IPC rings (stage 7), commands (8, 9), graceful shutdown.
++ *
++ * Slots are 0x40 bytes of u32 words, word0 written last (kext 0x846b060/b138/b248/b364):
++ *  - type 0 (host -> fw command, IO): every slot primed with word0 = 1 in stage 6
++ *    (= free). Send: word1 = insize, word2 = outsize, then word0 = fw-rel packet
++ *    address (bit0 = 0), doorbell 1 << src. Done when the fw sets bit0 again.
++ *  - type 1 (fw request needing a reply, SHAREDMALLOC / IO_T2H): present when
++ *    bit0 == 0; the host replies in the same slot, word0 = value | 1 (words 1/2
++ *    echoed), then the doorbell.
++ *  - type 2 (fw report, TERMINAL): present when bit0 == 0; consume with
++ *    word0 = 1, no doorbell.
++ * All addresses are fw-relative (IOVA - fw IOVA). Nothing here is verified on hw.
++ */
++#include <linux/delay.h>
++#include <linux/interrupt.h>
++#include <linux/irq.h>
++#include <linux/irqdomain.h>
++#include <linux/jiffies.h>
++#include <linux/of.h>
++#include <linux/of_irq.h>
++#include <linux/platform_device.h>
++#include <linux/sizes.h>
++#include <linux/string.h>
++
++#include "isp.h"
++
++#define ISP_AIC_IRQ		91	/* ADT isp interrupts[0]; the kext uses only index 0 */
++#define ISP_TERM_MAX		0x80	/* kext caps TERMINAL strings at 0x80 */
++#define ISP_SM_MAX		SZ_32M	/* largest single SHAREDMALLOC we honour */
++#define ISP_IRQ_STORM		100000	/* give up on the IRQ after this many */
++#define ISP_IRQ_SAFETY_MS	1000	/* poll interval while the IRQ is in use */
++
++static inline u32 *isp_slot(struct isp_chan *c, u32 i)
++{
++	return (u32 *)(c->ring + i * ISP_MSG_SIZE);
++}
++
++static void isp_doorbell(struct t7000_isp *isp, struct isp_chan *c)
++{
++	dma_wmb();
++	isp_wr(isp, ISP_DOORBELL, BIT(c->src));
++}
++
++/* TERMINAL: word0 & ~3 = fw-rel string, word1 = length */
++static void isp_terminal(struct t7000_isp *isp, u32 rel, u32 len)
++{
++	char buf[ISP_TERM_MAX + 1];
++	const char *p;
++	u32 i;
++
++	if (!len)
++		return;
++	len = min_t(u32, len, ISP_TERM_MAX);
++	p = isp_translate(isp, rel, len);
++	if (!p) {
++		dev_warn_ratelimited(isp->dev, "TERMINAL: string at fw-rel 0x%08x len %u is outside every surface\n",
++				     rel, len);
++		return;
++	}
++	memcpy(buf, p, len);
++	buf[len] = 0;
++	len = strnlen(buf, len);
++	while (len && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
++		buf[--len] = 0;
++	for (i = 0; i < len; i++)
++		if (buf[i] < 0x20 || buf[i] > 0x7e)
++			buf[i] = '.';
++	dev_info(isp->dev, "ISPCPU: %s\n", buf);
++}
++
++/*
++ * SHAREDMALLOC request: word0 == 0 -> alloc (word1 size, word2 4cc tag),
++ * reply word0 = fw-rel address | 1. word0 != 0 -> free that address, reply 1.
++ * A failed alloc replies 1 (= NULL) so the fw sees a failure, not a hang.
++ */
++static u32 isp_sm_request(struct t7000_isp *isp, u32 w0, u32 size, u32 tag)
++{
++	u32 rel = w0 & ~3U;
++	struct isp_surf *s;
++
++	if (!rel) {
++		if (!size || size > ISP_SM_MAX) {
++			dev_err(isp->dev, "SHAREDMALLOC: implausible size 0x%x '%4.4s', replying NULL\n",
++				size, (char *)&tag);
++			return 1;
++		}
++		s = isp_surf_alloc(isp, max_t(u32, size, 0x1000), tag);
++		if (!s) {
++			dev_err(isp->dev, "SHAREDMALLOC: alloc 0x%x '%4.4s' failed, replying NULL\n",
++				size, (char *)&tag);
++			return 1;
++		}
++		s->sm = true;
++		dev_info(isp->dev, "SHAREDMALLOC: alloc 0x%x '%4.4s' -> fw-rel 0x%08x\n",
++			 size, (char *)&tag, isp_rel(s->iova));
++		return isp_rel(s->iova) | 1;
++	}
++	s = isp_surf_find(isp, isp_fw_iova + rel);
++	if (!s || !s->sm || s->iova != isp_fw_iova + rel) {
++		dev_warn(isp->dev, "SHAREDMALLOC: free of unknown fw-rel 0x%08x ignored\n", rel);
++		return 1;
++	}
++	dev_info(isp->dev, "SHAREDMALLOC: free fw-rel 0x%08x (0x%x '%4.4s')\n", rel, s->size,
++		 (char *)&s->tag);
++	isp_surf_free(isp, s);
++	return 1;
++}
++
++/* Handle every pending message of one type 1/2 ring; returns how many. */
++static int isp_drain(struct t7000_isp *isp, struct isp_chan *c)
++{
++	u32 n, *m, w0, w1, w2, reply;
++	int done = 0;
++
++	for (n = 0; n < c->num; n++) {
++		m = isp_slot(c, c->idx);
++		w0 = READ_ONCE(m[0]);
++		if (w0 & 1)
++			break;		/* slot is host-owned: nothing pending */
++		dma_rmb();
++		w1 = READ_ONCE(m[1]);
++		w2 = READ_ONCE(m[2]);
++		c->msgs++;
++		done++;
++		if (c->type == CHAN_REPORT) {
++			if (c == isp->tm)
++				isp_terminal(isp, w0 & ~3U, w1);
++			else
++				dev_info(isp->dev, "report '%s'[%u]: %08x %08x %08x\n",
++					 c->name, c->idx, w0, w1, w2);
++			WRITE_ONCE(m[0], 1);	/* consume, no doorbell */
++		} else {
++			if (c == isp->sm) {
++				reply = isp_sm_request(isp, w0, w1, w2);
++			} else {
++				if (c == isp->tm)
++					isp_terminal(isp, w0 & ~3U, w1);
++				else
++					dev_info(isp->dev, "request '%s'[%u]: %08x %08x %08x (acked)\n",
++						 c->name, c->idx, w0, w1, w2);
++				reply = w0 | 1;
++			}
++			dma_wmb();
++			WRITE_ONCE(m[0], reply);
++			isp_doorbell(isp, c);
++		}
++		c->idx = (c->idx + 1) % c->num;
++	}
++	return done;
++}
++
++/* One service pass: ack the mailbox, drain all fw->host rings, check the DART. */
++int isp_service(struct t7000_isp *isp)
++{
++	u32 pending, i;
++	int n = 0;
++
++	pending = isp_rd(isp, ISP_MBOX_PENDING);
++	if (pending)
++		isp_wr(isp, ISP_MBOX_ACK, pending);
++	for (i = 0; i < isp->nchans; i++) {
++		struct isp_chan *c = &isp->chans[i];
++
++		if (c->skip || !c->ring || c->type == CHAN_CMD)
++			continue;
++		n += isp_drain(isp, c);
++	}
++	isp_dart_fault(isp);
++	return n;
++}
+diff --git a/drivers/media/platform/apple/isp-t7000/isp.h b/drivers/media/platform/apple/isp-t7000/isp.h
+index df79441d2..f3369d4b3 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp.h
++++ b/drivers/media/platform/apple/isp-t7000/isp.h
+@@ -102,6 +102,7 @@ struct isp_surf {
+ 	u32 iova;		/* absolute DART IOVA */
+ 	u32 size;		/* multiple of PAGE_SIZE */
+ 	u32 tag;		/* 4cc, for logs */
++	bool sm;		/* allocated by a SHAREDMALLOC request */
+ 	unsigned int npages;
+ 	struct page **pages;
+ 	dma_addr_t *dma;
+@@ -114,6 +115,7 @@ struct isp_chan {
+ 	u8 *ring;		/* CPU view of num * 0x40 bytes */
+ 	u32 idx;		/* next slot to send (cmd) or to look at (reply/report) */
+ 	unsigned long msgs;
++	bool skip;		/* ring looked uninitialised at stage 7: not serviced */
+ };
+ 
+ struct t7000_isp {
+@@ -148,7 +150,10 @@ struct t7000_isp {
+ 
+ 	/* runtime */
+ 	struct delayed_work poll_work;
+-	bool poll_on;
++	bool poll_init, poll_on;
++	bool started;		/* START acked */
++	bool io_dead;		/* an IO command timed out: fw not answering */
++	u32 cmd_seq;
+ 	int irq;
+ 	atomic_t irq_count;
+ 	unsigned long dart_err_logged;
+@@ -204,6 +209,9 @@ int isp_stage_chans(struct t7000_isp *isp);
+ void isp_cpu_stop(struct t7000_isp *isp);
+ 
+ /* isp-ipc.c */
++int isp_service(struct t7000_isp *isp);
++int isp_cmd_send(struct t7000_isp *isp, void *pkt, u32 insize, u32 outsize,
++		 bool wait, u16 *status);
+ int isp_stage_mbox(struct t7000_isp *isp);
+ int isp_stage_start(struct t7000_isp *isp);
+ int isp_stage_query(struct t7000_isp *isp);

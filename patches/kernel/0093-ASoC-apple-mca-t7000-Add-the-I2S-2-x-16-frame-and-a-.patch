@@ -1,0 +1,203 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 23:04:12 +0000
+Subject: [PATCH 093/138] ASoC: apple: mca-t7000: Add the I2S 2 x 16 frame and
+ a shim SRAM offset
+
+iOS records the microphones through the CS42L67's ASP on MCA0: I2S, two
+16-bit slots, MCA0 the clock master with MCLK out (ADT cfg 0x11/0).
+Accept SND_SOC_DAIFMT_I2S and use frame config 0x0f10130c for it
+(FSYNC 16 bits, 2 slots, BCLK = NCO / 8 so the NCO stays at 12.288 MHz,
+bits 2/3 as iOS derives them for cfg 0x11/0), capture from slot 0, at
+most 2 channels.
+
+Two MCAs running at once must not share shim SRAM. Add an optional
+apple,shim-sram-offset (bytes into both 0x400-byte pools) and put it in
+the low half of the FIFO window word, as the SIO firmware's bump
+allocator does. MCA2 keeps offset 0.
+
+Untested on hardware.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../bindings/sound/apple,t7000-mca.yaml       |  9 +++
+ sound/soc/apple/mca-t7000.c                   | 65 +++++++++++++++----
+ 2 files changed, 61 insertions(+), 13 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/sound/apple,t7000-mca.yaml b/Documentation/devicetree/bindings/sound/apple,t7000-mca.yaml
+index d65911708..5219c4ef7 100644
+--- a/Documentation/devicetree/bindings/sound/apple,t7000-mca.yaml
++++ b/Documentation/devicetree/bindings/sound/apple,t7000-mca.yaml
+@@ -51,6 +51,15 @@ properties:
+     description:
+       I2S switch pin group the port is routed to. Defaults to the MCA index.
+ 
++  apple,shim-sram-offset:
++    $ref: /schemas/types.yaml#/definitions/uint32
++    maximum: 0x3fc
++    multipleOf: 4
++    default: 0
++    description:
++      Byte offset of this MCA's FIFOs in the TX and RX shim SRAM pools
++      (0x400 bytes each), so that MCAs running at once do not overlap.
++
+   '#sound-dai-cells':
+     enum: [0, 1]
+     description:
+diff --git a/sound/soc/apple/mca-t7000.c b/sound/soc/apple/mca-t7000.c
+index 0652994fd..e3a643e90 100644
+--- a/sound/soc/apple/mca-t7000.c
++++ b/sound/soc/apple/mca-t7000.c
+@@ -47,6 +47,11 @@
+  * iOS sets it when the two ends disagree on who is master (always for us)
+  */
+ #define  FRAME_CFG_8X16		(0x0f107000 | BIT(2))
++/*
++ * I2S, 2 x 16-bit slots (MCA0 <-> CS42L67 ASP, ADT cfg 0x11/0): FSYNC 16
++ * bits, BCLK = NCO / 8 (NCO at 12.288 MHz like MCA2), bit 3 = not DSP mode
++ */
++#define  FRAME_CFG_I2S_2X16	(0x0f101300 | BIT(3) | BIT(2))
+ #define MCA_IRQ_EN		0x10
+ #define MCA_PAD_BITS		0x14
+ #define MCA_TX_CTL		0x18
+@@ -180,6 +185,9 @@ struct mca_t7000 {
+ 	struct clk *clk;
+ 	unsigned int index;
+ 	unsigned int pin;
++	unsigned int sram_off;		/* bytes into the TX and RX shim SRAM pools */
++	u32 frame_cfg;			/* FRAME_CFG_8X16 or FRAME_CFG_I2S_2X16 */
++	bool i2s;
+ 
+ 	struct hrtimer timer;
+ 	struct mca_dir tx, rx;
+@@ -343,19 +351,19 @@ static void mca_t7000_hw_init(struct mca_t7000 *mca)
+ 	readl(mca->wrap + WRAP_FLUSH);
+ 	readl(mca->wrap + WRAP_FLUSH);
+ 	writel(XFER_16BIT, tx + SHIM_XFER);
+-	writel((fifo_bytes / 4) << 16, tx + SHIM_WINDOW);
++	writel((fifo_bytes / 4) << 16 | mca->sram_off / 4, tx + SHIM_WINDOW);
+ 	writel(fifo_bytes - 0x20, tx + SHIM_TRIGGER);
+ 	writel(0, tx + SHIM_TIMEOUT);
+ 	writel(1, tx + SHIM_ENABLE);
+ 
+-	/* the RX shim, from the separate RX SRAM pool (offset 0) */
++	/* the RX shim, from the separate RX SRAM pool */
+ 	writel(shim, mca->wrap + WRAP_SHIM_OFF_RX);
+ 	writel(0, rx + SHIM_LINK);
+ 	writel(0, rx + SHIM_ENABLE);
+ 	readl(mca->wrap + WRAP_FLUSH);
+ 	readl(mca->wrap + WRAP_FLUSH);
+ 	writel(XFER_16BIT, rx + SHIM_XFER);
+-	writel((rx_fifo_bytes / 4) << 16, rx + SHIM_WINDOW);
++	writel((rx_fifo_bytes / 4) << 16 | mca->sram_off / 4, rx + SHIM_WINDOW);
+ 	writel(1, rx + SHIM_TRIGGER);
+ 	writel(0, rx + SHIM_TIMEOUT);
+ 	writel(1, rx + SHIM_ENABLE);
+@@ -366,12 +374,12 @@ static void mca_t7000_hw_init(struct mca_t7000 *mca)
+ 	writel(0x00030004, mca->base + MCA_RX_FIFO);
+ 	writel(0, mca->base + MCA_PAD_BITS);
+ 	writel(1, mca->base + MCA_TX_MASK);
+-	writel(0xf, mca->base + MCA_RX_MASK);
++	writel(mca->i2s ? 0x3 : 0xf, mca->base + MCA_RX_MASK);
+ 	writel(0x208, mca->base + MCA_TX_CTL);
+ 	writel(RX_CTL_IDLE, mca->base + MCA_RX_CTL);
+ 	writel(1, mca->base + MCA_IRQ_EN);
+ 	writel(IRQ_STATUS_ALL, mca->base + MCA_IRQ_STATUS);
+-	writel(FRAME_CFG_8X16 | FRAME_CFG_MASTER, mca->base + MCA_FRAME_CFG);
++	writel(mca->frame_cfg | FRAME_CFG_MASTER, mca->base + MCA_FRAME_CFG);
+ 
+ 	/* route MCAn's data out to its I2S pins; the pins clock from the MCA */
+ 	writel(SWITCH_IDLE, mca->wrap + WRAP_SWITCH_AUD(mca->index));
+@@ -409,13 +417,35 @@ static void mca_t7000_hw_stop_rx(struct mca_t7000 *mca)
+ 
+ static int mca_t7000_dai_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
+ {
+-	/* the only tested frame: DSP A, MCA provides BCLK and FSYNC */
+-	if ((fmt & SND_SOC_DAIFMT_FORMAT_MASK) != SND_SOC_DAIFMT_DSP_A ||
+-	    (fmt & SND_SOC_DAIFMT_INV_MASK) != SND_SOC_DAIFMT_NB_NF ||
++	struct mca_t7000 *mca = snd_soc_dai_get_drvdata(dai);
++
++	/*
++	 * The MCA provides BCLK and FSYNC. DSP A = MCA2's 8 x 16 TDM bus
++	 * (tested); I2S = MCA0's 2 x 16 link to the codec ASP (iOS' ADT
++	 * config). All links of one MCA must agree.
++	 */
++	if ((fmt & SND_SOC_DAIFMT_INV_MASK) != SND_SOC_DAIFMT_NB_NF ||
+ 	    (fmt & SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK) != SND_SOC_DAIFMT_BP_FP)
+ 		return -EINVAL;
+ 
+-	return 0;
++	switch (fmt & SND_SOC_DAIFMT_FORMAT_MASK) {
++	case SND_SOC_DAIFMT_DSP_A:
++		mca->i2s = false;
++		mca->frame_cfg = FRAME_CFG_8X16;
++		return 0;
++	case SND_SOC_DAIFMT_I2S:
++		mca->i2s = true;
++		mca->frame_cfg = FRAME_CFG_I2S_2X16;
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++/* capture channel 1 = this slot */
++static unsigned int mca_t7000_rx_base(struct mca_t7000 *mca)
++{
++	return mca->i2s ? 0 : rx_slot_base;
+ }
+ 
+ static int mca_t7000_dai_hw_params(struct snd_pcm_substream *substream,
+@@ -432,9 +462,10 @@ static int mca_t7000_dai_hw_params(struct snd_pcm_substream *substream,
+ 	    params_channels(params) != 1)
+ 		return -EINVAL;
+ 	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE &&
+-	    rx_slot_base + params_channels(params) > 8)
++	    mca_t7000_rx_base(mca) + params_channels(params) > (mca->i2s ? 2 : 8))
+ 		return -EINVAL;
+ 
++	/* both frames: BCLK = NCO / 2 (8 x 16) or NCO / 8 (2 x 16) */
+ 	ret = clk_set_rate(mca->clk, MCA_MCLK_RATE);
+ 	if (ret)
+ 		return ret;
+@@ -458,14 +489,15 @@ static int mca_t7000_dai_prepare(struct snd_pcm_substream *substream,
+ 		 * clock. TX stays disabled until trigger; the shim link starts
+ 		 * fine late.
+ 		 */
+-		writel(FRAME_CFG_8X16 | FRAME_CFG_RUN | FRAME_CFG_MASTER,
++		writel(mca->frame_cfg | FRAME_CFG_RUN | FRAME_CFG_MASTER,
+ 		       mca->base + MCA_FRAME_CFG);
+ 	}
+ 	mca->users |= BIT(substream->stream);
+ 
+ 	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE) {
+ 		ch = substream->runtime->channels;
+-		writel(GENMASK(rx_slot_base + ch - 1, rx_slot_base),
++		writel(GENMASK(mca_t7000_rx_base(mca) + ch - 1,
++			       mca_t7000_rx_base(mca)),
+ 		       mca->base + MCA_RX_MASK);
+ 		/* the pin's data into this MCA, or RX samples nothing */
+ 		writel(SWITCH_AUD_RX(mca->pin),
+@@ -486,7 +518,7 @@ static int mca_t7000_dai_hw_free(struct snd_pcm_substream *substream,
+ 	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE)
+ 		writel(SWITCH_IDLE, mca->wrap + WRAP_SWITCH_AUD(mca->index));
+ 	if (!mca->users)
+-		writel(FRAME_CFG_8X16 | FRAME_CFG_MASTER,
++		writel(mca->frame_cfg | FRAME_CFG_MASTER,
+ 		       mca->base + MCA_FRAME_CFG);
+ 	return 0;
+ }
+@@ -834,6 +866,13 @@ static int mca_t7000_probe(struct platform_device *pdev)
+ 
+ 	mca->pin = mca->index;
+ 	of_property_read_u32(dev->of_node, "apple,i2s-pin", &mca->pin);
++	mca->frame_cfg = FRAME_CFG_8X16;
++
++	/* each pool is 0x400 bytes; MCAs that run at once need their own part */
++	of_property_read_u32(dev->of_node, "apple,shim-sram-offset", &mca->sram_off);
++	if (mca->sram_off % 4 || mca->sram_off + max(fifo_bytes, rx_fifo_bytes) > 0x400)
++		return dev_err_probe(dev, -EINVAL, "bad apple,shim-sram-offset %#x\n",
++				     mca->sram_off);
+ 
+ 	mca->clk = devm_clk_get_enabled(dev, NULL);
+ 	if (IS_ERR(mca->clk))

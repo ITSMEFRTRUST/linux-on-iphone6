@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 02:13:00 +0000
+Subject: [PATCH 136/138] media: apple: t7000 ISP: frames mapped cacheable,
+ invalidated on read() (mmap_cached)
+
+The frames were mapped write-combine, so every CPU load from them was a
+bus read; Orchard's viewfinder converter spent most of 12-15 ms per
+1632x1224 frame on that. mmap_cached=1 (default) maps them cacheable and
+invalidates the buffer's lines when read() hands it out; 0 = the old
+write-combine mapping (read at mmap time, i.e. at the next START).
+
+From orchard-camvf's 0001 patch.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../media/platform/apple/isp-t7000/isp-cdev.c | 32 +++++++++++++++++--
+ 1 file changed, 30 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-cdev.c b/drivers/media/platform/apple/isp-t7000/isp-cdev.c
+index dda224a9d..0c0fe982a 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-cdev.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-cdev.c
+@@ -11,6 +11,7 @@
+ #include <linux/mm.h>
+ #include <linux/module.h>
+ #include <linux/platform_device.h>
++#include <linux/dma-mapping.h>
+ #include <linux/poll.h>
+ #include <linux/uaccess.h>
+ #include <uapi/linux/apple-isp-t7000.h>
+@@ -62,6 +63,10 @@ static int isp_release(struct inode *inode, struct file *f)
+ 	return 0;
+ }
+ 
++static bool isp_mmap_cached = true;
++module_param_named(mmap_cached, isp_mmap_cached, bool, 0644);
++MODULE_PARM_DESC(mmap_cached, "frames mapped cacheable + invalidated on read() (default); 0 = write-combine (old)");
++
+ static long isp_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
+ {
+ 	struct t7000_isp *isp = f->private_data;
+@@ -115,6 +120,22 @@ static long isp_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
+ 	return -ENOTTY;
+ }
+ 
++/*
++ * mmap_cached=1: userspace maps the frames cacheable and the buffer's cache lines are invalidated
++ * here, when it is handed out (BUF_USER: the fw no longer writes it). The page-by-page
++ * dma_sync_single_for_cpu(FROM_DEVICE) is arm64 dcache_inval_poc over the frame: ~48 k lines for a
++ * 1632x1224 NV12 frame. Lines the CPU pulled in earlier (speculation through the linear map or the
++ * user mapping) are dropped, so the reader sees what the ISP wrote. The pages were cleaned at
++ * dma_map_page time and the user mapping is read-only, so nothing dirty is ever written back over a frame.
++ */
++static void isp_frame_sync_for_cpu(struct t7000_isp *isp, struct isp_surf *s)
++{
++	unsigned int i;
++
++	for (i = 0; i < s->npages; i++)
++		dma_sync_single_for_cpu(isp->dev, s->dma[i], PAGE_SIZE, DMA_FROM_DEVICE);
++}
++
+ static bool isp_frame_ready(struct isp_stream *st)
+ {
+ 	return READ_ONCE(st->nready) || !READ_ONCE(st->on);
+@@ -144,6 +165,8 @@ static ssize_t isp_read(struct file *f, char __user *ubuf, size_t len, loff_t *o
+ 			fr.bytesused = st->stride * st->height * 3 / 2;
+ 			fr.flags = b->filled ? 0 : ISP_FRAME_FLAG_NOT_FILLED;
+ 			spin_unlock(&st->frame_lock);
++			if (READ_ONCE(isp_mmap_cached))
++				isp_frame_sync_for_cpu(isp, b->surf);
+ 			break;
+ 		}
+ 		spin_unlock(&st->frame_lock);
+@@ -166,7 +189,11 @@ static __poll_t isp_poll(struct file *f, poll_table *wait)
+ 	return READ_ONCE(isp->st.on) ? 0 : EPOLLERR;
+ }
+ 
+-/* nbufs * bufsize, read-only, write-combine (the ISP writes it by DMA, no CPU cache) */
++/*
++ * nbufs * bufsize, read-only. Write-combine (non-cacheable) by default before mmap_cached: every CPU load
++ * from it is a bus read — Orchard's old converter read a 1632x1224 frame a byte at a time (3 M bus reads,
++ * most of 12-15 ms). mmap_cached=1 (default): cacheable, invalidated on read() (isp_frame_sync_for_cpu).
++ */
+ static int isp_mmap(struct file *f, struct vm_area_struct *vma)
+ {
+ 	struct t7000_isp *isp = f->private_data;
+@@ -184,7 +211,8 @@ static int isp_mmap(struct file *f, struct vm_area_struct *vma)
+ 		goto out;
+ 	}
+ 	vm_flags_mod(vma, VM_DONTEXPAND | VM_DONTDUMP, VM_MAYWRITE);
+-	vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
++	if (!READ_ONCE(isp_mmap_cached))
++		vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
+ 	for (pg = first; pg < first + npg && !ret; pg++, addr += PAGE_SIZE)
+ 		ret = vm_insert_page(vma, addr, st->buf[pg / per].surf->pages[pg % per]);
+ out:

@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 22:12:54 +0000
+Subject: [PATCH 002/138] arm64: dts: apple: t7000-n61: Add DRV2604 haptics
+
+The iPhone 6 has a TI DRV2604 haptic driver at address 0x5a on i2c1,
+with its enable line on GPIO 76, driving a linear resonant actuator.
+Both are taken from the Apple device tree (i2c1/vib-pwm).
+
+LRA mode was confirmed on hardware: auto-calibration passes (STATUS
+0x80) and the motor vibrates, whereas ERM mode fails calibration.
+
+The rated and overdrive voltages match what Apple's iOS 12.5.5 driver
+(AppleDRV2604Vibrator) programs: RATED_VOLTAGE = 0x61 and OD_CLAMP =
+0x97. With drv260x's mV * 255 / 5600 conversion, 2140 mV and 3320 mV
+yield exactly those register values.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ arch/arm64/boot/dts/apple/t7000-n61.dts | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/apple/t7000-n61.dts b/arch/arm64/boot/dts/apple/t7000-n61.dts
+index 10b4ca8ba..5eec5926c 100644
+--- a/arch/arm64/boot/dts/apple/t7000-n61.dts
++++ b/arch/arm64/boot/dts/apple/t7000-n61.dts
+@@ -7,8 +7,24 @@
+ /dts-v1/;
+ 
+ #include "t7000-6.dtsi"
++#include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/input/ti-drv260x.h>
+ 
+ / {
+ 	compatible = "apple,n61", "apple,t7000", "apple,arm-platform";
+ 	model = "Apple iPhone 6";
+ };
++
++&i2c1 {
++	status = "okay";
++
++	haptics@5a {
++		compatible = "ti,drv2604";
++		reg = <0x5a>;
++		enable-gpios = <&pinctrl 76 GPIO_ACTIVE_HIGH>;
++		mode = <DRV260X_LRA_MODE>;
++		library-sel = <DRV260X_LIB_LRA>;
++		vib-rated-mv = <2140>;
++		vib-overdrive-mv = <3320>;
++	};
++};

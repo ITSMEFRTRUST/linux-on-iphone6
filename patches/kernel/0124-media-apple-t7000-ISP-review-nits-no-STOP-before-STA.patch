@@ -1,0 +1,136 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 00:24:06 +0000
+Subject: [PATCH 124/138] media: apple: t7000 ISP: review nits (no STOP before
+ START, unknown ring types, alignment)
+
+- N1: the graceful shutdown skips STOP when START was never sent (stage 7
+  rmmod); POWER_DOWN + the gpio0 handshake still run (all bounded).
+- N2: the boot-args dump no longer reads word 29 past the 0x74 bytes.
+- N3: only type 1/2 rings are serviced; unknown types are never answered.
+- N4: reject a channel table or ring at a non-4-aligned fw-rel address.
+- N5: BUILD_BUG_ON(PAGE_SIZE != SZ_4K) for the surface/PTE indexing.
+- N8: SHAREDMALLOC 4cc tags are made printable before they are logged.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../media/platform/apple/isp-t7000/isp-boot.c | 20 +++++++++-------
+ .../media/platform/apple/isp-t7000/isp-dart.c |  2 ++
+ .../media/platform/apple/isp-t7000/isp-ipc.c  | 24 ++++++++++++++-----
+ 3 files changed, 32 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-boot.c b/drivers/media/platform/apple/isp-t7000/isp-boot.c
+index 6263a6989..d00234615 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-boot.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-boot.c
+@@ -241,11 +241,15 @@ int isp_stage_args(struct t7000_isp *isp)
+ 	a[5] = isp->heap ? isp->heapsize : 0;
+ 	a[6] = isp_platform_id;
+ 	a[0xf] = 0xc;
+-	for (i = 0; i < ISP_ARGS_SIZE / 4; i += 8)
+-		dev_info(isp->dev, "bootargs[%02x]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+-			 i, a[i], a[i + 1], a[i + 2], a[i + 3], a[i + 4], a[i + 5],
+-			 i + 6 < ISP_ARGS_SIZE / 4 ? a[i + 6] : 0,
+-			 i + 7 < ISP_ARGS_SIZE / 4 ? a[i + 7] : 0);
++	{
++		u32 d[32] = {};		/* 0x74 bytes = 29 words, padded for the dump */
++
++		memcpy(d, a, ISP_ARGS_SIZE);
++		for (i = 0; i < ISP_ARGS_SIZE / 4; i += 8)
++			dev_info(isp->dev, "bootargs[%02x]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
++				 i, d[i], d[i + 1], d[i + 2], d[i + 3], d[i + 4], d[i + 5],
++				 d[i + 6], d[i + 7]);
++	}
+ 	dma_wmb();
+ 	isp_wr(isp, ISP_GPIO(0), isp_rel(isp->ipc->iova + args));
+ 	dev_info(isp->dev, "gpio0 = 0x%08x (fw-rel boot args), gpio7 = 0xf7fbdff9\n",
+@@ -261,8 +265,8 @@ int isp_stage_chans(struct t7000_isp *isp)
+ 	u32 tbl = isp_rd(isp, ISP_GPIO(0)), n, j;
+ 	const u8 *d = isp_translate(isp, tbl, isp->nchans * ISP_CHAN_DESC_SIZE);
+ 
+-	if (!d) {
+-		dev_err(isp->dev, "channel table at fw-rel 0x%08x is outside every surface\n", tbl);
++	if (!d || (tbl & 3)) {
++		dev_err(isp->dev, "channel table at fw-rel 0x%08x is unaligned or outside every surface\n", tbl);
+ 		return -EIO;
+ 	}
+ 	dev_info(isp->dev, "channel table at fw-rel 0x%08x, %u channels\n", tbl, isp->nchans);
+@@ -279,7 +283,7 @@ int isp_stage_chans(struct t7000_isp *isp)
+ 		c->idx = 0;
+ 		dev_info(isp->dev, "chan %u '%s': type %u src %u num %u ring fw-rel 0x%08x\n",
+ 			 n, c->name, c->type, c->src, c->num, c->rel);
+-		if (!c->num || c->num > 1024 || c->src > 31 ||
++		if (!c->num || c->num > 1024 || c->src > 31 || (c->rel & 3) ||
+ 		    !(c->ring = isp_translate(isp, c->rel, c->num * ISP_MSG_SIZE))) {
+ 			dev_err(isp->dev, "chan %u: bad ring (num %u src %u rel 0x%x)\n",
+ 				n, c->num, c->src, c->rel);
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-dart.c b/drivers/media/platform/apple/isp-t7000/isp-dart.c
+index 3db913d8f..7f40045f1 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-dart.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-dart.c
+@@ -12,6 +12,7 @@
+ #include <linux/dma-mapping.h>
+ #include <linux/iopoll.h>
+ #include <linux/platform_device.h>
++#include <linux/sizes.h>
+ #include <linux/slab.h>
+ #include <linux/vmalloc.h>
+ 
+@@ -81,6 +82,7 @@ int isp_dart_init(struct t7000_isp *isp)
+ 	u32 m = tcr_mask(), tcr, err;
+ 	int sid, i;
+ 
++	BUILD_BUG_ON(PAGE_SIZE != SZ_4K);	/* surface pages == DART pages, 9-bit L2 index */
+ 	isp->l1 = dma_alloc_coherent(isp->dev, PAGE_SIZE, &isp->l1_dma, GFP_KERNEL);
+ 	if (!isp->l1)
+ 		return -ENOMEM;
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-ipc.c b/drivers/media/platform/apple/isp-t7000/isp-ipc.c
+index 678d67be4..86898b9de 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-ipc.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-ipc.c
+@@ -121,6 +121,12 @@ static u32 isp_sm_request(struct t7000_isp *isp, u32 w0, u32 size, u32 tag)
+ {
+ 	u32 rel = w0 & ~3U;
+ 	struct isp_surf *s;
++	u8 *t = (u8 *)&tag;
++	int i;
++
++	for (i = 0; i < 4; i++)		/* the tag is only for logs: keep dmesg printable */
++		if (t[i] < 0x20 || t[i] > 0x7e)
++			t[i] = '.';
+ 
+ 	if (!rel) {
+ 		if (size > ISP_SM_MAX) {
+@@ -225,7 +231,8 @@ int isp_service(struct t7000_isp *isp)
+ 	for (i = 0; i < isp->nchans; i++) {
+ 		struct isp_chan *c = &isp->chans[i];
+ 
+-		if (!c->ring || c->type == CHAN_CMD)
++		/* type 0 = host->fw; unknown types (>= 3) are never answered */
++		if (!c->ring || (c->type != CHAN_REPLY && c->type != CHAN_REPORT))
+ 			continue;
+ 		n += isp_drain(isp, c);
+ 	}
+@@ -642,12 +649,17 @@ void isp_fw_shutdown(struct t7000_isp *isp)
+ 		dev_warn(isp->dev, "graceful shutdown skipped: the fw is not answering IO\n");
+ 		goto out;
+ 	}
+-	ret = isp_cmd_simple(isp, "STOP", &h, sizeof(h), sizeof(h), NULL);
+-	if (ret) {
+-		dev_err(isp->dev, "STOP failed (%d): skipping POWER_DOWN, hard stop follows\n", ret);
+-		goto out;
++	if (!isp->started) {
++		dev_info(isp->dev, "START was never sent: skipping STOP\n");
++	} else {
++		ret = isp_cmd_simple(isp, "STOP", &h, sizeof(h), sizeof(h), NULL);
++		if (ret) {
++			dev_err(isp->dev, "STOP failed (%d): skipping POWER_DOWN, hard stop follows\n",
++				ret);
++			goto out;
++		}
++		isp->started = false;
+ 	}
+-	isp->started = false;
+ 	isp_wr(isp, ISP_GPIO(0), ISP_MAGIC_ARGS);
+ 	h = (struct isp_cmd_hdr){ .opcode = CISP_CMD_POWER_DOWN };
+ 	ret = isp_cmd_send(isp, &h, sizeof(h), sizeof(h), false, NULL);

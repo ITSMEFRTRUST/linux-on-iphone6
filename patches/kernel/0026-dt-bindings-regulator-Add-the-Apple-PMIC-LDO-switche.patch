@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 00:29:27 +0000
+Subject: [PATCH 026/138] dt-bindings: regulator: Add the Apple PMIC LDO
+ switches
+
+The Dialog based PMIC of the Apple A8 iPhones has enable-only LDO
+switches. Describe them as children of the PMIC; LDO15 powers the
+touch controller.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../devicetree/bindings/mfd/apple,pmic.yaml   |  3 ++
+ .../regulator/apple,adi-pmic-ldo.yaml         | 54 +++++++++++++++++++
+ 2 files changed, 57 insertions(+)
+ create mode 100644 Documentation/devicetree/bindings/regulator/apple,adi-pmic-ldo.yaml
+
+diff --git a/Documentation/devicetree/bindings/mfd/apple,pmic.yaml b/Documentation/devicetree/bindings/mfd/apple,pmic.yaml
+index 8bf64a835..578ee1f04 100644
+--- a/Documentation/devicetree/bindings/mfd/apple,pmic.yaml
++++ b/Documentation/devicetree/bindings/mfd/apple,pmic.yaml
+@@ -64,6 +64,9 @@ patternProperties:
+   "^nvmem(@[0-9a-f]+)?$":
+     $ref: /schemas/nvmem/apple,pmic-nvmem.yaml
+ 
++  "^ldo[0-9]+(@[0-9a-f]+)?$":
++    $ref: /schemas/regulator/apple,adi-pmic-ldo.yaml
++
+ required:
+   - compatible
+   - reg
+diff --git a/Documentation/devicetree/bindings/regulator/apple,adi-pmic-ldo.yaml b/Documentation/devicetree/bindings/regulator/apple,adi-pmic-ldo.yaml
+new file mode 100644
+index 000000000..d316ec55a
+--- /dev/null
++++ b/Documentation/devicetree/bindings/regulator/apple,adi-pmic-ldo.yaml
+@@ -0,0 +1,54 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/regulator/apple,adi-pmic-ldo.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Apple PMIC enable-only LDO switch
++
++maintainers:
++  - ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
++
++description:
++  An LDO of an Apple PMIC (see ../mfd/apple,pmic.yaml) that is only switched
++  on and off. The voltage is left as the bootloader configured it.
++
++properties:
++  compatible:
++    enum:
++      - apple,adi-pmic-ldo15
++
++  reg:
++    maxItems: 1
++    description:
++      Address of the register that holds the enable bit of the LDO. The
++      register size is 1.
++
++required:
++  - compatible
++  - reg
++
++allOf:
++  - $ref: regulator.yaml#
++
++unevaluatedProperties: false
++
++examples:
++  - |
++    i2c {
++        #address-cells = <1>;
++        #size-cells = <0>;
++
++        pmic@74 {
++            compatible = "apple,adi-pmic", "apple,i2c-pmic";
++            reg = <0x74>;
++            #address-cells = <1>;
++            #size-cells = <1>;
++
++            ldo15@85 {
++                compatible = "apple,adi-pmic-ldo15";
++                reg = <0x85 0x1>;
++                regulator-name = "ldo15";
++            };
++        };
++    };

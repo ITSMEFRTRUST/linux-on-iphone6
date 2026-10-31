@@ -1,0 +1,33 @@
+#!/bin/bash
+# mkwifi - build tools/wifi-user.tgz: iw + wpa_supplicant userspace for the phone (Alpine aarch64, musl),
+# minus everything the initramfs / tools/alsa.tgz already provide. Untar at / on the phone, then
+# tools/wifiup (scan / connect). Verifies the result with bin/btcheck.
+# usage: bin/mkwifi   (needs network for the apk downloads; stage lives in var/alpine/wifi, gitignored)
+set -e
+cd "$(dirname "$(readlink -f "$0")")/.."
+APK=dl/apk/x/sbin/apk.static
+[ -x $APK ] || { echo "no $APK (run ui/fetch-deps.sh first)"; exit 1; }
+R=var/alpine/wifi
+# same Alpine release as tools/alsa.tgz + tools/bt.tgz (v3.22): shared libs (libdbus, ...) stay identical
+REPO=https://dl-cdn.alpinelinux.org/alpine/${REL:-v3.22}
+rm -rf $R; mkdir -p $R
+$APK --arch aarch64 --root $R --initdb --usermode --no-scripts --allow-untrusted \
+	-X $REPO/main -X $REPO/community \
+	add iw wpa_supplicant wireless-regdb >/dev/null
+
+BINS="usr/sbin/iw sbin/wpa_supplicant sbin/wpa_cli sbin/wpa_passphrase"
+# regulatory.db: cfg80211 asks for it at boot (CONFIG_CFG80211_REQUIRE_SIGNED_REGDB accepts the kernel-signed copy)
+DATA="lib/firmware/regulatory.db lib/firmware/regulatory.db.p7s"
+
+PROV=var/alpine/provided; rm -rf $PROV; mkdir -p $PROV
+tar xzf tools/alsa.tgz -C $PROV
+mkdir -p $PROV/lib; cp -a $R/lib/ld-musl-aarch64.so.1 $R/lib/libc.musl-aarch64.so.1 $PROV/lib/   # musl is in the initramfs
+LIST=$(mktemp)
+bin/btclosure $R $PROV -- $BINS > $LIST
+for f in $DATA; do echo $f >> $LIST; done
+for f in $(cat $LIST); do [ -e $R/$f ] || [ -L $R/$f ] || { echo "missing $f"; exit 1; }; done
+sort -u $LIST -o $LIST
+tar -C $R --no-recursion --owner=0 --group=0 --numeric-owner -T $LIST -czf tools/wifi-user.tgz.new
+mv tools/wifi-user.tgz.new tools/wifi-user.tgz; rm -f $LIST
+ls -la tools/wifi-user.tgz
+bin/btcheck tools/wifi-user.tgz

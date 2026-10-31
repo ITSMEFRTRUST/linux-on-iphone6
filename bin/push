@@ -1,0 +1,4 @@
+#!/bin/bash
+# push tools/* to phone /tmp
+cd "$(dirname "$(readlink -f "$0")")/../tools" && (timeout 15 python3 -m http.server 8642 --bind 172.16.43.2 >/dev/null 2>&1 &); sleep 1
+../bin/ph "cd /tmp && for f in $*; do wget -q -O \$f http://172.16.43.2:8642/\$f && chmod +x \$f; done; ls -la /tmp"

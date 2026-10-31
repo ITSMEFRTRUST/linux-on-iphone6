@@ -1,0 +1,220 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 23:02:46 +0000
+Subject: [PATCH 068/138] cpuidle: Add a WFI idle driver for Apple A7-A11 cores
+
+Apple A7-A11 cores lose their state when they power down in idle (deep
+WFI resets the core to RVBAR), so WFI is the only idle state Linux can
+use on them without a resume path through the reset vector.
+
+Add a one-state cpuidle driver that does the same as the default arm64
+idle loop, plus what iOS does around WFI on Typhoon (A8/A8X): the iOS 12
+kernel sets HID2 bit 13 (disMMUmtlbPrefetch) before every idle WFI and
+clears it afterwards. The wfi_wa module parameter turns that off. The
+driver also gives per-state idle statistics in sysfs.
+
+HID2 is read and written back once on every CPU from process context
+before the driver registers, so a trap shows up at load time and not
+in the idle loop.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/cpuidle/Kconfig.arm     |  10 +++
+ drivers/cpuidle/Makefile        |   1 +
+ drivers/cpuidle/cpuidle-apple.c | 154 ++++++++++++++++++++++++++++++++
+ 3 files changed, 165 insertions(+)
+ create mode 100644 drivers/cpuidle/cpuidle-apple.c
+
+diff --git a/drivers/cpuidle/Kconfig.arm b/drivers/cpuidle/Kconfig.arm
+index b88b01aa5..632834e69 100644
+--- a/drivers/cpuidle/Kconfig.arm
++++ b/drivers/cpuidle/Kconfig.arm
+@@ -43,6 +43,16 @@ config ARM_PSCI_CPUIDLE_DOMAIN
+ 	  which is needed to support the hierarchical DT based layout of the
+ 	  idle states.
+ 
++config ARM_APPLE_CPUIDLE
++	tristate "CPU idle driver for Apple A7-A11 cores"
++	depends on ARM64 && (ARCH_APPLE || COMPILE_TEST)
++	help
++	  Select this to register a WFI-only CPU idle driver on Apple A7-A11
++	  cores. On A8 (Typhoon) it applies the iOS workaround around WFI
++	  (HID2 MMU prefetch disable). It also gives per-state idle statistics.
++	  Deeper states are not supported: these cores lose their state when
++	  powered down in idle.
++
+ config ARM_BIG_LITTLE_CPUIDLE
+ 	bool "Support for ARM big.LITTLE processors"
+ 	depends on ARCH_VEXPRESS_TC2_PM || ARCH_EXYNOS || COMPILE_TEST
+diff --git a/drivers/cpuidle/Makefile b/drivers/cpuidle/Makefile
+index 88cbc2a7a..76317b76c 100644
+--- a/drivers/cpuidle/Makefile
++++ b/drivers/cpuidle/Makefile
+@@ -25,6 +25,7 @@ obj-$(CONFIG_ARM_U8500_CPUIDLE)         += cpuidle-ux500.o
+ obj-$(CONFIG_ARM_AT91_CPUIDLE)          += cpuidle-at91.o
+ obj-$(CONFIG_ARM_EXYNOS_CPUIDLE)        += cpuidle-exynos.o
+ obj-$(CONFIG_ARM_CPUIDLE)		+= cpuidle-arm.o
++obj-$(CONFIG_ARM_APPLE_CPUIDLE)	+= cpuidle-apple.o
+ obj-$(CONFIG_ARM_PSCI_CPUIDLE)		+= cpuidle-psci.o
+ obj-$(CONFIG_ARM_PSCI_CPUIDLE_DOMAIN)	+= cpuidle-psci-domain.o
+ obj-$(CONFIG_ARM_TEGRA_CPUIDLE)		+= cpuidle-tegra.o
+diff --git a/drivers/cpuidle/cpuidle-apple.c b/drivers/cpuidle/cpuidle-apple.c
+new file mode 100644
+index 000000000..3d73b4bed
+--- /dev/null
++++ b/drivers/cpuidle/cpuidle-apple.c
+@@ -0,0 +1,154 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * CPU idle driver for Apple A7-A11 cores (Cyclone to Monsoon/Mistral)
++ *
++ * These cores cannot keep their state across a core power-down: "deep WFI"
++ * (CYC_OVRD WFI mode 3) resets the core to RVBAR, in EL3 on parts that have
++ * one. The boot loader (m1n1) also forces WFI to clock-gate only (CYC_OVRD
++ * ok2pwrdn = force up). Without a resume path through the reset vector the
++ * only usable state is WFI, which is what this driver provides, with two
++ * additions over the default arm64 idle loop:
++ *
++ *  - the iOS WFI workaround for Typhoon (A8/A8X): around every idle WFI the
++ *    iOS 12 kernel sets HID2 bit 13 (disMMUmtlbPrefetch) and clears it again
++ *    afterwards (typhoon_prepare_for_wfi / typhoon_return_from_wfi, for a core
++ *    that could get stuck entering WFI because of an MMU prefetch). The
++ *    wfi_wa parameter turns it off.
++ *  - cpuidle usage and residency statistics in sysfs, which the default idle
++ *    loop does not have (the time a core really spends idle).
++ *
++ * The HID2 write is the only new instruction in the idle path. The driver
++ * reads and writes back HID2 once on every CPU, in process context, before it
++ * registers, so an unexpected trap shows up as an oops in a kworker at load
++ * time and not in the idle loop.
++ */
++
++#include <linux/cpu.h>
++#include <linux/cpuidle.h>
++#include <linux/cpumask.h>
++#include <linux/module.h>
++#include <linux/moduleparam.h>
++#include <linux/of.h>
++#include <linux/smp.h>
++
++#include <asm/barrier.h>
++#include <asm/cpuidle.h>
++#include <asm/cputype.h>
++#include <asm/sysreg.h>
++
++#define SYS_IMP_APL_HID2			sys_reg(3, 0, 15, 2, 0)
++#define HID2_DIS_MMU_MTLB_PREFETCH		BIT_ULL(13)
++
++static bool wfi_wa = true;
++module_param(wfi_wa, bool, 0644);
++MODULE_PARM_DESC(wfi_wa, "Typhoon (A8/A8X): set HID2.disMMUmtlbPrefetch around WFI, as iOS does (default: on)");
++
++static bool typhoon;
++
++static const struct midr_range apple_a7_a11[] = {
++	MIDR_ALL_VERSIONS(MIDR_APPLE_A7_CYCLONE),
++	MIDR_ALL_VERSIONS(MIDR_APPLE_A8_TYPHOON),
++	MIDR_ALL_VERSIONS(MIDR_APPLE_A8X_TYPHOON),
++	MIDR_ALL_VERSIONS(MIDR_APPLE_SAMSUNG_TWISTER),
++	MIDR_ALL_VERSIONS(MIDR_APPLE_TSMC_TWISTER),
++	MIDR_ALL_VERSIONS(MIDR_APPLE_A10_T2_HURRICANE_ZEPHYR),
++	MIDR_ALL_VERSIONS(MIDR_APPLE_A10X_HURRICANE_ZEPHYR),
++	MIDR_ALL_VERSIONS(MIDR_APPLE_A11_MONSOON),
++	MIDR_ALL_VERSIONS(MIDR_APPLE_A11_MISTRAL),
++	{}
++};
++
++static const struct midr_range apple_typhoon[] = {
++	MIDR_ALL_VERSIONS(MIDR_APPLE_A8_TYPHOON),
++	MIDR_ALL_VERSIONS(MIDR_APPLE_A8X_TYPHOON),
++	{}
++};
++
++/* cpu_do_idle() is not exported: the same sequence, with the HID2 bit around it on Typhoon */
++static __cpuidle int apple_idle_enter_wfi(struct cpuidle_device *dev,
++					  struct cpuidle_driver *drv, int index)
++{
++	struct arm_cpuidle_irq_context context;
++	bool wa = typhoon && READ_ONCE(wfi_wa);
++
++	arm_cpuidle_save_irq_context(&context);
++
++	if (wa) {
++		sysreg_clear_set_s(SYS_IMP_APL_HID2, 0, HID2_DIS_MMU_MTLB_PREFETCH);
++		isb();
++	}
++
++	dsb(sy);
++	wfi();
++
++	if (wa) {
++		sysreg_clear_set_s(SYS_IMP_APL_HID2, HID2_DIS_MMU_MTLB_PREFETCH, 0);
++		dsb(sy);
++		isb();
++	}
++
++	arm_cpuidle_restore_irq_context(&context);
++
++	return index;
++}
++
++static struct cpuidle_driver apple_idle_driver = {
++	.name = "apple_idle",
++	.owner = THIS_MODULE,
++	.states[0] = {
++		.enter			= apple_idle_enter_wfi,
++		.exit_latency		= 1,
++		.target_residency	= 1,
++		.power_usage		= UINT_MAX,
++		.name			= "WFI",
++		.desc			= "WFI, clock gated",
++	},
++	.state_count = 1,
++};
++
++/* in process context on @cpu: a trap here is an oops in a kworker, not a hang in the idle loop */
++static int apple_idle_probe_hid2(void *unused)
++{
++	u64 v = read_sysreg_s(SYS_IMP_APL_HID2);
++
++	write_sysreg_s(v, SYS_IMP_APL_HID2);
++	isb();
++	return 0;
++}
++
++static int __init apple_idle_init(void)
++{
++	unsigned int cpu;
++	int ret;
++
++	if (!of_machine_is_compatible("apple,arm-platform") ||
++	    !is_midr_in_range_list(apple_a7_a11))
++		return -ENODEV;
++
++	typhoon = is_midr_in_range_list(apple_typhoon);
++	if (typhoon) {
++		for_each_online_cpu(cpu) {
++			ret = smp_call_on_cpu(cpu, apple_idle_probe_hid2, NULL, false);
++			if (ret)
++				return ret;
++		}
++	}
++
++	ret = cpuidle_register(&apple_idle_driver, NULL);
++	if (ret)
++		return ret;
++
++	pr_info("apple_idle: WFI%s\n",
++		typhoon ? (wfi_wa ? " with the Typhoon HID2 workaround" : " (Typhoon workaround off)") : "");
++	return 0;
++}
++module_init(apple_idle_init);
++
++static void __exit apple_idle_exit(void)
++{
++	cpuidle_unregister(&apple_idle_driver);
++}
++module_exit(apple_idle_exit);
++
++MODULE_DESCRIPTION("CPU idle driver for Apple A7-A11 cores");
++MODULE_LICENSE("GPL");

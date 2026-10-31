@@ -1,0 +1,86 @@
+#!/bin/bash
+# iosdisk - iOS side of the writable data area. Phone booted into iOS via checkra1n (var/no-autoboot set!),
+# SSH on usbmux port 44. Creates /private/var/linux/disk.img (preallocated, zero-filled), locks it, records
+# its physical extents + raw hashes in var/storage/ and writes var/extra-rd/etc/flashdata.conf (EXTENTS only).
+# usage: bin/iosdisk [MiB]   (default 4096)   |   bin/iosdisk sh 'cmd'
+set -e
+cd "$(dirname "$(readlink -f "$0")")/.."
+S=var/storage; mkdir -p $S
+ios() {
+	# the iOS root password is asked interactively; IOS_ASKPASS=<script> answers it for you
+	${IOS_ASKPASS:+env SSH_ASKPASS=$IOS_ASKPASS SSH_ASKPASS_REQUIRE=force} \
+	ssh -o ProxyCommand="inetcat 44" -o PreferredAuthentications=password \
+		-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR root@iphone "$@"
+}
+[ "$1" = sh ] && { shift; ios "$@"; exit; }
+MB=${1:-4096}
+F=/private/var/linux/disk.img
+tools/ios-l2p/build.sh >/dev/null
+# exec from /private/var is denied by the sandbox (Killed: 9) -> the tool lives on the rootfs
+ios 'mkdir -p /private/var/linux /usr/local/bin && cat > /usr/local/bin/l2p.new && chmod 755 /usr/local/bin/l2p.new && ldid -S /usr/local/bin/l2p.new && mv /usr/local/bin/l2p.new /usr/local/bin/l2p && rm -f /private/var/linux/l2p' < tools/ios-l2p/l2p
+ios "df -k /private/var; ls -la /private/var/linux"
+L=/usr/local/bin/l2p
+if ios "test -e $F"; then
+	echo "$F exists - mapping only"; ios "$L map $F" | grep -v '^SIZE' | tee $S/extents.txt
+else
+	ios "$L create $F $MB" | grep -v '^PREALLOC' | tee $S/extents.txt
+fi
+grep -q '^TOTAL' $S/extents.txt || { echo "no extents"; exit 1; }
+# sanity: <= 128 extents (asp.c windows), 4 KiB aligned, sum == file size
+n=$(awk '/^TOTAL/{print $2}' $S/extents.txt); tot=$(awk '/^TOTAL/{print $3}' $S/extents.txt)
+[ "$n" -le 128 ] || { echo "$n extents > 128 windows"; exit 1; }
+[ "$tot" -eq $((MB << 20)) ] || { echo "extents total $tot != $((MB << 20))"; exit 1; }
+awk '/^EXT/ && ($3 % 4096 || $4 % 4096 || $3 < 4096) {bad=1} END {exit bad}' $S/extents.txt || { echo "unaligned/negative extent"; exit 1; }
+
+# boundary test - proves the offsets are relative to disk0s1 (a whole-disk base would be 24 KiB off):
+# rewrite the file in place with a new byte; the first/last 4 KiB of each extent must change on raw
+# disk0s1, the 4 KiB just before/after must not (unless it belongs to another extent of the file).
+# Writes only through the file itself. Reads are batched into one ssh per pass.
+OFFS=$(awk '/^EXT/ {print $3 - 4096, $3, $3 + $4 - 4096, $3 + $4}' $S/extents.txt | tr '\n' ' ')
+probe() { ios "for o in $OFFS; do $L raw /dev/rdisk0s1 \$o 4096 || exit 1; done" > $1; }
+probe $S/probe-a.bin
+ios "$L fill $F $(printf 0x%02x $((RANDOM % 250 + 3)))" | grep -v '^SIZE' > $S/extents-b.txt
+diff -q <(grep ^EXT $S/extents.txt) <(grep ^EXT $S/extents-b.txt) || { echo "extents MOVED after rewrite - abort"; exit 1; }
+probe $S/probe-b.bin
+python3 -I - $S/extents.txt $S/probe-a.bin $S/probe-b.bin <<'PY' || { echo "BOUNDARY TEST FAILED - do not write from Linux"; exit 1; }
+import sys
+ext = [tuple(map(int, l.split()[2:4])) for l in open(sys.argv[1]) if l.startswith("EXT")]
+a, b = open(sys.argv[2], "rb").read(), open(sys.argv[3], "rb").read()
+assert len(a) == len(b) == len(ext) * 4 * 4096, "short probe read"
+inside = lambda o: any(d <= o < d + n for d, n in ext)
+bad = 0
+for i, (d, n) in enumerate(ext):
+    for j, (off, want_change) in enumerate([(d - 4096, False), (d, True), (d + n - 4096, True), (d + n, False)]):
+        k = (i * 4 + j) * 4096
+        changed = a[k:k + 4096] != b[k:k + 4096]
+        if not want_change and inside(off):
+            continue  # neighbour is another extent of the same file
+        if changed != want_change:
+            print(f"extent {d}: block at {off} {'changed' if changed else 'unchanged'} (expected {'change' if want_change else 'no change'})")
+            bad = 1
+print("boundary test", "FAILED" if bad else f"OK ({len(ext)} extents)")
+sys.exit(bad)
+PY
+ios "$L lock $F; ls -lO $F 2>/dev/null || ls -la $F"
+# raw hashes of the first + last MiB of each extent (or the whole extent if smaller), as iOS sees disk0s1
+: > $S/ios-hashes.txt
+EXT=
+while read -r tag foff doff len; do
+	[ "$tag" = EXT ] || continue
+	EXT="$EXT${EXT:+ }$doff:$len"
+done < $S/extents.txt
+ios "for e in $EXT; do d=\${e%:*}; n=\${e#*:}; m=1048576; [ \$n -lt \$m ] && m=\$n; $L raw /dev/rdisk0s1 \$d \$m; $L raw /dev/rdisk0s1 \$((d + n - m)) \$m; done" > $S/ios-raw.bin
+python3 -I - $S/ios-raw.bin $EXT >> $S/ios-hashes.txt <<'PY'
+import sys, hashlib
+f = open(sys.argv[1], "rb")
+for e in sys.argv[2:]:
+    d, n = map(int, e.split(":")); m = min(n, 1 << 20)
+    h = [hashlib.sha256(f.read(m)).hexdigest() for _ in range(2)]
+    print(d, n, h[0], h[1])
+PY
+rm -f $S/ios-raw.bin
+wc -l < $S/ios-hashes.txt
+mkdir -p var/extra-rd/etc
+echo "EXTENTS=\"$EXT\"" > var/extra-rd/etc/flashdata.conf
+cat var/extra-rd/etc/flashdata.conf
+echo "next: DFU back into Linux, push flashdata.conf, 'flashdata hash' must equal $S/ios-hashes.txt before any write"

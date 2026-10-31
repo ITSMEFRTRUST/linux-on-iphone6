@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 03:25:29 +0000
+Subject: [PATCH 101/138] drm: adp: t7000: Heal only the panel wake, never a
+ layer packet
+
+The heal work sent the LAYER_CTL packet with only panel_lock held, while
+userspace keeps flipping (Orchard's UI is awake behind the held-off
+backlight). The debugfs power path takes all modeset locks and waits
+for the last commit before any layer packet so that no BASE/STRIDE
+write races the layer change; the heal work cannot take those locks
+(atomic_disable holds them while it cancels the work synchronously).
+
+Retry only a failed panel wake (DCS) in the background. A failed layer
+on keeps display_state "bad" until userspace does a CRTC off/on, which
+Orchard does after about 2 s.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/gpu/drm/adp/adp-t7000.c | 41 +++++++++++++++++++++------------
+ 1 file changed, 26 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/gpu/drm/adp/adp-t7000.c b/drivers/gpu/drm/adp/adp-t7000.c
+index 5d7194e0a..64ceea40d 100644
+--- a/drivers/gpu/drm/adp/adp-t7000.c
++++ b/drivers/gpu/drm/adp/adp-t7000.c
+@@ -21,8 +21,9 @@
+  * Screen off (CRTC off = DPMS off / ACTIVE=0): panel_sleep=1 sends the panel to sleep; deep_off=1
+  * first stops the pipe's vram fetch (no layer, ADP IRQs masked) the way iOS does, then sleeps the
+  * panel (unless deep_panel=0). The timing generator and the DSI link keep running in both cases.
+- * debugfs "panel" and "power" run the same sequences without DRM master. A CRTC on whose layer
+- * packet or panel wake fails is retried in the background; sysfs display_state says "bad" meanwhile.
++ * debugfs "panel" and "power" run the same sequences without DRM master. A CRTC on whose panel
++ * wake fails is retried in the background; sysfs display_state says "bad" while the layer or the
++ * panel is off.
+  */
+ 
+ #include <linux/aperture.h>
+@@ -913,9 +914,10 @@ static void adpt_display_off(struct adpt *adp, bool deep, bool force)
+ }
+ 
+ /*
+- * Undo whatever adpt_display_off() did (no-op otherwise): layer back first, then panel wake. @crtc: the
+- * CRTC enable path. If a step fails there the CRTC is on but the screen isn't; the heal work retries in
+- * the background and display_state reports "bad" until it is fixed.
++ * Undo whatever adpt_display_off() did (no-op otherwise): layer back first, then panel wake.
++ * @crtc: the CRTC enable path. If a step fails there the CRTC is on but the screen isn't:
++ * display_state reports "bad" until it is fixed, and the heal work retries a failed panel wake
++ * in the background.
+  */
+ static void adpt_display_on(struct adpt *adp, bool scanout, bool crtc)
+ {
+@@ -946,44 +948,53 @@ static void adpt_display_on(struct adpt *adp, bool scanout, bool crtc)
+ 		drm_info(&adp->drm, "display on #%u: %lld ms\n", adp->n_on, ktime_ms_delta(ktime_get(), t0));
+ 	} else {
+ 		adp->n_fail++;
+-		drm_err(&adp->drm, "display on #%u FAILED at %s (%d) after %lld ms: scanout %s, panel %s; retrying\n",
++		drm_err(&adp->drm, "display on #%u FAILED at %s (%d) after %lld ms: scanout %s, panel %s; %s\n",
+ 			adp->n_on, adp->last_step ?: "?", adp->last_err, ktime_ms_delta(ktime_get(), t0),
+-			adp->scanout_off ? "off" : "on", adp->panel_asleep ? "asleep" : "awake");
+-		if (!adp->panel_keep)
++			adp->scanout_off ? "off" : "on", adp->panel_asleep ? "asleep" : "awake",
++			adp->panel_asleep ? "retrying the panel" : "needs a CRTC off/on");
++		if (!adp->panel_keep && adp->panel_asleep)
+ 			mod_delayed_work(system_freezable_wq, &adp->heal, msecs_to_jiffies(100));
+ 	}
+ out:
+ 	mutex_unlock(&adp->panel_lock);
+ }
+ 
+-/* CRTC on but the screen isn't: retry the on steps, 100 ms doubling to 2 s, for as long as the CRTC stays on */
++/*
++ * CRTC on but the panel didn't wake: retry the wake, 100 ms doubling to 2 s, for as long as the
++ * CRTC stays on. Only the panel (DCS): a layer packet from here could race a flip's BASE/STRIDE
++ * writes, which only the modeset locks exclude (see adpt_power_set()), and taking those here would
++ * deadlock against the cancel_delayed_work_sync() in atomic_disable. A failed layer on stays "bad"
++ * in display_state until userspace does a CRTC off/on (Orchard does after ~2 s).
++ */
+ static void adpt_heal_work(struct work_struct *work)
+ {
+ 	struct adpt *adp = container_of(to_delayed_work(work), struct adpt, heal);
+ 	unsigned int tries;
+-	bool ok;
++	bool ok, layer_off;
+ 	int idx;
+ 
+ 	mutex_lock(&adp->panel_lock);
+-	if (!adp->crtc_on || adp->dbg_off || adp->panel_keep || adpt_on_ok_locked(adp)) {
++	if (!adp->crtc_on || adp->dbg_off || adp->panel_keep || !adp->panel_asleep) {
+ 		mutex_unlock(&adp->panel_lock);
+ 		return;
+ 	}
+ 	if (drm_dev_enter(&adp->drm, &idx)) {
+ 		adp->last_err = 0;
+ 		adp->last_step = NULL;
+-		adpt_scanout_on_locked(adp);
+ 		adpt_panel_wake_locked(adp);
+ 		drm_dev_exit(idx);
+ 	}
+-	ok = adpt_on_ok_locked(adp);
++	ok = !adp->panel_asleep;
++	layer_off = adp->scanout_off;
+ 	tries = ++adp->heal_tries;
+ 	mutex_unlock(&adp->panel_lock);
+ 	if (ok) {
+-		drm_info(&adp->drm, "display on after %u background retr%s\n", tries, tries == 1 ? "y" : "ies");
++		drm_info(&adp->drm, "panel awake after %u background retr%s%s\n", tries,
++			 tries == 1 ? "y" : "ies",
++			 layer_off ? " (scanout still off: needs a CRTC off/on)" : "");
+ 		return;
+ 	}
+-	drm_err_ratelimited(&adp->drm, "display still not on after %u retries\n", tries);
++	drm_err_ratelimited(&adp->drm, "panel still asleep after %u retries\n", tries);
+ 	queue_delayed_work(system_freezable_wq, &adp->heal, msecs_to_jiffies(min(100U << min(tries, 5U), 2000U)));
+ }
+ 

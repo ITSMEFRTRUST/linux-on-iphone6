@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 01:27:33 +0000
+Subject: [PATCH 073/138] power: supply: apple_swi: Sleep through SWI transfers
+ instead of polling
+
+Every HDQ byte waited for its frames by polling the UART every 100 us
+(and the break every 50 us) from the start of the transfer, although
+the transfer times are fixed: 8 frames at 57600 baud take 1.5 ms, the
+break frame at 9600 baud 1.15 ms, and the gauge answers within 320 us.
+Each poll is an hrtimer sleep, so one byte cost ~55 timer interrupts
+and one 16-bit register ~170. Reading battery/current_now every 2 s
+(what a battery monitor does) added ~230 timer interrupts a second to
+an idle phone that otherwise takes ~45, and a bq27xxx cache refresh
+plus a voltage read cost ~700.
+
+Sleep for the expected transfer time in one go and only poll after
+that. A byte takes about as long as before and now costs a handful of
+wakeups.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/power/supply/apple_swi_battery.c | 25 +++++++++++++++++++-----
+ 1 file changed, 20 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/power/supply/apple_swi_battery.c b/drivers/power/supply/apple_swi_battery.c
+index e5f3ac6a2..158b34615 100644
+--- a/drivers/power/supply/apple_swi_battery.c
++++ b/drivers/power/supply/apple_swi_battery.c
+@@ -73,6 +73,16 @@
+ 
+ #define SWI_IDLE_MS		500
+ 
++/*
++ * Frame times: 11 bits (start, 8 data, 2 stop) at 57600 and at 9600 baud.
++ * The waits below sleep through most of a transfer in one go and only
++ * then poll: polling every 100 us from the start cost ~55 timer wakeups
++ * per byte, ~170 per 16-bit register.
++ */
++#define SWI_FRAME_US		191
++#define SWI_BREAK_US		1146
++#define SWI_RESPONSE_US		320	/* gauge answers within this */
++
+ struct apple_swi {
+ 	struct device *dev;
+ 	void __iomem *base;
+@@ -121,11 +131,15 @@ static int swi_wait_tx(struct apple_swi *swi)
+ 				  st & UTRSTAT_TXE, 50, 10000);
+ }
+ 
+-static int swi_wait_rx(struct apple_swi *swi, unsigned int n)
++/* Wait for n frames that start arriving within lead_us */
++static int swi_wait_rx(struct apple_swi *swi, unsigned int n,
++		       unsigned int lead_us)
+ {
+-	unsigned int cnt;
++	unsigned int cnt, us = lead_us + n * SWI_FRAME_US;
++
++	/* 8 frames take 1.5 ms: sleep through them, then poll the rest */
++	usleep_range(us, us + 100);
+ 
+-	/* 8 frames take 1.5 ms, the gauge answers within 320 us */
+ 	return read_poll_timeout(swi_rx_count, cnt, cnt >= n, 100, 10000,
+ 				 false, swi);
+ }
+@@ -152,6 +166,7 @@ static int swi_break(struct apple_swi *swi)
+ 
+ 	swi_set_baud(swi, SWI_BREAK_BAUD);
+ 	swi_wr(swi, UART_UTXH, 0);
++	usleep_range(SWI_BREAK_US, SWI_BREAK_US + 100);
+ 	ret = swi_wait_tx(swi);
+ 	swi_set_baud(swi, SWI_BAUD);
+ 	/* break recovery, at least 40 us */
+@@ -171,7 +186,7 @@ static int swi_send(struct apple_swi *swi, u8 byte)
+ 		swi_wr(swi, UART_UTXH, frame[i]);
+ 	}
+ 
+-	ret = swi_wait_rx(swi, 8);
++	ret = swi_wait_rx(swi, 8, 0);	/* the echo */
+ 	if (ret)
+ 		return ret;
+ 
+@@ -186,7 +201,7 @@ static int swi_recv(struct apple_swi *swi)
+ {
+ 	int i, ret, val = 0;
+ 
+-	ret = swi_wait_rx(swi, 8);
++	ret = swi_wait_rx(swi, 8, SWI_RESPONSE_US);
+ 	if (ret)
+ 		return ret;
+ 

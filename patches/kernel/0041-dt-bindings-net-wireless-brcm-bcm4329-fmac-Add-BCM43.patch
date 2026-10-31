@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 16:26:24 +0000
+Subject: [PATCH 041/138] dt-bindings: net: wireless: brcm,bcm4329-fmac: Add
+ BCM4345 PCIe
+
+The BCM4345 B1 in the iPhone 6 is attached over PCIe with the device ID
+0x43ab.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../devicetree/bindings/net/wireless/brcm,bcm4329-fmac.yaml      | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/Documentation/devicetree/bindings/net/wireless/brcm,bcm4329-fmac.yaml b/Documentation/devicetree/bindings/net/wireless/brcm,bcm4329-fmac.yaml
+index 81fd3e374..c047c79f7 100644
+--- a/Documentation/devicetree/bindings/net/wireless/brcm,bcm4329-fmac.yaml
++++ b/Documentation/devicetree/bindings/net/wireless/brcm,bcm4329-fmac.yaml
+@@ -49,6 +49,7 @@ properties:
+           - const: brcm,bcm4329-fmac
+       - enum:
+           - brcm,bcm4329-fmac
++          - pci14e4,43ab  # BCM4345
+           - pci14e4,43dc  # BCM4355
+           - pci14e4,4464  # BCM4364
+           - pci14e4,4488  # BCM4377

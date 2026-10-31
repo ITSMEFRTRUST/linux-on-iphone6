@@ -1,0 +1,332 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 23:16:46 +0000
+Subject: [PATCH 072/138] Input: apple_z2 - Power the controller down while
+ closed
+
+The controller was booted at probe and then scanned for good, about 60
+frames a second with an interrupt and two SPI transfers each, even with
+nobody listening. On the iPhone 6 that is a steady drain with the screen
+off.
+
+Power it down in close() and boot it again in open(), reusing the
+suspend/resume paths, so closing or inhibiting the input device stops the
+scanning. On the N1 this cuts both supplies and gates the 32 kHz clock.
+A mutex and a running flag keep probe, open/close, suspend/resume and
+remove in step and the interrupt enable count balanced; the interrupt is
+only enabled once a boot succeeded. A closed device stays off across
+suspend.
+
+Bring-up is retried once and logged. On the N1, keep the controller off
+for at least 200 ms and hold its chip select low while it is unpowered,
+as iOS does. Reset the frame counter on every boot, and on the Z2 do not
+leave the interrupt enabled when the boot interrupt times out.
+
+The close_poweroff module parameter restores the old behaviour, and
+off_cs_low leaves the chip select alone.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/input/touchscreen/apple_z2.c | 159 ++++++++++++++++++++++++---
+ 1 file changed, 142 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/input/touchscreen/apple_z2.c b/drivers/input/touchscreen/apple_z2.c
+index 747989306..4324b4933 100644
+--- a/drivers/input/touchscreen/apple_z2.c
++++ b/drivers/input/touchscreen/apple_z2.c
+@@ -8,11 +8,14 @@
+ #include <linux/clk.h>
+ #include <linux/delay.h>
+ #include <linux/firmware.h>
++#include <linux/gpio/consumer.h>
+ #include <linux/input.h>
+ #include <linux/input/mt.h>
+ #include <linux/input/touchscreen.h>
+ #include <linux/interrupt.h>
++#include <linux/ktime.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ #include <linux/of.h>
+ #include <linux/regulator/consumer.h>
+ #include <linux/spi/spi.h>
+@@ -50,6 +53,18 @@
+ #define APPLE_N1_REPORT_CONTACTS         0x44
+ #define APPLE_N1_REPORT_CONTACTS_IMAGE   0x45
+ #define APPLE_N1_BUF_SIZE                4000
++/* iOS keeps the N1 unpowered for at least this long before powering it again */
++#define APPLE_N1_MIN_OFF_MS              200
++
++static bool close_poweroff = true;
++module_param(close_poweroff, bool, 0644);
++MODULE_PARM_DESC(close_poweroff,
++		 "Power the controller down while the input device is closed or inhibited (default: true)");
++
++static bool off_cs_low = true;
++module_param(off_cs_low, bool, 0644);
++MODULE_PARM_DESC(off_cs_low,
++		 "N1: hold the GPIO chip select asserted (low) while unpowered, as iOS does (default: true)");
+ 
+ struct apple_z2 {
+ 	struct spi_device *spidev;
+@@ -68,6 +83,11 @@ struct apple_z2 {
+ 	struct regulator *vdd;
+ 	struct regulator *vdd_ana;
+ 	struct clk *clk;
++	/* Serialises probe, open/close, suspend/resume and remove */
++	struct mutex lock;
++	bool running;
++	bool resume_running;
++	ktime_t off_time;
+ };
+ 
+ struct apple_z2_finger {
+@@ -646,6 +666,20 @@ static int apple_n1_probe_bootloader(struct apple_z2 *z2)
+ 	return -ENODEV;
+ }
+ 
++/*
++ * iOS drives the chip select low before it cuts the supplies and only raises
++ * it again once they are back, so the unpowered controller is not fed through
++ * its CS pin. The line is an active-low GPIO owned by the SPI core, which only
++ * touches it during transfers, and there are none while the N1 is off.
++ */
++static void apple_n1_set_cs_asserted(struct apple_z2 *z2, bool asserted)
++{
++	struct gpio_desc *cs = spi_get_csgpiod(z2->spidev, 0);
++
++	if (cs && (off_cs_low || !asserted))
++		gpiod_set_value_cansleep(cs, asserted);
++}
++
+ static void apple_n1_power_off(struct apple_z2 *z2)
+ {
+ 	if (!z2->powered)
+@@ -653,19 +687,28 @@ static void apple_n1_power_off(struct apple_z2 *z2)
+ 
+ 	gpiod_set_value_cansleep(z2->reset_gpio, 1);
+ 	usleep_range(1000, 2000);
++	apple_n1_set_cs_asserted(z2, true);
+ 	clk_disable_unprepare(z2->clk);
+ 	if (z2->vdd)
+ 		regulator_disable(z2->vdd);
+ 	if (z2->vdd_ana)
+ 		regulator_disable(z2->vdd_ana);
+ 	z2->powered = false;
++	z2->off_time = ktime_get();
+ }
+ 
+ static int apple_n1_power_on(struct apple_z2 *z2)
+ {
+ 	struct spi_transfer xfer = { .tx_buf = z2->tx_buf, .rx_buf = z2->rx_buf, .len = 2 };
++	s64 off_ms;
+ 	int error;
+ 
++	if (z2->off_time) {
++		off_ms = ktime_ms_delta(ktime_get(), z2->off_time);
++		if (off_ms >= 0 && off_ms < APPLE_N1_MIN_OFF_MS)
++			msleep(APPLE_N1_MIN_OFF_MS - off_ms);
++	}
++
+ 	if (z2->vdd_ana) {
+ 		error = regulator_enable(z2->vdd_ana);
+ 		if (error)
+@@ -677,6 +720,7 @@ static int apple_n1_power_on(struct apple_z2 *z2)
+ 			goto err_ana;
+ 	}
+ 	usleep_range(5000, 6000);
++	apple_n1_set_cs_asserted(z2, false);
+ 
+ 	error = clk_prepare_enable(z2->clk);
+ 	if (error)
+@@ -708,11 +752,13 @@ static int apple_n1_power_on(struct apple_z2 *z2)
+ 	apple_n1_power_off(z2);
+ 	return error;
+ err_vdd:
++	apple_n1_set_cs_asserted(z2, true);
+ 	if (z2->vdd)
+ 		regulator_disable(z2->vdd);
+ err_ana:
+ 	if (z2->vdd_ana)
+ 		regulator_disable(z2->vdd_ana);
++	z2->off_time = ktime_get();
+ 	return error;
+ }
+ 
+@@ -734,10 +780,14 @@ static int apple_n1_boot(struct apple_z2 *z2)
+ 	return 0;
+ }
+ 
++/* Bring the controller up; the IRQ is enabled only if this succeeds */
+ static int apple_z2_boot(struct apple_z2 *z2)
+ {
+ 	int error;
+ 
++	/* A freshly booted controller expects the same counter as at probe */
++	z2->index_parity = 0;
++
+ 	if (z2->n1)
+ 		return apple_n1_boot(z2);
+ 
+@@ -745,9 +795,9 @@ static int apple_z2_boot(struct apple_z2 *z2)
+ 	enable_irq(z2->spidev->irq);
+ 	gpiod_set_value(z2->reset_gpio, 0);
+ 	if (!wait_for_completion_timeout(&z2->boot_irq, msecs_to_jiffies(20)))
+-		return -ETIMEDOUT;
+-
+-	error = apple_z2_upload_firmware(z2);
++		error = -ETIMEDOUT;
++	else
++		error = apple_z2_upload_firmware(z2);
+ 	if (error) {
+ 		gpiod_set_value(z2->reset_gpio, 1);
+ 		disable_irq(z2->spidev->irq);
+@@ -757,6 +807,70 @@ static int apple_z2_boot(struct apple_z2 *z2)
+ 	return 0;
+ }
+ 
++/* Boot with one retry. Must be called with z2->lock held. */
++static int apple_z2_start(struct apple_z2 *z2)
++{
++	struct device *dev = &z2->spidev->dev;
++	int error;
++
++	lockdep_assert_held(&z2->lock);
++
++	if (z2->running)
++		return 0;
++
++	error = apple_z2_boot(z2);
++	if (error) {
++		dev_warn(dev, "bring-up failed (%d), retrying\n", error);
++		/* The N1 path waits out its minimum off time by itself */
++		usleep_range(5000, 10000);
++		error = apple_z2_boot(z2);
++		if (error) {
++			dev_err(dev, "bring-up failed again (%d), controller left off\n", error);
++			return error;
++		}
++		dev_info(dev, "bring-up succeeded on retry\n");
++	}
++
++	z2->running = true;
++	return 0;
++}
++
++/* IRQ off first, then the controller. Must be called with z2->lock held. */
++static void apple_z2_stop(struct apple_z2 *z2)
++{
++	lockdep_assert_held(&z2->lock);
++
++	if (!z2->running)
++		return;
++
++	disable_irq(z2->spidev->irq);
++	if (z2->n1)
++		apple_n1_power_off(z2);
++	else
++		gpiod_direction_output(z2->reset_gpio, 1);
++	z2->booted = false;
++	z2->running = false;
++}
++
++static int apple_z2_open(struct input_dev *input_dev)
++{
++	struct apple_z2 *z2 = input_get_drvdata(input_dev);
++
++	guard(mutex)(&z2->lock);
++	return apple_z2_start(z2);
++}
++
++static void apple_z2_close(struct input_dev *input_dev)
++{
++	struct apple_z2 *z2 = input_get_drvdata(input_dev);
++
++	if (!close_poweroff)
++		return;
++
++	guard(mutex)(&z2->lock);
++	apple_z2_stop(z2);
++}
++
+ static int apple_z2_probe(struct spi_device *spi)
+ {
+ 	struct device *dev = &spi->dev;
+@@ -780,6 +894,9 @@ static int apple_z2_probe(struct spi_device *spi)
+ 	z2->spidev = spi;
+ 	init_completion(&z2->boot_irq);
+ 	spi_set_drvdata(spi, z2);
++	error = devm_mutex_init(dev, &z2->lock);
++	if (error)
++		return error;
+ 
+ 	/* Reset the device on boot */
+ 	z2->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
+@@ -822,6 +939,9 @@ static int apple_z2_probe(struct spi_device *spi)
+ 	z2->input_dev->name = (char *)spi_get_device_id(spi)->driver_data;
+ 	z2->input_dev->phys = "apple_z2";
+ 	z2->input_dev->id.bustype = BUS_SPI;
++	z2->input_dev->open = apple_z2_open;
++	z2->input_dev->close = apple_z2_close;
++	input_set_drvdata(z2->input_dev, z2);
+ 
+ 	/* Allocate the axes before setting from DT */
+ 	input_set_abs_params(z2->input_dev, ABS_MT_POSITION_X, 0, 0, 0, 0);
+@@ -845,39 +965,44 @@ static int apple_z2_probe(struct spi_device *spi)
+ 	if (error)
+ 		return dev_err_probe(dev, error, "unable to register input device\n");
+ 
+-	/* Wait for device reset to finish */
++	/*
++	 * Boot now, so a broken controller fails the probe. If nobody opens the
++	 * device, the first close() or inhibit powers it down again.
++	 */
+ 	usleep_range(5000, 10000);
+-	error = apple_z2_boot(z2);
+-	if (error)
+-		return error;
+-
+-	return 0;
++	guard(mutex)(&z2->lock);
++	return apple_z2_start(z2);
+ }
+ 
+ static void apple_z2_shutdown(struct spi_device *spi)
+ {
+ 	struct apple_z2 *z2 = spi_get_drvdata(spi);
+ 
+-	disable_irq(z2->spidev->irq);
+-	if (z2->n1)
+-		apple_n1_power_off(z2);
+-	else
+-		gpiod_direction_output(z2->reset_gpio, 1);
+-	z2->booted = false;
++	guard(mutex)(&z2->lock);
++	apple_z2_stop(z2);
+ }
+ 
+ static int apple_z2_suspend(struct device *dev)
+ {
+-	apple_z2_shutdown(to_spi_device(dev));
++	struct apple_z2 *z2 = spi_get_drvdata(to_spi_device(dev));
++
++	guard(mutex)(&z2->lock);
++	z2->resume_running = z2->running;
++	apple_z2_stop(z2);
+ 
+ 	return 0;
+ }
+ 
++/* A closed or inhibited device stays off across suspend */
+ static int apple_z2_resume(struct device *dev)
+ {
+ 	struct apple_z2 *z2 = spi_get_drvdata(to_spi_device(dev));
+ 
+-	return apple_z2_boot(z2);
++	guard(mutex)(&z2->lock);
++	if (!z2->resume_running)
++		return 0;
++
++	return apple_z2_start(z2);
+ }
+ 
+ static DEFINE_SIMPLE_DEV_PM_OPS(apple_z2_pm, apple_z2_suspend, apple_z2_resume);

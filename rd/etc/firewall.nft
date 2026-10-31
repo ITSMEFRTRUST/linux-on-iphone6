@@ -1,0 +1,41 @@
+#!/usr/sbin/nft -f
+# Phone firewall (rd/etc/hl-rd.d/44-firewall.sh loads it at boot, before Wi-Fi). Inbound only; output is untouched.
+# - usb0 (the PC link) and lo: everything, as before (bin/ph = root telnet on 172.16.43.1:23, unudhcpd for the PC).
+# - The USB subnet / telnet are refused from any other interface: Linux's weak-host model would otherwise accept a
+#   packet for 172.16.43.1 arriving on wlan0 (a LAN box only needs "ip route add 172.16.43.1 via <phone>").
+# - wlan0 / tailscale0 / anything else: replies to our own traffic (established/related), DHCP replies, IPv6
+#   neighbour discovery + router adverts (SLAAC), IGMP/MLD queries, and tailscaled's WireGuard/disco port udp 41641 (direct peer
+#   paths). Nothing else gets in: no new connection to any listener (unudhcpd :67, tailscaled peerapi, ...).
+#   tailscale0 additionally has tailscaled's --shields-up; tailscaled itself needs nothing new inbound on it.
+# Rollback: nft flush ruleset      Counters: nft list ruleset
+flush ruleset
+
+table inet hl_fw {
+	chain input {
+		type filter hook input priority filter; policy accept;
+
+		iifname { "lo", "usb0" } accept
+
+		# never the USB-side addresses / telnet from anywhere else (logged-free drop; counters show hits)
+		ip daddr 172.16.0.0/16 counter drop
+		tcp dport 23 counter drop
+
+		ct state invalid counter drop
+		ct state { established, related } accept
+
+		# DHCP replies to udhcpc (renewals use a UDP socket; broadcast OFFER/ACK don't match conntrack)
+		iifname "wlan0" udp sport 67 udp dport 68 accept
+		# IPv6 on wlan0: SLAAC + neighbour discovery (+ ICMPv6 errors are "related" above)
+		iifname "wlan0" meta l4proto ipv6-icmp icmpv6 type { nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert } accept
+		# multicast membership queries (IGMP / MLD): answering them keeps snooping APs delivering the
+		# solicited-node groups IPv6 neighbour discovery needs
+		iifname "wlan0" ip protocol igmp accept
+		iifname "wlan0" meta l4proto ipv6-icmp icmpv6 type mld-listener-query accept
+		# Tailscale direct paths (WireGuard + disco), only on the physical uplink
+		iifname "wlan0" udp dport 41641 accept
+		# ICMP echo is harmless and helps debugging from the LAN; rate-limited
+		iifname "wlan0" icmp type echo-request limit rate 5/second accept
+
+		counter drop
+	}
+}

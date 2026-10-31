@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 02:35:16 +0000
+Subject: [PATCH 107/138] Bluetooth: hci_bcm: Accept a host wake interrupt
+ behind a slow bus
+
+On the iPhone 6 BT_HOST_WAKE goes to a PMU GPIO whose interrupt is a
+nested threaded one, which request_irq() refuses. Use
+request_any_context_irq(); the handler only takes a runtime PM reference.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/bluetooth/hci_bcm.c | 13 ++++++++-----
+ 1 file changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/bluetooth/hci_bcm.c b/drivers/bluetooth/hci_bcm.c
+index 9a103db7e..6a63cf610 100644
+--- a/drivers/bluetooth/hci_bcm.c
++++ b/drivers/bluetooth/hci_bcm.c
+@@ -347,14 +347,17 @@ static int bcm_request_irq(struct bcm_data *bcm)
+ 		goto unlock;
+ 	}
+ 
+-	err = devm_request_irq(bdev->dev, bdev->irq, bcm_host_wake,
+-			       bdev->irq_active_low ? IRQF_TRIGGER_FALLING :
+-						      IRQF_TRIGGER_RISING,
+-			       "host_wake", bdev);
+-	if (err) {
++	/* The host wake line may come from a PMIC behind a slow bus */
++	err = devm_request_any_context_irq(bdev->dev, bdev->irq, bcm_host_wake,
++					   bdev->irq_active_low ?
++						IRQF_TRIGGER_FALLING :
++						IRQF_TRIGGER_RISING,
++					   "host_wake", bdev);
++	if (err < 0) {
+ 		bdev->irq = err;
+ 		goto unlock;
+ 	}
++	err = 0;
+ 
+ 	bdev->irq_acquired = true;
+ 

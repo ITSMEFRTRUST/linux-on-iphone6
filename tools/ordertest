@@ -1,0 +1,11 @@
+#!/bin/sh
+# ordertest - is the shim link happy if the MCA frame clock already runs (TX off) before the link starts?
+M=/tmp/mem; A=0x20a0a8; S=0x20a0a9
+sh /tmp/linktest-noStart
+$M w ${A}00c 0f107007 s 50 >/dev/null              # clock runs, TX disabled
+/tmp/i2c 1 40 r 15 r 16 r 15 r 16 | tr '\n' ' '; echo
+i=0; args=""; while [ $i -lt 51 ]; do args="$args w $(printf 0x%x $((0x20a0aa000 + (i % 8) * 4))) 0"; i=$((i+1)); done
+$M $args >/dev/null
+$M w ${S}00c ac w 0x20a001010 8000 w 0x20a001014 8000 w ${S}014 1 w ${A}018 209 >/dev/null
+/tmp/tone p 2 3
+/tmp/i2c 1 40 r 15 r 16 | tr '\n' ' '; echo

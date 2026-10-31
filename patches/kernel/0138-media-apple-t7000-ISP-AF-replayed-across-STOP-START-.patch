@@ -1,0 +1,280 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 02:39:05 +0000
+Subject: [PATCH 138/138] media: apple: t7000 ISP: AF replayed across
+ STOP/START, af=0 sends no AF command
+
+- A client's last ISP_IOC_FOCUS (rear) is replayed at the next START of the same
+  channel instead of plain continuous AF: its window, and CAF off when the lens was
+  held (one scan / lock / manual). The lens position is read before CH_STOP and put
+  back after CH_START if the fw moved it. Orchard's photo (viewfinder STOP, still
+  START, STOP, viewfinder START) no longer undoes tap-to-focus or AF lock.
+  Forgotten at the first open and the last release, or when the other camera starts.
+- af=0: the ioctl sends no AF command (the AE window still applies), no position
+  query either.
+- read() invalidates only when this START's mapping is cacheable (latched at mmap),
+  so flipping mmap_cached with the Camera open can't give stale frames; the sync
+  uses DMA_BIDIRECTIONAL, as mapped.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../media/platform/apple/isp-t7000/isp-af.c   | 85 +++++++++++++++++--
+ .../media/platform/apple/isp-t7000/isp-cdev.c | 13 ++-
+ .../media/platform/apple/isp-t7000/isp-scfg.c |  1 +
+ .../platform/apple/isp-t7000/isp-stream.c     |  1 +
+ drivers/media/platform/apple/isp-t7000/isp.h  |  9 ++
+ 5 files changed, 98 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-af.c b/drivers/media/platform/apple/isp-t7000/isp-af.c
+index ac985c96a..ebba94ca0 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-af.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-af.c
+@@ -127,16 +127,38 @@ static bool af_rear(struct t7000_isp *isp)
+ 	return isp->st.on && isp->st.sensor_id == AF_SENSOR_REAR;
+ }
+ 
+-/* isp_stream_start(), right before CH_START (iOS H6ISPCaptureStreamStart order). Never fatal. */
++/* the replayed request holds the lens (one scan done, lock, manual) rather than running CAF */
++static bool af_held(struct isp_stream *st)
++{
++	return st->af_have && st->af_mode != ISP_FOCUS_CONTINUOUS;
++}
++
++/* open / last release: nothing of an earlier client is replayed */
++void isp_af_forget(struct t7000_isp *isp)
++{
++	isp->st.af_have = false;
++	isp->st.af_lens = -1;
++	memset(isp->st.af_win, 0, sizeof(isp->st.af_win));
++}
++
++/*
++ * isp_stream_start(), right before CH_START (iOS H6ISPCaptureStreamStart order). Never fatal.
++ * A client's last ISP_IOC_FOCUS on this channel is replayed instead of plain CAF, so a STOP +
++ * START (Orchard's photo: viewfinder -> still preset -> viewfinder) keeps tap-to-focus / AF lock:
++ * its window, and CAF off when the lens was held (isp_af_stream_on puts the lens back).
++ */
+ void isp_af_prestart(struct t7000_isp *isp)
+ {
++	struct isp_stream *st = &isp->st;
+ 	int fpix = READ_ONCE(isp_af_fpix), en = READ_ONCE(isp_af_enable);
+ 	u8 pkt[0x20];
+ 
++	if (st->af_have && st->af_ch != st->ch)
++		isp_af_forget(isp);	/* (the other camera's request) */
+ 	if (!READ_ONCE(isp_af) || !af_rear(isp))
+ 		return;
+ 	if (en >= 0) {
+-		af_pkt(pkt, 0x70a, isp->st.ch);
++		af_pkt(pkt, 0x70a, st->ch);
+ 		put_unaligned_le16(en, pkt + 0xc);
+ 		af_cmd(isp, "FOCUS_ENABLE", pkt, 0x14, NULL);
+ 	}
+@@ -144,19 +166,58 @@ void isp_af_prestart(struct t7000_isp *isp)
+ 		af_simple(isp, "AF_FOCUS_PIXELS_ENABLE", 0x8410, 0x10, !!fpix, 0, NULL);
+ 	if (READ_ONCE(isp_af_start))
+ 		af_simple(isp, "AF_START", 0x400, 0xc, 0, 0, NULL);
+-	af_simple(isp, "AF_CONTINUOUS_FOCUS_ENABLE", 0x840f, 0x10, 1, READ_ONCE(isp_af_mode), NULL);
++	if (st->af_have && st->af_win[2] && st->af_win[3]) {
++		struct isp_focus f = { .x = st->af_win[0], .y = st->af_win[1], .w = st->af_win[2],
++				       .h = st->af_win[3] };
++
++		af_window(isp, "AF_WINDOW_PARAM_SET", 0x8401, &f, NULL);
++	}
++	if (af_held(st))
++		af_simple(isp, "AF_CONTINUOUS_FOCUS_ENABLE", 0x840f, 0x10, 0, 0, NULL);
++	else
++		af_simple(isp, "AF_CONTINUOUS_FOCUS_ENABLE", 0x840f, 0x10, 1, READ_ONCE(isp_af_mode),
++			  NULL);
+ }
+ 
+ /* isp_stream_start(), after CH_START succeeded */
+ void isp_af_stream_on(struct t7000_isp *isp)
+ {
++	struct isp_stream *st = &isp->st;
++	int pos;
++
+ 	if (!READ_ONCE(isp_af) || !af_rear(isp))
+ 		return;
+-	dev_info(isp->dev, "af: continuous AF on (mode %u), lens position %d, focus_ldo %s\n",
+-		 READ_ONCE(isp_af_mode), af_position(isp),
++	pos = af_position(isp);
++	if (af_held(st)) {
++		int was = pos;
++
++		if (st->af_lens >= 0 && pos != st->af_lens) {	/* the fw moved it across STOP/START */
++			u8 pkt[0x20];
++
++			af_pkt(pkt, 0x702, st->ch);
++			pkt[0xc] = st->af_lens;
++			if (!af_cmd(isp, "FOCUS_POSITION_SET", pkt, 0x14, NULL))
++				pos = af_position(isp);
++		}
++		dev_info(isp->dev, "af: replayed mode %u window %u,%u %ux%u: lens held, %d -> %d (was %d at stop)\n",
++			 st->af_mode, st->af_win[0], st->af_win[1], st->af_win[2], st->af_win[3], was, pos,
++			 st->af_lens);
++		return;
++	}
++	dev_info(isp->dev, "af: continuous AF on (mode %u%s), lens position %d, focus_ldo %s\n",
++		 READ_ONCE(isp_af_mode), st->af_have ? ", replayed window" : "", pos,
+ 		 af_pmic ? (af_ldo_set ? "switched on" : "was on") : "not controlled");
+ }
+ 
++/* isp_stream_stop(), before CH_STOP (isp->lock held): where a held lens is, for the next START */
++void isp_af_prestop(struct t7000_isp *isp)
++{
++	struct isp_stream *st = &isp->st;
++
++	if (READ_ONCE(isp_af) && af_rear(isp) && af_held(st))
++		st->af_lens = af_position(isp);
++}
++
+ static void af_clamp(u16 *pos, u16 *len)
+ {
+ 	if (*len > 1000)
+@@ -191,7 +252,7 @@ long isp_af_ioctl(struct t7000_isp *isp, void __user *up)
+ 	rear = af_rear(isp);
+ 	if (win && f.flags & ISP_FOCUS_F_AE)
+ 		ret = af_window(isp, "AE_WINDOW_PARAM_SET", 0x8200, &f, &fwst);
+-	if (!rear || f.mode == ISP_FOCUS_QUERY || ret)
++	if (!rear || f.mode == ISP_FOCUS_QUERY || ret || !READ_ONCE(isp_af))	/* af=0: no AF command at all */
+ 		goto pos;
+ 	if (win && f.mode != ISP_FOCUS_MANUAL)
+ 		ret = af_window(isp, "AF_WINDOW_PARAM_SET", 0x8401, &f, &fwst);
+@@ -222,8 +283,18 @@ long isp_af_ioctl(struct t7000_isp *isp, void __user *up)
+ 		break;
+ 	}
+ 	}
++	if (!ret) {	/* replayed at the next START of this channel (isp_af_prestart) */
++		isp->st.af_have = true;
++		isp->st.af_ch = isp->st.ch;
++		isp->st.af_mode = f.mode;
++		isp->st.af_lens = -1;
++		if (win) {
++			isp->st.af_win[0] = f.x, isp->st.af_win[1] = f.y;
++			isp->st.af_win[2] = f.w, isp->st.af_win[3] = f.h;
++		}
++	}
+ pos:
+-	f.position = rear ? af_position(isp) : -1;
++	f.position = rear && READ_ONCE(isp_af) ? af_position(isp) : -1;
+ 	f.fw_status = fwst;
+ 	dev_info(isp->dev, "af: mode %u window %u,%u %ux%u%s -> lens %d, fw status 0x%04x%s\n", f.mode,
+ 		 f.x, f.y, f.w, f.h, f.flags & ISP_FOCUS_F_AE ? " +AE" : "", f.position, fwst,
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-cdev.c b/drivers/media/platform/apple/isp-t7000/isp-cdev.c
+index 0c0fe982a..17a60572f 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-cdev.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-cdev.c
+@@ -30,6 +30,8 @@ static int isp_open(struct inode *inode, struct file *f)
+ 
+ 	mutex_lock(&isp_open_lock);
+ 	isp_trace_mark(isp, "open (count %d, stages done %d)", isp->open_count, isp->done);
++	if (isp->open_count == 0)
++		isp_af_forget(isp);	/* (a new client: no AF request of the last one is replayed) */
+ 	if (isp->open_count == 0 && isp->done < ISP_FULL_STAGE) {
+ 		dev_info(isp->dev, "/dev/isp0 opened: booting the ISP\n");
+ 		ret = isp_boot(isp, ISP_FULL_STAGE);
+@@ -53,6 +55,7 @@ static int isp_release(struct inode *inode, struct file *f)
+ 	if (--isp->open_count == 0) {
+ 		mutex_lock(&isp->lock);
+ 		isp_stream_stop(isp);
++		isp_af_forget(isp);
+ 		mutex_unlock(&isp->lock);
+ 		if (!isp_keep_on) {
+ 			dev_info(isp->dev, "/dev/isp0 closed: powering sensor + ISP off (keep_on=0)\n");
+@@ -65,7 +68,7 @@ static int isp_release(struct inode *inode, struct file *f)
+ 
+ static bool isp_mmap_cached = true;
+ module_param_named(mmap_cached, isp_mmap_cached, bool, 0644);
+-MODULE_PARM_DESC(mmap_cached, "frames mapped cacheable + invalidated on read() (default); 0 = write-combine (old)");
++MODULE_PARM_DESC(mmap_cached, "frames mapped cacheable + invalidated on read() (default); 0 = write-combine (old). Read at mmap time (the next START)");
+ 
+ static long isp_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
+ {
+@@ -101,7 +104,7 @@ static long isp_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
+ 		mutex_unlock(&isp->lock);
+ 		isp_term_flush(isp);
+ 		return ret;
+-	case ISP_IOC_STOP:
++	case ISP_IOC_STOP:	/* (the AF request stays: the next START of this channel replays it) */
+ 		mutex_lock(&isp->lock);
+ 		isp_stream_stop(isp);
+ 		mutex_unlock(&isp->lock);
+@@ -133,7 +136,7 @@ static void isp_frame_sync_for_cpu(struct t7000_isp *isp, struct isp_surf *s)
+ 	unsigned int i;
+ 
+ 	for (i = 0; i < s->npages; i++)
+-		dma_sync_single_for_cpu(isp->dev, s->dma[i], PAGE_SIZE, DMA_FROM_DEVICE);
++		dma_sync_single_for_cpu(isp->dev, s->dma[i], PAGE_SIZE, DMA_BIDIRECTIONAL);	/* (as mapped) */
+ }
+ 
+ static bool isp_frame_ready(struct isp_stream *st)
+@@ -165,7 +168,7 @@ static ssize_t isp_read(struct file *f, char __user *ubuf, size_t len, loff_t *o
+ 			fr.bytesused = st->stride * st->height * 3 / 2;
+ 			fr.flags = b->filled ? 0 : ISP_FRAME_FLAG_NOT_FILLED;
+ 			spin_unlock(&st->frame_lock);
+-			if (READ_ONCE(isp_mmap_cached))
++			if (READ_ONCE(st->mapped_cached))	/* (latched at mmap: the knob may have changed since) */
+ 				isp_frame_sync_for_cpu(isp, b->surf);
+ 			break;
+ 		}
+@@ -213,6 +216,8 @@ static int isp_mmap(struct file *f, struct vm_area_struct *vma)
+ 	vm_flags_mod(vma, VM_DONTEXPAND | VM_DONTDUMP, VM_MAYWRITE);
+ 	if (!READ_ONCE(isp_mmap_cached))
+ 		vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
++	else
++		WRITE_ONCE(st->mapped_cached, true);	/* sticky until the next START: any cached mapping is synced */
+ 	for (pg = first; pg < first + npg && !ret; pg++, addr += PAGE_SIZE)
+ 		ret = vm_insert_page(vma, addr, st->buf[pg / per].surf->pages[pg % per]);
+ out:
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-scfg.c b/drivers/media/platform/apple/isp-t7000/isp-scfg.c
+index 29cd5a3f3..b4736ff48 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-scfg.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-scfg.c
+@@ -536,6 +536,7 @@ int isp_stream_start(struct t7000_isp *isp, u32 arg)
+ 		goto out;
+ 	st->seq = 0;
+ 	st->nready = 0;
++	st->mapped_cached = false;	/* (the previous START's mappings are gone: STOP = unmap) */
+ 	st->stopping = false;
+ 	st->on = true;
+ 	if (READ_ONCE(isp_stream_nostart)) {
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-stream.c b/drivers/media/platform/apple/isp-t7000/isp-stream.c
+index 61a0a6642..388795b50 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-stream.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-stream.c
+@@ -316,6 +316,7 @@ void isp_stream_stop(struct t7000_isp *isp)
+ 		return;
+ 	st->stopping = true;
+ 	if (isp->io && !isp->io_dead) {
++		isp_af_prestop(isp);	/* (a held lens: remember where it is) */
+ 		c.h.opcode = CISP_CMD_CH_STOP;
+ 		isp_cmd_simple(isp, "CH_STOP", &c, 0xc, 0xc, NULL);
+ 		c.h = (struct isp_cmd_hdr){ .opcode = CISP_CMD_CH_BUFFER_RETURN };
+diff --git a/drivers/media/platform/apple/isp-t7000/isp.h b/drivers/media/platform/apple/isp-t7000/isp.h
+index b786df251..ab9249ee0 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp.h
++++ b/drivers/media/platform/apple/isp-t7000/isp.h
+@@ -182,6 +182,13 @@ struct isp_stream {
+ 	struct isp_surf *lists;		/* ISP_BUFLIST_SLOT per BUF_H2T slot */
+ 	struct isp_surf *setf;		/* setfile copy for CH_SET_FILE_LOAD */
+ 	u32 seq;
++	bool mapped_cached;	/* a user mapping of this START is cacheable: read() invalidates (isp-cdev.c) */
++	/* rear AF request to replay at the next START of the same channel (isp-af.c); cleared at the
++	 * first open and the last release, so it lives as long as one client's session */
++	bool af_have;
++	u32 af_ch, af_mode;
++	u16 af_win[4];		/* x, y, w, h per-mille; w == 0: none */
++	int af_lens;		/* lens position at the last STOP while AF was held, -1 = unknown */
+ 	/* frame queue (frame_lock): indices in completion order */
+ 	spinlock_t frame_lock;
+ 	wait_queue_head_t wait;
+@@ -404,6 +411,8 @@ void isp_stream_kick(struct t7000_isp *isp);
+ /* isp-af.c */
+ void isp_af_power(struct t7000_isp *isp, bool on);
+ void isp_af_prestart(struct t7000_isp *isp);
++void isp_af_prestop(struct t7000_isp *isp);
++void isp_af_forget(struct t7000_isp *isp);
+ void isp_af_stream_on(struct t7000_isp *isp);
+ long isp_af_ioctl(struct t7000_isp *isp, void __user *up);
+ 

@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 03:08:34 +0000
+Subject: [PATCH 111/138] arm64: dts: apple: t7000-n61: Use the SN2400
+ interrupt for cable changes
+
+PMU event 3 is not wired on N61 (iOS uses the charger's answer instead,
+and it never latched on a re-plug). Use the charger's own INT, PMU event
+24 = PMU GPIO 0 (ADT tigris: interrupts <24>, parent pmu), as its wake
+source.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../interrupt-controller/apple,adi-pmic-irq.yaml    |  6 +++---
+ arch/arm64/boot/dts/apple/t7000-n61.dts             | 13 +++++++++----
+ 2 files changed, 12 insertions(+), 7 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/interrupt-controller/apple,adi-pmic-irq.yaml b/Documentation/devicetree/bindings/interrupt-controller/apple,adi-pmic-irq.yaml
+index ce0a3b603..be587a9f2 100644
+--- a/Documentation/devicetree/bindings/interrupt-controller/apple,adi-pmic-irq.yaml
++++ b/Documentation/devicetree/bindings/interrupt-controller/apple,adi-pmic-irq.yaml
+@@ -13,9 +13,9 @@ description:
+   The event interrupts of an Apple PMIC (see ../mfd/apple,pmic.yaml). The
+   PMIC latches up to 104 events in 13 event registers, each with a mask bit,
+   and signals them on one interrupt line to the SoC. Event n is bit n % 8 of
+-  event register n / 8. On the D2186 of the iPhone 6, event 3 is VBUS
+-  detect, events 24 to 44 are PMIC GPIO 0 to 20 and event 88 is the RTC
+-  alarm.
++  event register n / 8. On the D2186 of the iPhone 6, events 24 to 44 are
++  PMIC GPIO 0 to 20 (GPIO 0 is the charger's interrupt) and event 88 is the
++  RTC alarm.
+ 
+ properties:
+   compatible:
+diff --git a/arch/arm64/boot/dts/apple/t7000-n61.dts b/arch/arm64/boot/dts/apple/t7000-n61.dts
+index 30e42fa5b..ad7ad03b0 100644
+--- a/arch/arm64/boot/dts/apple/t7000-n61.dts
++++ b/arch/arm64/boot/dts/apple/t7000-n61.dts
+@@ -209,9 +209,14 @@ haptics@5a {
+ 	charger: charger@75 {
+ 		compatible = "ti,sn2400";
+ 		reg = <0x75>;
+-		/* PMU event 3 = VBUS detect (iOS wake reason "usb") */
+-		interrupts-extended = <&pmic_irq 3 IRQ_TYPE_EDGE_RISING>;
+-		interrupt-names = "vbus";
++		/*
++		 * INT on PMU GPIO 0 = PMU event 24 (ADT tigris: interrupts
++		 * <24>, parent = pmu), a level input. PMU event 3 ("usb") is
++		 * not wired on N61: iOS asks the charger instead (ADT pmu
++		 * function-get_vbus_detect), and it never fires on a re-plug.
++		 */
++		interrupts-extended = <&pmic_irq 24 IRQ_TYPE_LEVEL_LOW>;
++		interrupt-names = "irq";
+ 		wakeup-source;
+ 		input-current-limit-microamp = <500000>;
+ 		constant-charge-current-max-microamp = <1000000>;
+@@ -384,7 +389,7 @@ &pmic_gpio {
+ };
+ 
+ /*
+- * PMU events (iOS AppleD2186PMU): 3 = VBUS detect, 24 + n = PMU GPIO n
++ * PMU events (iOS AppleD2186PMU): 3 = "usb" (unused on N61), 24 + n = PMU GPIO n
+  * (0 = SN2400 INT, 6 = WLAN host wake, 9 = BT host wake), 88 = RTC alarm.
+  */
+ &pmic_irq {

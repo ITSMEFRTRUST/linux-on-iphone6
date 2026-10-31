@@ -1,0 +1,42 @@
+#!/usr/bin/env python3
+# btclosure ROOT PROVIDED_DIR... -- BIN... : print the files (relative to ROOT) needed to run BIN... from ROOT,
+# i.e. BIN + every shared lib from ROOT in their DT_NEEDED closure that is NOT already present (by soname) in a PROVIDED_DIR.
+# Symlink chains are followed (the link and its target are both listed). Helper for bin/mkbt.
+import os, subprocess, sys
+root = sys.argv[1]; sep = sys.argv.index("--")
+provided = sys.argv[2:sep]; bins = sys.argv[sep+1:]
+LIBDIRS = ["lib", "usr/lib"]
+
+def needed(path):
+    out = subprocess.run(["readelf", "-d", path], capture_output=True, text=True).stdout
+    return [l.split("[")[1].rstrip("]") for l in out.splitlines() if "(NEEDED)" in l]
+
+def find(base, soname):
+    for d in LIBDIRS:
+        p = os.path.join(base, d, soname)
+        if os.path.lexists(p): return os.path.relpath(p, base)
+    return None
+
+def chain(base, rel):
+    """rel plus every symlink target it passes through"""
+    res = []
+    while True:
+        res.append(rel)
+        p = os.path.join(base, rel)
+        if not os.path.islink(p): return res
+        t = os.readlink(p)
+        rel = os.path.normpath(os.path.join(os.path.dirname(rel), t))
+
+keep, seen, todo = [], set(), list(bins)
+for b in bins: keep += [b]
+while todo:
+    f = todo.pop()
+    for so in needed(os.path.join(root, f)):
+        if so in seen: continue
+        seen.add(so)
+        if any(find(p, so) for p in provided): continue
+        r = find(root, so)
+        if not r: print("UNRESOLVED", so, "needed by", f, file=sys.stderr); sys.exit(1)
+        c = chain(root, r)
+        keep += c; todo.append(c[-1])
+print("\n".join(dict.fromkeys(keep)))

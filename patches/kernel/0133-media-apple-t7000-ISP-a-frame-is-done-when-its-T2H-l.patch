@@ -1,0 +1,163 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 21:57:00 +0000
+Subject: [PATCH 133/138] media: apple: t7000 ISP: a frame is done when its T2H
+ list is a RENDER list
+
+The fw returned real images all along. The driver threw them away because
+it treated the per-plane bit 0x40000000 as "has data". In fw 13.42
+(0xa8ff0) that bit is only set when the fw CPU itself wrote the buffer
+(+0x50) and cleaned its cache (0xa7cd8). Scaler DMA output never has it.
+Like Asahi, decide on the T2H message word2: bits 31:28 = 1 (RENDER,
+0x10000000, list type 2 meta + frame; ch 1 adds low bits 0x5) is a
+rendered frame, and 3 (0x30000000, type 1) is CH_BUFFER_RETURN.
+
+Hw (power3 kernel, 2026-10-21): front IMX190 1376x776 at 29.9 fps and
+rear IMX237 1408x792 at 122 fps, 60/60 frames delivered, no faults.
+The front frame is a real image.
+
+smmu_en now defaults to 1. Without it the pipeline DMA bypasses the
+SMMU and wedges the SoC at CH_START (hw H2/H2b vs H5).
+
+ko (power3, hw-tested): var/hwcam4/apple-isp.ko md5 790e41e1bf5ffa8cde033ad076b95cb3
+ko (oscar, built against var/build-oscar, not yet on hw):
+var/hwcam4-oscar/apple-isp.ko md5 f3d645c950a56ccd15b9677d881b0380
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../media/platform/apple/isp-t7000/isp-cdev.c |  2 +-
+ .../media/platform/apple/isp-t7000/isp-main.c |  6 ++---
+ .../platform/apple/isp-t7000/isp-stream.c     | 22 ++++++++++++++-----
+ drivers/media/platform/apple/isp-t7000/isp.h  |  1 +
+ 4 files changed, 21 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-cdev.c b/drivers/media/platform/apple/isp-t7000/isp-cdev.c
+index 071179a81..80831ca7a 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-cdev.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-cdev.c
+@@ -140,7 +140,7 @@ static ssize_t isp_read(struct file *f, char __user *ubuf, size_t len, loff_t *o
+ 			fr.seq = b->seq;
+ 			fr.timestamp_ns = b->ts;
+ 			fr.bytesused = st->stride * st->height * 3 / 2;
+-			fr.flags = (b->fwflags & 0x40000000) ? 0 : ISP_FRAME_FLAG_NOT_FILLED;
++			fr.flags = b->filled ? 0 : ISP_FRAME_FLAG_NOT_FILLED;
+ 			spin_unlock(&st->frame_lock);
+ 			break;
+ 		}
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-main.c b/drivers/media/platform/apple/isp-t7000/isp-main.c
+index eecddf97f..43fa38378 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-main.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-main.c
+@@ -36,9 +36,9 @@ MODULE_PARM_DESC(irq, "1 = use AIC IRQ 91 for the mailbox (default: poll)");
+ int isp_sens = 1;
+ module_param_named(sens, isp_sens, int, 0444);
+ MODULE_PARM_DESC(sens, "1 = also power ps_ispsens0/1 like the kext EnableISPClocksAndPower (default); 0 = ISP only");
+-int isp_smmu_en;
++int isp_smmu_en = 1;
+ module_param_named(smmu_en, isp_smmu_en, int, 0444);
+-MODULE_PARM_DESC(smmu_en, "1 = also set SMMU+0xc byte[sid] |= 0x80 like iOS (default: SMMU read-only)");
++MODULE_PARM_DESC(smmu_en, "1 (default) = set SMMU+0xc byte[sid] |= 0x80 like iOS; 0 = SMMU read-only: the pipeline DMA bypasses translation and wedges the SoC at CH_START");
+ int isp_graceful = 1;
+ module_param_named(graceful, isp_graceful, int, 0444);
+ MODULE_PARM_DESC(graceful, "1 = STOP + POWER_DOWN handshake before halting a booted fw");
+@@ -159,7 +159,7 @@ module_param_named(pool_frame, isp_pool_frame, int, 0644);
+ MODULE_PARM_DESC(pool_frame, "fw pool id for frame (RENDERED) buffers (-1 = the type-1 record's id from POOL_CONFIG_GET, else 2)");
+ int isp_keep_empty;
+ module_param_named(keep_empty, isp_keep_empty, int, 0644);
+-MODULE_PARM_DESC(keep_empty, "1 = deliver frames the fw returned without the data flag 0x40000000 too (default: recycle them)");
++MODULE_PARM_DESC(keep_empty, "1 = also deliver frames the fw handed back unused (CH_BUFFER_RETURN, T2H word2 0x30000000; default: recycle them)");
+ int isp_dart_ios;
+ module_param_named(dart_ios, isp_dart_ios, int, 0444);
+ MODULE_PARM_DESC(dart_ios, "1 = also program DART diag(+0x20)=0x100, fetch(+0x30)=0xe0303, bypass(+0x2c)=0 and SMMU bypass(+0x2c)=0 like the iOS DART restore");
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-stream.c b/drivers/media/platform/apple/isp-t7000/isp-stream.c
+index 295f0d586..a249f13d6 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-stream.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-stream.c
+@@ -6,6 +6,11 @@
+  *   { u32 type, u32 count, count x { u32 addr[3], u32 flags[3], u32 nplanes, u32 pool, u64 tag } }
+  * Host -> fw on BUF_H2T (type-0 ring: word0 = fw-rel list, word1 = length, word2 bit 28 =
+  * list mode); fw -> host on BUF_T2H (type-1 ring: reply word0 = list | 1, word2 = 0x80000000).
++ * A T2H list with word2 bits 31:28 = 1 (Asahi ISP_IPC_BUFEXC_FLAG_RENDER 0x10000000; list type 2:
++ * meta + frame; low bits seen on hw: ch 0 -> 0, ch 1 -> 5) carries rendered frames; word2 =
++ * 0x30000000 (list type 1) is CH_BUFFER_RETURN handing back unused buffers. The per-plane
++ * bit 0x40000000 is NOT a data flag: fw 0xa8ff0 sets it only when the
++ * fw CPU wrote the buffer (+0x50) and cleaned its cache (0xa7cd8); scaler DMA output never has it.
+  * Buffer states change under st.frame_lock; everything that talks to the fw holds isp->lock.
+  */
+ #include <linux/delay.h>
+@@ -22,7 +27,9 @@
+ #define ISP_TAG(pool, i)	((ISP_TAG_MAGIC << 32) | ((u64)(pool) << 16) | (i))
+ #define ISP_H2T_LIST		0x10000000	/* word2 bit 28: word0 is a buffer list */
+ #define ISP_H2T_WORD2		0x30000000	/* Asahi's BUFEXC COMMAND value (bit 28 set) */
+-#define ISP_BUF_FILLED		0x40000000	/* per-plane flag (Asahi submits it; fw sets it on data) */
++#define ISP_BUF_FILLED		0x40000000	/* per-plane: fw CPU wrote it + cache clean (Asahi submits it) */
++#define ISP_T2H_KIND(w2)	((w2) >> 28)	/* T2H word2 bits 31:28: 1 render, 3 buffer return */
++#define ISP_T2H_RENDER		1
+ #define ISP_LIST_MIN		0x180		/* the fw's own T2H list size */
+ 
+ struct isp_bl_entry {
+@@ -178,11 +185,12 @@ static void isp_frame_limit(struct isp_stream *st)
+ 	}
+ }
+ 
+-static void isp_t2h_entry(struct t7000_isp *isp, const struct isp_bl_entry *e)
++static void isp_t2h_entry(struct t7000_isp *isp, const struct isp_bl_entry *e, bool rendered)
+ {
+ 	struct isp_stream *st = &isp->st;
+ 	u32 pool = (e->tag >> 16) & 0xffff, i = e->tag & 0xffff;
+ 	struct isp_sbuf *b;
++	bool filled;
+ 
+ 	if ((e->tag >> 32) != ISP_TAG_MAGIC || i >= st->nbufs ||
+ 	    (pool != ISP_POOL_META && pool != ISP_POOL_RENDERED) ||
+@@ -193,6 +201,7 @@ static void isp_t2h_entry(struct t7000_isp *isp, const struct isp_bl_entry *e)
+ 		return;
+ 	}
+ 	b = pool == ISP_POOL_META ? &st->meta[i] : &st->buf[i];
++	filled = rendered || (e->flags[0] & ISP_BUF_FILLED);
+ 	if (READ_ONCE(isp_stream_dump))
+ 		dev_info(isp->dev, "T2H: pool %u idx %u planes %u addr %08x %08x flags %08x %08x\n",
+ 			 pool, i, e->nplanes, e->addr[0], e->addr[1], e->flags[0], e->flags[1]);
+@@ -204,10 +213,10 @@ static void isp_t2h_entry(struct t7000_isp *isp, const struct isp_bl_entry *e)
+ 				     pool, i, b->state);
+ 		return;
+ 	}
+-	if (pool == ISP_POOL_RENDERED && !(e->flags[0] & ISP_BUF_FILLED) && !READ_ONCE(isp_keep_empty))
+-		st->empty++;	/* no data flag (fw 0xa8ff0): recycle, not a frame */
++	if (pool == ISP_POOL_RENDERED && !filled && !READ_ONCE(isp_keep_empty))
++		st->empty++;	/* CH_BUFFER_RETURN (word2 0x30000000): recycle, not a frame */
+ 	if (pool == ISP_POOL_META || !st->on || st->stopping ||
+-	    (!(e->flags[0] & ISP_BUF_FILLED) && !READ_ONCE(isp_keep_empty))) {
++	    (!filled && !READ_ONCE(isp_keep_empty))) {
+ 		b->state = BUF_FREE;	/* meta, empty, or a buffer handed back by CH_BUFFER_RETURN */
+ 		spin_unlock(&st->frame_lock);
+ 		return;
+@@ -216,6 +225,7 @@ static void isp_t2h_entry(struct t7000_isp *isp, const struct isp_bl_entry *e)
+ 	b->seq = st->seq++;
+ 	b->ts = ktime_get_ns();
+ 	b->fwflags = e->flags[0];
++	b->filled = filled;
+ 	st->ready[st->nready++] = i;
+ 	st->frames++;
+ 	isp_frame_limit(st);
+@@ -260,7 +270,7 @@ u32 isp_bt_handle(struct t7000_isp *isp, u32 w0, u32 w1, u32 w2)
+ 		dev_info(isp->dev, "T2H: list fw-rel 0x%08x type %u count %u w1 0x%x w2 0x%08x\n",
+ 			 rel, bl->type, bl->count, w1, w2);
+ 	for (i = 0; i < n; i++)
+-		isp_t2h_entry(isp, &bl->e[i]);
++		isp_t2h_entry(isp, &bl->e[i], ISP_T2H_KIND(w2) == ISP_T2H_RENDER);
+ 	return rel | 1;
+ }
+ 
+diff --git a/drivers/media/platform/apple/isp-t7000/isp.h b/drivers/media/platform/apple/isp-t7000/isp.h
+index cc73b8478..0c8ea5fb9 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp.h
++++ b/drivers/media/platform/apple/isp-t7000/isp.h
+@@ -157,6 +157,7 @@ struct isp_sbuf {
+ 	u32 seq;
+ 	u64 ts;
+ 	u32 fwflags;
++	bool filled;		/* came back in a RENDER list (T2H word2 0x1xxxxxxx) */
+ };
+ 
+ struct isp_stream {

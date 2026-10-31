@@ -1,0 +1,159 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 00:29:27 +0000
+Subject: [PATCH 027/138] regulator: Add a driver for the Apple PMIC LDO
+ switches
+
+Expose LDO15 (register 0x85, bit 1) of the A8 iPhone PMIC as a
+regulator. The voltage is fixed by the PMIC and not known.
+
+Tested on the iPhone 6 (N61) together with the touchscreen.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/regulator/Kconfig                | 12 +++
+ drivers/regulator/Makefile               |  1 +
+ drivers/regulator/apple-pmic-regulator.c | 99 ++++++++++++++++++++++++
+ 3 files changed, 112 insertions(+)
+ create mode 100644 drivers/regulator/apple-pmic-regulator.c
+
+diff --git a/drivers/regulator/Kconfig b/drivers/regulator/Kconfig
+index ec3f12b07..a1778577b 100644
+--- a/drivers/regulator/Kconfig
++++ b/drivers/regulator/Kconfig
+@@ -217,6 +217,18 @@ config REGULATOR_APPLE_CHESTNUT
+ 	  This driver can also be built as a module. If so, the module
+ 	  will be called apple-chestnut-regulator.
+ 
++config REGULATOR_APPLE_PMIC
++	tristate "Apple PMIC regulators"
++	depends on I2C
++	depends on ARCH_APPLE || COMPILE_TEST
++	select MFD_SIMPLE_MFD_I2C
++	help
++	  This driver supports the enable-only LDO switches of the Dialog
++	  based PMICs found in Apple A8 iPhones.
++
++	  This driver can also be built as a module. If so, the module
++	  will be called apple-pmic-regulator.
++
+ config REGULATOR_AW37503
+ 	tristate "Awinic AW37503 Dual Output Power regulators"
+ 	depends on I2C && GPIOLIB
+diff --git a/drivers/regulator/Makefile b/drivers/regulator/Makefile
+index d0c9db4fb..24023b08a 100644
+--- a/drivers/regulator/Makefile
++++ b/drivers/regulator/Makefile
+@@ -22,6 +22,7 @@ obj-$(CONFIG_REGULATOR_AB8500)	+= ab8500-ext.o ab8500.o
+ obj-$(CONFIG_REGULATOR_ACT8865) += act8865-regulator.o
+ obj-$(CONFIG_REGULATOR_ACT8945A) += act8945a-regulator.o
+ obj-$(CONFIG_REGULATOR_APPLE_CHESTNUT) += apple-chestnut-regulator.o
++obj-$(CONFIG_REGULATOR_APPLE_PMIC) += apple-pmic-regulator.o
+ obj-$(CONFIG_REGULATOR_AD5398) += ad5398.o
+ obj-$(CONFIG_REGULATOR_ADP5055) += adp5055-regulator.o
+ obj-$(CONFIG_REGULATOR_ANATOP) += anatop-regulator.o
+diff --git a/drivers/regulator/apple-pmic-regulator.c b/drivers/regulator/apple-pmic-regulator.c
+new file mode 100644
+index 000000000..97e9cdd78
+--- /dev/null
++++ b/drivers/regulator/apple-pmic-regulator.c
+@@ -0,0 +1,99 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Apple PMIC regulator driver
++ *
++ * Enable-only LDO switches in the Dialog based PMICs of Apple A8 devices.
++ * The PMIC is described by an apple,i2c-pmic MFD, which provides the 16 bit
++ * register map shared by its children. The register that holds the enable
++ * bit comes from the "reg" property, the bit itself from the compatible.
++ *
++ * Only the enable bit is touched and no voltage is programmed: the rails keep
++ * the voltage the bootloader set up.
++ */
++
++#include <linux/bits.h>
++#include <linux/err.h>
++#include <linux/device.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++#include <linux/regulator/driver.h>
++#include <linux/slab.h>
++
++struct apple_pmic_ldo_data {
++	const char *name;
++	unsigned int enable_mask;
++};
++
++static const struct regulator_ops apple_pmic_ldo_ops = {
++	.enable = regulator_enable_regmap,
++	.disable = regulator_disable_regmap,
++	.is_enabled = regulator_is_enabled_regmap,
++};
++
++static int apple_pmic_regulator_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	const struct apple_pmic_ldo_data *data;
++	struct regulator_config config = { };
++	struct regulator_desc *desc;
++	struct regulator_dev *rdev;
++	u32 reg;
++	int ret;
++
++	data = device_get_match_data(dev);
++
++	ret = of_property_read_u32_index(dev->of_node, "reg", 0, &reg);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to read reg\n");
++
++	desc = devm_kzalloc(dev, sizeof(*desc), GFP_KERNEL);
++	if (!desc)
++		return -ENOMEM;
++
++	desc->name = data->name;
++	desc->of_match = data->name;
++	desc->type = REGULATOR_VOLTAGE;
++	desc->owner = THIS_MODULE;
++	desc->ops = &apple_pmic_ldo_ops;
++	desc->enable_reg = reg;
++	desc->enable_mask = data->enable_mask;
++
++	config.dev = dev;
++	config.regmap = dev_get_regmap(dev->parent, NULL);
++	if (!config.regmap)
++		return dev_err_probe(dev, -ENODEV, "parent has no regmap\n");
++
++	rdev = devm_regulator_register(dev, desc, &config);
++	if (IS_ERR(rdev))
++		return dev_err_probe(dev, PTR_ERR(rdev),
++				     "failed to register %s\n", data->name);
++
++	return 0;
++}
++
++/* D2186: register 0x0085 holds the enables of ldo14..ldo18 in bits 0..4 */
++static const struct apple_pmic_ldo_data adi_pmic_ldo15 = {
++	.name = "ldo15",
++	.enable_mask = BIT(1),
++};
++
++static const struct of_device_id apple_pmic_regulator_of_match[] = {
++	{ .compatible = "apple,adi-pmic-ldo15", .data = &adi_pmic_ldo15 },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, apple_pmic_regulator_of_match);
++
++static struct platform_driver apple_pmic_regulator_driver = {
++	.probe = apple_pmic_regulator_probe,
++	.driver = {
++		.name = "apple-pmic-regulator",
++		.of_match_table = apple_pmic_regulator_of_match,
++	},
++};
++module_platform_driver(apple_pmic_regulator_driver);
++
++MODULE_DESCRIPTION("Apple PMIC regulator driver");
++MODULE_LICENSE("GPL");

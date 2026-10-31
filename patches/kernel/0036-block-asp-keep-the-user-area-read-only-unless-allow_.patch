@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 03:42:18 +0000
+Subject: [PATCH 036/138] block: asp: keep the user area read-only unless
+ allow_write=1
+
+The user area holds the iOS install. Skip WRITE_UNLOCK and mark the
+disk read-only by default; allow_write=1 restores the old behaviour.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/block/asp.c | 31 ++++++++++++++++++++-----------
+ 1 file changed, 20 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/block/asp.c b/drivers/block/asp.c
+index e329fea00..35846901d 100644
+--- a/drivers/block/asp.c
++++ b/drivers/block/asp.c
+@@ -254,6 +254,10 @@ static bool enable_reformat;
+ module_param(enable_reformat, bool, 0644);
+ MODULE_PARM_DESC(enable_reformat, "Automatically format unformatted media");
+ 
++static bool allow_write;
++module_param(allow_write, bool, 0444);
++MODULE_PARM_DESC(allow_write, "Unlock writes to the user area (default: read-only)");
++
+ //static int asp_major;
+ static DEFINE_IDA(asp_instance_ida);
+ 
+@@ -813,20 +817,22 @@ static int apple_asp_start_disk(struct apple_asp *asp)
+ 
+ 	kfree(identify);
+ 
+-	cmd->op = ASP_CMD_WRITE_UNLOCK;
+-	cmd->flags = 0;
+-	cmd->slba = 0;
+-	cmd->length = 0;
++	if (allow_write) {
++		cmd->op = ASP_CMD_WRITE_UNLOCK;
++		cmd->flags = 0;
++		cmd->slba = 0;
++		cmd->length = 0;
++
++		status = asp_submit_sync_admin_cmd(asp->admin_rq, cmd, NULL, 0);
++		if (status) {
++			dev_err(asp->dev, "could not enable writes: %d", status);
++			ret = -EIO;
++			goto out_free_cmd;
++		}
+ 
+-	status = asp_submit_sync_admin_cmd(asp->admin_rq, cmd, NULL, 0);
+-	if (status) {
+-		dev_err(asp->dev, "could not enable writes: %d", status);
+-		ret = -EIO;
+-		goto out_free_cmd;
++		dev_dbg(asp->dev, "Write enable OK");
+ 	}
+ 
+-	dev_dbg(asp->dev, "Write enable OK");
+-
+ 	struct queue_limits lim = {
+ 		.logical_block_size = ASP_LBA_SIZE,
+ 		.max_hw_sectors = ASP_CMD_MAX_SECTORS,
+@@ -867,6 +873,9 @@ static int apple_asp_start_disk(struct apple_asp *asp)
+ 	 * NVRAM, so set it to RO outside of the loop such that the statement
+ 	 * can be removed on per-namespace basis.
+ 	 */
++	/* the user area holds the iOS install: keep it read-only unless asked */
++	if (!allow_write)
++		set_disk_ro(asp->q_data[ASP_QUEUE_TYPE_USERAREA].disk, true);
+ 	set_disk_ro(asp->q_data[ASP_QUEUE_TYPE_LLB].disk, true);
+ 	set_disk_ro(asp->q_data[ASP_QUEUE_TYPE_FW].disk, true);
+ 	/* write disallowed at controller level */

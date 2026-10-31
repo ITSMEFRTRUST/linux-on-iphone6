@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 20:36:15 +0000
+Subject: [PATCH 078/138] pmdomain: apple: Keep the power domains on across
+ system suspend
+
+genpd powers off every domain whose devices are all suspended in the
+noirq phase of system suspend. On T7000 that is nearly everything that
+is not apple,always-on: gpio, ans, pcie_ref, disp0/mipi_dsi, usb*, the
+UARTs, I2C and SPI blocks. Linux cannot bring most of them back: the
+display pipe and the flash IOP were set up by iBoot, the PCIe link would
+need a re-train that pcie-apple does not do on resume, and a GPIO block
+that lost power forgets every pin setting and cannot deliver the button
+interrupt that is supposed to end suspend-to-idle. The first
+"echo freeze > /sys/power/state" would end in a phone that never wakes.
+
+Give the domains a governor whose ->system_power_down_ok() says no, so
+genpd_sync_power_off() leaves them alone. Runtime PM and the late_initcall
+power-off of unused domains do not consult that callback and behave as
+before. pmgr_pwrstate.suspend_power_off=1 (or the sysfs parameter)
+restores the old behaviour for experiments with drivers that do restore
+their block.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/pmdomain/apple/pmgr-pwrstate.c | 25 ++++++++++++++++++++++++-
+ 1 file changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/pmdomain/apple/pmgr-pwrstate.c b/drivers/pmdomain/apple/pmgr-pwrstate.c
+index 82c33cf72..2986e8383 100644
+--- a/drivers/pmdomain/apple/pmgr-pwrstate.c
++++ b/drivers/pmdomain/apple/pmgr-pwrstate.c
+@@ -47,6 +47,29 @@ struct apple_pmgr_ps {
+ };
+ 
+ #define genpd_to_apple_pmgr_ps(_genpd) container_of(_genpd, struct apple_pmgr_ps, genpd)
++
++/*
++ * System suspend (s2idle) leaves every domain powered by default. genpd would
++ * otherwise cut each domain whose devices are all suspended, and on A7/A8 most
++ * of the blocks behind them cannot be brought back by Linux: the display pipe
++ * and the flash IOP were set up by iBoot, the PCIe link would need a full
++ * re-train, and losing the GPIO block loses every pin setting and the button
++ * wake path. Runtime PM and the boot-time power-off of unused domains are not
++ * affected.
++ */
++static bool suspend_power_off;
++module_param(suspend_power_off, bool, 0644);
++MODULE_PARM_DESC(suspend_power_off,
++		 "Let genpd power domains off during system suspend (default: keep them on)");
++
++static bool apple_pmgr_ps_system_power_down_ok(struct dev_pm_domain *pd)
++{
++	return READ_ONCE(suspend_power_off);
++}
++
++static struct dev_power_governor apple_pmgr_ps_gov = {
++	.system_power_down_ok = apple_pmgr_ps_system_power_down_ok,
++};
+ #define rcdev_to_apple_pmgr_ps(_rcdev) container_of(_rcdev, struct apple_pmgr_ps, rcdev)
+ 
+ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool auto_enable)
+@@ -249,7 +272,7 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
+ 		regmap_update_bits(regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_AUTO_ENABLE,
+ 				   APPLE_PMGR_AUTO_ENABLE);
+ 
+-	ret = pm_genpd_init(&ps->genpd, NULL, !active);
++	ret = pm_genpd_init(&ps->genpd, &apple_pmgr_ps_gov, !active);
+ 	if (ret < 0) {
+ 		dev_err(dev, "pm_genpd_init failed\n");
+ 		return ret;

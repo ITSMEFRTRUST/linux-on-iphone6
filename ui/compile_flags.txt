@@ -1,0 +1,6 @@
+-I.
+-Isrc
+-Ithird_party/lvgl
+-Ithird_party/libvterm-0.3.3/include
+-DLV_CONF_INCLUDE_SIMPLE
+-DORCHARD_SDL

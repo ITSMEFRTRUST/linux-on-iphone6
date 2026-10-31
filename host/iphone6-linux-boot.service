@@ -1,0 +1,10 @@
+[Unit]
+Description=Boot Linux on the iPhone 6 when it enters DFU
+
+[Service]
+Type=oneshot
+# Template: replace YOUR_USER, YOUR_UID and /path/to/iphone6-linux before installing (see README, "Autoboot").
+User=YOUR_USER
+Environment=HOME=/home/YOUR_USER DISPLAY=:0 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/YOUR_UID/bus
+ExecStart=/path/to/iphone6-linux/bin/autoboot
+TimeoutStartSec=300

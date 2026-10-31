@@ -1,0 +1,234 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 03:08:34 +0000
+Subject: [PATCH 110/138] power: supply: sn2400: Use the chip's interrupt line
+
+On the iPhone 6 the SN2400 INT goes to PMU GPIO 0 (PMU event 24), and
+that, not the PMU's own VBUS event, is how iOS learns about cable
+changes: its D2186 driver asks the charger for VBUS detect, which is a
+flag set by the charger's interrupt handler.
+
+With an "irq" interrupt, unmask the events iOS uses for that (event 1
+bits 2, 4, 6, 7 and event 3 bit 0, tunable with irq_events) and treat
+any of them like the VBUS event: settle, check the input limit, tell
+userspace. The handler always reads the events, which releases the
+level line. A source that keeps firing gets everything masked again,
+once. The INT line is the wake source when described.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/power/supply/sn2400_charger.c | 134 ++++++++++++++++++++++++--
+ 1 file changed, 128 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/power/supply/sn2400_charger.c b/drivers/power/supply/sn2400_charger.c
+index 0979ab60f..e03f9c484 100644
+--- a/drivers/power/supply/sn2400_charger.c
++++ b/drivers/power/supply/sn2400_charger.c
+@@ -8,22 +8,30 @@
+  * it has an input current limit, so the driver only programs the input
+  * and charge current and reads back the ADC.
+  *
+- * The chip's own interrupt line goes through the PMU and is not used: the
+- * input limit is checked by polling. The PMU's VBUS detect event, when
+- * described, reports plug and unplug right away and wakes the system.
++ * The chip's own interrupt output goes through the PMU (on the iPhone 6 PMU
++ * GPIO 0, a level input). When it is described, the events iOS uses for
++ * cable changes are unmasked: event 1 bits 2 and 4 (adapter change) and
++ * bits 6 and 7 plus event 3 bit 0 (input limit / VBUS change, what iOS
++ * reports as "VBUS detect"). Any of them makes the driver look at the
++ * input limit again and tell userspace, and it can wake the system. The
++ * events latch until read, and reading them is what releases the line, so
++ * the handler always reads them. The input limit is polled as well.
+  */
+ 
+ #include <linux/bits.h>
+ #include <linux/devm-helpers.h>
+ #include <linux/i2c.h>
+ #include <linux/interrupt.h>
++#include <linux/jiffies.h>
+ #include <linux/kernel.h>
+ #include <linux/module.h>
++#include <linux/moduleparam.h>
+ #include <linux/mutex.h>
+ #include <linux/pm_wakeirq.h>
+ #include <linux/power_supply.h>
+ #include <linux/property.h>
+ #include <linux/regmap.h>
++#include <linux/string.h>
+ #include <linux/workqueue.h>
+ 
+ #define SN2400_EVENT_MASK1	0x01	/* 0x01-0x03, 1 = masked */
+@@ -55,11 +63,24 @@
+ #define SN2400_VBUS_ONLINE	4000000
+ #define SN2400_VBUS_LIMIT	4500000
+ 
++/*
++ * Events unmasked when the INT line is described, as ev3 << 16 | ev2 << 8 |
++ * ev1. Event 3 bit 2 (input power limited) is left out: iOS masks it again
++ * on its first hit, it fires in a loop while VBUS sags.
++ */
++#define SN2400_IRQ_EVENTS	0x0100d4
++#define SN2400_IRQ_MAX_PER_S	20
++
+ #define SN2400_DEF_INPUT	500000
+ #define SN2400_DEF_CHG		1000000
+ #define SN2400_POLL_MS		5000
+ #define SN2400_VBUS_SETTLE_MS	500
+ 
++static uint irq_events = SN2400_IRQ_EVENTS;
++module_param(irq_events, uint, 0444);
++MODULE_PARM_DESC(irq_events,
++		 "Events to unmask on the INT line, ev3 << 16 | ev2 << 8 | ev1");
++
+ struct sn2400 {
+ 	struct device *dev;
+ 	struct regmap *regmap;
+@@ -70,6 +91,9 @@ struct sn2400 {
+ 	u32 chg_current;
+ 	bool suspended;		/* no I2C from the VBUS event until resume */
+ 	bool vbus_event;	/* report a change from the next work run */
++	u8 irq_mask[3];		/* written to the event masks, 1 = masked */
++	unsigned long irq_window;
++	unsigned int irq_runs;
+ };
+ 
+ static const struct regmap_config sn2400_regmap = {
+@@ -186,7 +210,8 @@ static void sn2400_work(struct work_struct *work)
+ }
+ 
+ /*
+- * PMU VBUS detect (plug or unplug). Let VBUS settle, then check the input
++ * Cable change (plug or unplug), from the INT line or a VBUS detect event of
++ * the PMU. Let VBUS settle, then check the input
+  * limit (the chip starts at 90 mA after a plug) and tell userspace.
+  */
+ static irqreturn_t sn2400_vbus_irq(int irq, void *data)
+@@ -205,6 +230,96 @@ static irqreturn_t sn2400_vbus_irq(int irq, void *data)
+ 	return IRQ_HANDLED;
+ }
+ 
++/*
++ * The chip's INT line. Reading the events clears them and releases the line;
++ * the PMU sees a level input and latches its own event again until then.
++ * The read has to happen even while suspending: the line is a wake source,
++ * and the PMU interrupt stays busy for as long as the line is asserted. A
++ * source that keeps firing gets everything masked again, once.
++ */
++static irqreturn_t sn2400_irq(int irq, void *data)
++{
++	static const u8 all[3] = { 0xff, 0xff, 0xff };
++	struct sn2400 *sn = data;
++	u8 ev[3];
++	bool active;
++	int ret;
++
++	ret = regmap_bulk_read(sn->regmap, SN2400_EVENT1, ev, sizeof(ev));
++	if (ret) {
++		dev_err_ratelimited(sn->dev, "failed to read events: %d\n", ret);
++		return IRQ_NONE;
++	}
++
++	active = (ev[0] & ~sn->irq_mask[0]) || (ev[1] & ~sn->irq_mask[1]) ||
++		 (ev[2] & ~sn->irq_mask[2]);
++
++	dev_dbg(sn->dev, "events %3ph\n", ev);
++
++	if (!active)
++		return IRQ_HANDLED;
++
++	if (time_after(jiffies, sn->irq_window + HZ)) {
++		sn->irq_window = jiffies;
++		sn->irq_runs = 0;
++	}
++	if (++sn->irq_runs > SN2400_IRQ_MAX_PER_S) {
++		dev_err(sn->dev,
++			"event storm (last %3ph), events masked until reboot\n",
++			ev);
++		memcpy(sn->irq_mask, all, sizeof(all));
++		if (!regmap_bulk_write(sn->regmap, SN2400_EVENT_MASK1, all,
++				       sizeof(all)))
++			regmap_bulk_read(sn->regmap, SN2400_EVENT1, ev,
++					 sizeof(ev));
++	}
++
++	return sn2400_vbus_irq(irq, data);
++}
++
++static int sn2400_request_irq(struct sn2400 *sn)
++{
++	struct device *dev = sn->dev;
++	int irq, ret;
++
++	irq = fwnode_irq_get_byname(dev_fwnode(dev), "irq");
++	if (irq == -EPROBE_DEFER)
++		return irq;
++	if (irq <= 0)
++		return 0;
++
++	sn->irq_window = jiffies;
++	ret = devm_request_threaded_irq(dev, irq, NULL, sn2400_irq,
++					IRQF_ONESHOT, "sn2400", sn);
++	if (ret) {
++		dev_warn(dev, "interrupt unusable: %d\n", ret);
++		return 0;
++	}
++
++	sn->irq_mask[0] = ~(irq_events & 0xff);
++	sn->irq_mask[1] = ~((irq_events >> 8) & 0xff);
++	sn->irq_mask[2] = ~((irq_events >> 16) & 0xff);
++	ret = regmap_bulk_write(sn->regmap, SN2400_EVENT_MASK1, sn->irq_mask,
++				sizeof(sn->irq_mask));
++	if (ret) {
++		dev_warn(dev, "failed to unmask events: %d\n", ret);
++		memset(sn->irq_mask, 0xff, sizeof(sn->irq_mask));
++		return 0;
++	}
++
++	dev_info(dev, "interrupt on, event masks %3ph\n", sn->irq_mask);
++
++	if (device_property_read_bool(dev, "wakeup-source")) {
++		ret = devm_device_init_wakeup(dev);
++		if (!ret)
++			ret = devm_pm_set_wake_irq(dev, irq);
++		if (ret)
++			dev_warn(dev, "wake unusable: %d\n", ret);
++	}
++
++	return 0;
++}
++
+ static int sn2400_request_vbus_irq(struct sn2400 *sn)
+ {
+ 	struct device *dev = sn->dev;
+@@ -223,7 +338,9 @@ static int sn2400_request_vbus_irq(struct sn2400 *sn)
+ 		return 0;
+ 	}
+ 
+-	if (device_property_read_bool(dev, "wakeup-source")) {
++	/* The INT line, when there is one, is the wake source already */
++	if (device_property_read_bool(dev, "wakeup-source") &&
++	    !device_can_wakeup(dev)) {
+ 		ret = devm_device_init_wakeup(dev);
+ 		if (!ret)
+ 			ret = devm_pm_set_wake_irq(dev, irq);
+@@ -373,7 +490,7 @@ static int sn2400_probe(struct i2c_client *client)
+ 		return dev_err_probe(dev, PTR_ERR(sn->regmap),
+ 				     "failed to init regmap\n");
+ 
+-	/* No interrupt yet: mask all events and clear pending ones */
++	/* Mask all events and clear pending ones; the INT line unmasks some */
+ 	ret = regmap_bulk_write(sn->regmap, SN2400_EVENT_MASK1, mask,
+ 				sizeof(mask));
+ 	if (ret)
+@@ -403,6 +520,11 @@ static int sn2400_probe(struct i2c_client *client)
+ 	if (ret)
+ 		return ret;
+ 
++	memset(sn->irq_mask, 0xff, sizeof(sn->irq_mask));
++	ret = sn2400_request_irq(sn);
++	if (ret)
++		return ret;
++
+ 	ret = sn2400_request_vbus_irq(sn);
+ 	if (ret)
+ 		return ret;

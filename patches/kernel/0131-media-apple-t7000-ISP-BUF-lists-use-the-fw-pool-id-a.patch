@@ -1,0 +1,156 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 21:18:26 +0000
+Subject: [PATCH 131/138] media: apple: t7000 ISP: BUF lists use the fw pool
+ id, ask POOL_CONFIG_GET for all records
+
+hw 2026-10-21 (smmu_en=1, no wedge): the fw returned every 2-plane frame buffer we
+posted as pool 1 as a 1-plane META buffer (0x2c40 bytes of metadata, no 0x40000000
+data flag). fw 0xa9590/0xa8fc0: the list's +0x1c indexes the fw pool table by pool
+*id*; 0x16b90 numbers them id = ch * n + index + 1 (ch 0: META 1, RENDERED 2) and stops
+after +0xc records (we sent 0 -> 'Not all the supported pools are reported!').
+
+- POOL_CONFIG_GET: +0xc = 15, take the META/RENDERED ids from the records
+  (fallback 1/2), log them; pool_meta=/pool_frame= override (0644).
+- BUF lists carry the fw id, the tag keeps our kind; T2H checks both.
+- Frames returned without the data flag are recycled, not delivered
+  (debugfs 'empty'); keep_empty=1 delivers them anyway.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../media/platform/apple/isp-t7000/isp-cdev.c    |  1 +
+ .../media/platform/apple/isp-t7000/isp-main.c    | 10 ++++++++++
+ .../media/platform/apple/isp-t7000/isp-scfg.c    | 11 +++++++++++
+ .../media/platform/apple/isp-t7000/isp-stream.c  | 16 ++++++++++------
+ drivers/media/platform/apple/isp-t7000/isp.h     |  4 +++-
+ 5 files changed, 35 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-cdev.c b/drivers/media/platform/apple/isp-t7000/isp-cdev.c
+index 8d4c6e624..071179a81 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-cdev.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-cdev.c
+@@ -227,6 +227,7 @@ int isp_cdev_init(struct t7000_isp *isp)
+ 	debugfs_create_u64("errors", 0444, isp->dbg, &st->errors);
+ 	debugfs_create_u64("h2t_posts", 0444, isp->dbg, &st->h2t_posts);
+ 	debugfs_create_u64("h2t_busy", 0444, isp->dbg, &st->h2t_busy);
++	debugfs_create_u32("empty", 0444, isp->dbg, &st->empty);
+ 	debugfs_create_u64("t2h_msgs", 0444, isp->dbg, &st->t2h_msgs);
+ 	dev_info(isp->dev, "stream: /dev/isp0 ready (debugfs apple-isp/)\n");
+ 	return 0;
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-main.c b/drivers/media/platform/apple/isp-t7000/isp-main.c
+index 83a00067f..eecddf97f 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-main.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-main.c
+@@ -150,6 +150,16 @@ MODULE_PARM_DESC(quiet_ms, "N > 0: after CH_START, N ms (max 10000) with no ISP
+ int isp_stream_nobufs;
+ module_param_named(stream_nobufs, isp_stream_nobufs, int, 0644);
+ MODULE_PARM_DESC(stream_nobufs, "1 = CH_START without posting any frame/meta buffer (only the fw's own SHAREDMALLOC buffers get DMA)");
++/* fw pool ids (re/HW-TEST-2026-10-21.md step 15): the BUF list +0x1c indexes the fw's pool table by id, not type */
++int isp_pool_meta = -1;
++module_param_named(pool_meta, isp_pool_meta, int, 0644);
++MODULE_PARM_DESC(pool_meta, "fw pool id for META buffers in the BUF lists (-1 = the type-0 record's id from POOL_CONFIG_GET, else 1)");
++int isp_pool_frame = -1;
++module_param_named(pool_frame, isp_pool_frame, int, 0644);
++MODULE_PARM_DESC(pool_frame, "fw pool id for frame (RENDERED) buffers (-1 = the type-1 record's id from POOL_CONFIG_GET, else 2)");
++int isp_keep_empty;
++module_param_named(keep_empty, isp_keep_empty, int, 0644);
++MODULE_PARM_DESC(keep_empty, "1 = deliver frames the fw returned without the data flag 0x40000000 too (default: recycle them)");
+ int isp_dart_ios;
+ module_param_named(dart_ios, isp_dart_ios, int, 0444);
+ MODULE_PARM_DESC(dart_ios, "1 = also program DART diag(+0x20)=0x100, fetch(+0x30)=0xe0303, bypass(+0x2c)=0 and SMMU bypass(+0x2c)=0 like the iOS DART restore");
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-scfg.c b/drivers/media/platform/apple/isp-t7000/isp-scfg.c
+index 5613c4dcc..8da8c420a 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-scfg.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-scfg.c
+@@ -173,7 +173,10 @@ static void isp_config_meta(struct t7000_isp *isp, u8 *buf)
+ 	memset(buf, 0, ISP_POOLGET_SIZE);
+ 	((struct isp_cmd_hdr *)buf)->opcode = CISP_CMD_CH_BUFFER_POOL_CONFIG_GET;
+ 	*(u32 *)(buf + 8) = st->ch;
++	*(u32 *)(buf + 0xc) = 15;	/* fw 0x16b90: max records; 0 = "Not all the supported pools are reported!" after 1 */
+ 	st->meta_size = 0;
++	st->pool_id[ISP_POOL_META] = 1;		/* ch 0 ids seen on hw: META 1; fw: id = ch * n + index + 1 */
++	st->pool_id[ISP_POOL_RENDERED] = 2;
+ 	if (isp_ch_cmd(isp, "BUFFER_POOL_CONFIG_GET", buf, ISP_POOLGET_SIZE, true))
+ 		return;
+ 	for (i = 0; i < 15; i++) {
+@@ -186,7 +189,15 @@ static void isp_config_meta(struct t7000_isp *isp, u8 *buf)
+ 			 rd16(buf, off + 0xe));
+ 		if (rd16(buf, off) == ISP_POOL_META && rd32(buf, off + 8) <= SZ_1M)
+ 			st->meta_size = rd32(buf, off + 8);
++		if (rd16(buf, off) <= ISP_POOL_RENDERED)	/* type 0 META, 1 RENDERED */
++			st->pool_id[rd16(buf, off)] = rd16(buf, off + 2);
+ 	}
++	if (isp_pool_meta >= 0)
++		st->pool_id[ISP_POOL_META] = isp_pool_meta;
++	if (isp_pool_frame >= 0)
++		st->pool_id[ISP_POOL_RENDERED] = isp_pool_frame;
++	dev_info(isp->dev, "pool ids: META %u, RENDERED %u\n", st->pool_id[ISP_POOL_META],
++		 st->pool_id[ISP_POOL_RENDERED]);
+ 	if (!st->meta_size) {
+ 		dev_warn(isp->dev, "no META pool reported: not submitting meta buffers\n");
+ 		return;
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-stream.c b/drivers/media/platform/apple/isp-t7000/isp-stream.c
+index b0bb13752..295f0d586 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-stream.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-stream.c
+@@ -48,7 +48,7 @@ static void isp_fill_entry(struct t7000_isp *isp, struct isp_bl_entry *e, u32 po
+ 	struct isp_stream *st = &isp->st;
+ 
+ 	memset(e, 0, sizeof(*e));
+-	e->pool = pool;
++	e->pool = st->pool_id[pool];	/* fw pool id; the tag keeps our kind */
+ 	e->tag = ISP_TAG(pool, i);
+ 	if (pool == ISP_POOL_META) {
+ 		e->addr[0] = isp_rel(st->meta[i].surf->iova);
+@@ -181,11 +181,12 @@ static void isp_frame_limit(struct isp_stream *st)
+ static void isp_t2h_entry(struct t7000_isp *isp, const struct isp_bl_entry *e)
+ {
+ 	struct isp_stream *st = &isp->st;
+-	u32 pool = e->pool & 0x0fffffff, i = e->tag & 0xffff;
++	u32 pool = (e->tag >> 16) & 0xffff, i = e->tag & 0xffff;
+ 	struct isp_sbuf *b;
+ 
+-	if ((e->tag >> 32) != ISP_TAG_MAGIC || ((e->tag >> 16) & 0xffff) != pool ||
+-	    i >= st->nbufs || (pool != ISP_POOL_META && pool != ISP_POOL_RENDERED)) {
++	if ((e->tag >> 32) != ISP_TAG_MAGIC || i >= st->nbufs ||
++	    (pool != ISP_POOL_META && pool != ISP_POOL_RENDERED) ||
++	    (e->pool & 0x0fffffff) != st->pool_id[pool]) {
+ 		st->errors++;
+ 		dev_warn_ratelimited(isp->dev, "T2H: unknown buffer: pool 0x%x tag 0x%016llx addr 0x%08x\n",
+ 				     e->pool, e->tag, e->addr[0]);
+@@ -203,8 +204,11 @@ static void isp_t2h_entry(struct t7000_isp *isp, const struct isp_bl_entry *e)
+ 				     pool, i, b->state);
+ 		return;
+ 	}
+-	if (pool == ISP_POOL_META || !st->on || st->stopping) {
+-		b->state = BUF_FREE;	/* meta, or a buffer handed back by CH_BUFFER_RETURN */
++	if (pool == ISP_POOL_RENDERED && !(e->flags[0] & ISP_BUF_FILLED) && !READ_ONCE(isp_keep_empty))
++		st->empty++;	/* no data flag (fw 0xa8ff0): recycle, not a frame */
++	if (pool == ISP_POOL_META || !st->on || st->stopping ||
++	    (!(e->flags[0] & ISP_BUF_FILLED) && !READ_ONCE(isp_keep_empty))) {
++		b->state = BUF_FREE;	/* meta, empty, or a buffer handed back by CH_BUFFER_RETURN */
+ 		spin_unlock(&st->frame_lock);
+ 		return;
+ 	}
+diff --git a/drivers/media/platform/apple/isp-t7000/isp.h b/drivers/media/platform/apple/isp-t7000/isp.h
+index dc9e0d5dc..cc73b8478 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp.h
++++ b/drivers/media/platform/apple/isp-t7000/isp.h
+@@ -164,6 +164,8 @@ struct isp_stream {
+ 	u32 ch, sensor_id, preset, npresets;
+ 	u32 in_w, in_h, width, height, stride, bufsize, nbufs;
+ 	u32 meta_size;
++	u32 pool_id[2];		/* fw pool id per ISP_POOL_* kind (BUF list +0x1c), from POOL_CONFIG_GET */
++	u32 empty;		/* buffers returned without the 0x40000000 data flag */
+ 	char sensor_name[32];
+ 	struct isp_sbuf buf[ISP_MAX_BUFS];
+ 	struct isp_sbuf meta[ISP_MAX_BUFS];
+@@ -301,7 +303,7 @@ extern int isp_keep_on, isp_preset, isp_stream_nostart, isp_dart_reflector, isp_
+ extern uint isp_refclk_cfg, isp_nbufs, isp_out_range, isp_setfile_rear, isp_setfile_front;
+ /* wedge hunt (re/CAMERA-WEDGE.md), all default off */
+ extern uint isp_quiet_ms;
+-extern int isp_stream_nobufs, isp_dart_ios, isp_canary;
++extern int isp_stream_nobufs, isp_dart_ios, isp_canary, isp_pool_meta, isp_pool_frame, isp_keep_empty;
+ extern unsigned long long isp_canary_base;
+ 
+ /*

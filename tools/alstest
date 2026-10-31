@@ -1,0 +1,40 @@
+#!/bin/sh
+# Ambient light sensor check (busybox sh). Read-only except the optional insmod.
+#   alstest                  show IIO devices + readings (kernel build-als, driver as module)
+#   alstest load [ko] [id]   insmod tsl2583.ko (default /tmp/tsl2583.ko); any 3rd arg = ignore_chip_id=1
+#   alstest watch            print illuminance + raw channels every 1 s (Ctrl-C stops)
+# Push both:  bin/push alstest tsl2583.ko   (copy build-als/drivers/iio/light/tsl2583.ko to tools/ first)
+rd() { cat "$1" 2>/dev/null || echo "?"; }
+show() {
+	found=0
+	for d in /sys/bus/iio/devices/iio:device*; do
+		[ -d "$d" ] || continue
+		found=1
+		echo "== $d name=$(rd $d/name)"
+		for f in in_illuminance_input in_intensity_both_raw in_intensity_ir_raw \
+		         in_illuminance_calibscale in_illuminance_integration_time; do
+			[ -e "$d/$f" ] && echo "  $f=$(rd $d/$f)"
+		done
+	done
+	[ $found = 1 ] || echo "no IIO device"
+}
+case "$1" in
+load)
+	ko=${2:-/tmp/tsl2583.ko}
+	p=""; [ -n "$3" ] && p="ignore_chip_id=1"
+	insmod "$ko" $p || echo "insmod failed"
+	dmesg | grep -i -E "tsl258|2-0029|i2c i2c-2" | tail -8
+	show ;;
+watch)
+	while :; do
+		d=$(ls -d /sys/bus/iio/devices/iio:device* 2>/dev/null | head -1)
+		[ -n "$d" ] || { echo "no IIO device"; exit 1; }
+		echo "lux=$(rd $d/in_illuminance_input) both=$(rd $d/in_intensity_both_raw) ir=$(rd $d/in_intensity_ir_raw)"
+		sleep 1
+	done ;;
+*)
+	echo "i2c buses:"; for b in /sys/bus/i2c/devices/i2c-*; do echo " $b $(readlink $b/of_node 2>/dev/null | sed 's|.*/||')"; done
+	echo "i2c2 client 2-0029: $(ls -d /sys/bus/i2c/devices/2-0029 2>/dev/null || echo missing) driver=$(readlink /sys/bus/i2c/devices/2-0029/driver 2>/dev/null | sed 's|.*/||')"
+	show
+	dmesg | grep -i -E "tsl258|2-0029" | tail -5 ;;
+esac

@@ -1,0 +1,2 @@
+# iPhone in DFU mode (Apple 05ac:1227) -> boot Linux on it. Disable: touch <repo>/var/no-autoboot
+ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="05ac", ATTR{idProduct}=="1227", TAG+="systemd", ENV{SYSTEMD_WANTS}+="iphone6-linux-boot.service"

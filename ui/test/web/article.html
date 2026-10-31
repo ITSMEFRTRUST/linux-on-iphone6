@@ -1,0 +1,44 @@
+<!doctype html><html><head><meta charset="utf-8"><title>The Quiet Return of the Night Train</title></head>
+<body>
+<nav><a href="/">Home</a> <a href="/world">World</a> <a href="/travel">Travel</a> <a href="/science">Science</a> <a href="/opinion">Opinion</a></nav>
+<main><article>
+<h1>The Quiet Return of the Night Train</h1>
+<p class="byline"><small>By Jane Doe · October 12, 2026 · 8 min read</small></p>
+<p>Across Europe, sleeper services that were written off a decade ago are filling up again. Rail operators say demand has <b>tripled</b> since 2021, and new routes from <a href="/vienna">Vienna</a>, <a href="/brussels">Brussels</a> and <a href="/zurich">Zürich</a> are selling out weeks ahead.</p>
+<p>The reasons are partly practical — a night in a couchette replaces both a flight and a hotel — and partly something harder to name. “People want the journey back,” says one conductor, who has worked the Vienna–Rome line for <em>nineteen years</em>.</p>
+<h2>A network rebuilt from spare parts</h2>
+<p>Most of the rolling stock is second-hand. Carriages retired in the 1990s have been stripped, rewired and fitted with USB sockets, a detail passengers mention more often than the new mattresses. The config file for the booking system, <code>routes.yaml</code>, now lists 42 overnight services.</p>
+<figure><img src="img/train.jpg" width="640" height="400" alt="A sleeper train at dusk"><figcaption>A Nightjet service waiting at Wien Hauptbahnhof before its overnight run to Rome.</figcaption></figure>
+<blockquote><p>We thought aviation had won. It turns out people just needed a reason to choose the slower way.</p></blockquote>
+<h3>What changed</h3>
+<ul>
+<li>Cheaper track access charges on several international corridors.</li>
+<li>Climate-conscious travellers, especially under 30, booking as a group.
+ <ul><li>Six-berth couchettes sell first.</li><li>Private cabins sell last but earn the most.</li></ul></li>
+<li>Better <a href="/apps">booking apps</a> that show the whole route at once.</li>
+</ul>
+<h3>The busiest routes this autumn</h3>
+<table>
+<thead><tr><th>Route</th><th>Departs</th><th>Arrives</th><th>Load</th></tr></thead>
+<tbody>
+<tr><td>Vienna → Rome</td><td>19:23</td><td>10:00</td><td>96%</td></tr>
+<tr><td>Brussels → Berlin</td><td>19:22</td><td>06:41</td><td>91%</td></tr>
+<tr><td>Zürich → Amsterdam</td><td>20:01</td><td>09:45</td><td>88%</td></tr>
+</tbody></table>
+<h2>How to book one</h2>
+<ol>
+<li>Pick a route and a date at least three weeks out.</li>
+<li>Choose a seat, a couchette or a sleeper cabin.</li>
+<li>Bring earplugs. Seriously.</li>
+</ol>
+<p>Operators expose a small API for timetables. A request looks like this:</p>
+<pre><code>curl https://api.example.org/v1/trains?from=VIE&amp;to=ROM \
+  -H 'Accept: application/json'
+{ "train": "NJ 233", "departs": "19:23", "berths": 4 }</code></pre>
+<hr>
+<h4>Correction</h4>
+<p>An earlier version of this article misstated the departure time of the Brussels service. It leaves at 19:22, not 19:52.</p>
+<figure><img src="img/map.png" width="300" height="300" alt="Route map"><figcaption>Map: the overnight network in 2026.</figcaption></figure>
+<p>Read more: <a href="/rail">All rail coverage</a> · <a href="/newsletter">Get the newsletter</a></p>
+</article></main>
+</body></html>

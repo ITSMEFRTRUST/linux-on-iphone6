@@ -1,0 +1,753 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 16:26:24 +0000
+Subject: [PATCH 040/138] PCI: apple: Add support for the A8 (T7000)
+
+The iPhone 6 Wi-Fi sits on port 1 of the A8 PCIe controller. Static
+analysis of the iOS 12 AppleT7000PCIe kext shows the M1 design minus a
+few blocks:
+
+- port clock, refclk, power-down and reset bits live in the common
+  ("rc") block, one set of fields per port, instead of the port block;
+- PHY 0 is shared by ports 0 and 1 and needs two settings written once;
+- the MSI doorbell is hardwired at 0xbffff000 (no MSIADDR register);
+- there is no RID-to-SID table, the port's DART has a single stream;
+- link status and LINKCMDSTS moved to 0x88 and 0x808.
+
+Add SoC hooks for the controller and port bring-up, skip the MSIADDR
+and RID2SID programming when the hardware has none, and give the T7000
+its own map_bus so that the unpowered port 0 and downstream buses with
+no link are never accessed (iOS panics on such accesses). The PERST#
+GPIO is requested asserted and released right before link training, as
+iOS does, and an optional pwren-gpios powers the endpoint 100 ms before
+the port comes up.
+
+The doorbell Kconfig symbol gets a prompt since the A8 needs a value
+other than the default. The MSI domain is torn down when the host bridge
+fails to come up, so that the driver can be probed again.
+
+The T7000 bring-up is untested and logs every step. The t7000_stage
+module parameter stops it after a given stage. A built-in driver defaults
+to doing nothing and a module to doing everything, so the controller is
+only touched on an explicit insmod.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/pci/controller/Kconfig      |  10 +-
+ drivers/pci/controller/pcie-apple.c | 544 +++++++++++++++++++++++++---
+ 2 files changed, 501 insertions(+), 53 deletions(-)
+
+diff --git a/drivers/pci/controller/Kconfig b/drivers/pci/controller/Kconfig
+index d246bbe37..9bec12cbe 100644
+--- a/drivers/pci/controller/Kconfig
++++ b/drivers/pci/controller/Kconfig
+@@ -36,9 +36,14 @@ config PCIE_ALTERA_MSI
+ 	  This MSI driver supports Altera MSI to GIC controller IP.
+ 
+ config PCIE_APPLE_MSI_DOORBELL_ADDR
+-	hex
++	hex "Apple PCIe MSI doorbell address"
+ 	default 0xfffff000
+ 	depends on PCIE_APPLE
++	help
++	  Bus address the Apple PCIe controller decodes as MSI writes. It is
++	  also reserved in the IOVA space by the DART driver. The M1 and later
++	  controllers can use any address (0xfffff000 matches macOS); the A8
++	  (T7000) one has the doorbell hardwired at 0xbffff000.
+ 
+ config PCIE_APPLE
+ 	tristate "Apple PCIe controller"
+@@ -50,7 +55,8 @@ config PCIE_APPLE
+ 	help
+ 	  Say Y here if you want to enable PCIe controller support on Apple
+ 	  system-on-chips, like the Apple M1. This is required for the USB
+-	  type-A ports, Ethernet, Wi-Fi, and Bluetooth.
++	  type-A ports, Ethernet, Wi-Fi, and Bluetooth. The A8 (T7000)
++	  controller, which carries the iPhone 6 Wi-Fi, is supported too.
+ 
+ 	  If unsure, say Y if you have an Apple Silicon system.
+ 
+diff --git a/drivers/pci/controller/pcie-apple.c b/drivers/pci/controller/pcie-apple.c
+index c2cffc065..bfae7de2a 100644
+--- a/drivers/pci/controller/pcie-apple.c
++++ b/drivers/pci/controller/pcie-apple.c
+@@ -14,6 +14,12 @@
+  * Copyright (C) 2021 Corellium LLC
+  * Copyright (C) 2021 Mark Kettenis <kettenis@openbsd.org>
+  *
++ * The A8 (T7000) flavour is the ancestor of the M1 design: the same
++ * DesignWare root ports behind ECAM and the same per-port INTSTAT/INTMSK/
++ * MSICFG/MSIBASE/LTSSMCTL registers, but the clock/reset/PERST controls
++ * live in a common "rc" block, there is a PHY shared by a port pair, the
++ * MSI doorbell is hardwired and there is no RID-to-SID mapping.
++ *
+  * Author: Alyssa Rosenzweig <alyssa@rosenzweig.io>
+  * Author: Marc Zyngier <maz@kernel.org>
+  */
+@@ -29,6 +35,7 @@
+ #include <linux/module.h>
+ #include <linux/msi.h>
+ #include <linux/of_irq.h>
++#include <linux/of_pci.h>
+ #include <linux/pci-ecam.h>
+ 
+ #include "pci-host-common.h"
+@@ -137,6 +144,53 @@
+ #define PORT_MSIMAP_ENABLE	BIT(31)
+ #define PORT_MSIMAP_TARGET	GENMASK(7, 0)
+ 
++/*
++ * T7000 (A8). Offsets from static analysis of the iOS 12 AppleT7000PCIe
++ * kext; names are ours, Apple's are unknown.
++ *
++ * Common ("rc") block, one set of fields per port p / per PHY:
++ */
++#define T7000_RC_PHY_CTL(phy)		(0x040 + 0x20 * (phy))
++#define   T7000_RC_PHY_CTL_CFG_EN	BIT(0)
++#define T7000_RC_PORT_CTL(p)		(0x100 + 0x80 * (p))
++#define   T7000_RC_PORT_CTL_EN		BIT(0)
++#define T7000_RC_PORT_REFCLK(p)		(0x108 + 0x80 * (p))
++#define   T7000_RC_PORT_REFCLK_EN	BIT(0)
++#define   T7000_RC_PORT_REFCLK_CGDIS	BIT(8)
++#define T7000_RC_PORT_PWRDN(p)		(0x10c + 0x80 * (p))
++#define   T7000_RC_PORT_PWRDN_EN	BIT(0)
++#define T7000_RC_PORT_RST(p)		(0x118 + 0x80 * (p))
++#define   T7000_RC_PORT_RST_DEASSERT	BIT(0)
++
++/* PHY block, shared by ports 2n and 2n + 1 */
++#define T7000_PHY_CFG0			0xc24
++#define T7000_PHY_CFG1			0xc28
++#define   T7000_PHY_CFG_VAL		0x3f
++
++/* Port block (same base as the M1 port block, a few different offsets) */
++#define T7000_PORT_LINKSTS		0x088
++#define   T7000_PORT_LINKSTS_UP		BIT(0)
++#define   T7000_PORT_LINKSTS_L2		BIT(6)
++#define T7000_PORT_TUN90		0x090
++#define   T7000_PORT_TUN90_MASK		GENMASK(7, 0)
++#define   T7000_PORT_TUN90_VAL		0x28
++#define T7000_PORT_IRQCFG		0x114
++#define T7000_PORT_TUN130		0x130
++#define   T7000_PORT_TUN130_VAL		0x3
++#define T7000_PORT_TUN134		0x134
++#define   T7000_PORT_TUN134_VAL		0x1
++#define T7000_PORT_LTSSM		0x804
++#define   T7000_PORT_LTSSM_STATE	GENMASK(14, 9)
++#define T7000_PORT_LINKCMDSTS		0x808
++
++/* Not programmable, hardwired in the controller */
++#define T7000_MSI_DOORBELL		0xbffff000
++
++/* iOS waits t-refclk-to-perst (ADT: 100) between port enable and reset release */
++#define T7000_REFCLK_TO_RESET_MS	100
++/* iOS: wlan.pcie.perstdelay_ms, power-on to PERST# release */
++#define PWREN_TO_PERST_MS		100
++
+ /*
+  * The doorbell address is set to 0xfffff000, which by convention
+  * matches what MacOS does, and it is possible to use any other
+@@ -146,15 +200,25 @@
+  */
+ #define DOORBELL_ADDR		CONFIG_PCIE_APPLE_MSI_DOORBELL_ADDR
+ 
++struct apple_pcie;
++struct apple_pcie_port;
++
+ struct hw_info {
+ 	u32 phy_lane_ctl;
+-	u32 port_msiaddr;
++	u32 port_msiaddr;		/* 0: no register, doorbell is fixed */
+ 	u32 port_msiaddr_hi;
+ 	u32 port_refclk;
+ 	u32 port_perst;
+ 	u32 port_rid2sid;
+ 	u32 port_msimap;
+-	u32 max_rid2sid;
++	u32 port_linkcmdsts;
++	u32 max_rid2sid;		/* 0: no RID-to-SID mapping */
++	u32 fixed_msi_doorbell;
++	unsigned int link_timeout_ms;
++	/* SoC-specific bring-up, when the M1 sequence doesn't apply */
++	int (*init_rc)(struct apple_pcie *pcie);
++	int (*port_enable)(struct apple_pcie_port *port);
++	const struct pci_ecam_ops *ecam_ops;
+ };
+ 
+ static const struct hw_info t8103_hw = {
+@@ -165,7 +229,9 @@ static const struct hw_info t8103_hw = {
+ 	.port_perst		= PORT_PERST,
+ 	.port_rid2sid		= PORT_RID2SID,
+ 	.port_msimap		= 0,
++	.port_linkcmdsts	= PORT_LINKCMDSTS,
+ 	.max_rid2sid		= 64,
++	.link_timeout_ms	= 100,
+ };
+ 
+ static const struct hw_info t602x_hw = {
+@@ -176,14 +242,19 @@ static const struct hw_info t602x_hw = {
+ 	.port_perst		= PORT_T602X_PERST,
+ 	.port_rid2sid		= PORT_T602X_RID2SID,
+ 	.port_msimap		= PORT_T602X_MSIMAP,
++	.port_linkcmdsts	= PORT_LINKCMDSTS,
+ 	/* 16 on t602x, guess for autodetect on future HW */
+ 	.max_rid2sid		= 512,
++	.link_timeout_ms	= 100,
+ };
+ 
+ struct apple_pcie {
+ 	struct mutex		lock;
+ 	struct device		*dev;
+ 	void __iomem            *base;
++	void __iomem		*phy;		/* T7000: shared PHY 0 */
++	struct pci_config_window *cfg;
++	struct irq_domain	*msi_domain;
+ 	const struct hw_info	*hw;
+ 	unsigned long		*bitmap;
+ 	struct list_head	ports;
+@@ -418,16 +489,19 @@ static int apple_pcie_port_setup_irq(struct apple_pcie_port *port)
+ 	/* Disable all interrupts */
+ 	writel_relaxed(~0, port->base + PORT_INTMSK);
+ 	writel_relaxed(~0, port->base + PORT_INTSTAT);
+-	writel_relaxed(~0, port->base + PORT_LINKCMDSTS);
++	if (pcie->hw->port_linkcmdsts)
++		writel_relaxed(~0, port->base + pcie->hw->port_linkcmdsts);
+ 
+ 	irq_set_chained_handler_and_data(irq, apple_port_irq_handler, port);
+ 
+-	/* Configure MSI base address */
++	/* Configure MSI base address, unless it is hardwired */
+ 	BUILD_BUG_ON(upper_32_bits(DOORBELL_ADDR));
+-	writel_relaxed(lower_32_bits(DOORBELL_ADDR),
+-		       port->base + pcie->hw->port_msiaddr);
+-	if (pcie->hw->port_msiaddr_hi)
+-		writel_relaxed(0, port->base + pcie->hw->port_msiaddr_hi);
++	if (pcie->hw->port_msiaddr) {
++		writel_relaxed(lower_32_bits(DOORBELL_ADDR),
++			       port->base + pcie->hw->port_msiaddr);
++		if (pcie->hw->port_msiaddr_hi)
++			writel_relaxed(0, port->base + pcie->hw->port_msiaddr_hi);
++	}
+ 
+ 	/* Enable MSIs, shared between all ports */
+ 	if (pcie->hw->port_msimap) {
+@@ -550,49 +624,17 @@ static u32 apple_pcie_rid2sid_write(struct apple_pcie_port *port,
+ 	return readl_relaxed(port_rid2sid_addr(port, idx));
+ }
+ 
+-static int apple_pcie_setup_port(struct apple_pcie *pcie,
+-				 struct device_node *np)
++/* M1-style port bring-up: APPCLK, refclk handshake, PERST#, PORT_STATUS */
++static int apple_pcie_port_enable_m1(struct apple_pcie_port *port,
++				     struct gpio_desc *reset)
+ {
++	struct apple_pcie *pcie = port->pcie;
+ 	struct platform_device *platform = to_platform_device(pcie->dev);
+-	struct apple_pcie_port *port;
+-	struct gpio_desc *reset;
++	struct device_node *np = port->np;
+ 	struct resource *res;
+ 	char name[16];
+-	u32 stat, idx;
+-	int ret, i;
+-
+-	reset = devm_fwnode_gpiod_get(pcie->dev, of_fwnode_handle(np), "reset",
+-				      GPIOD_OUT_LOW, "PERST#");
+-	if (IS_ERR(reset))
+-		return PTR_ERR(reset);
+-
+-	port = devm_kzalloc(pcie->dev, sizeof(*port), GFP_KERNEL);
+-	if (!port)
+-		return -ENOMEM;
+-
+-	port->sid_map = devm_bitmap_zalloc(pcie->dev, pcie->hw->max_rid2sid, GFP_KERNEL);
+-	if (!port->sid_map)
+-		return -ENOMEM;
+-
+-	ret = of_property_read_u32_index(np, "reg", 0, &idx);
+-	if (ret)
+-		return ret;
+-
+-	/* Use the first reg entry to work out the port index */
+-	port->idx = idx >> 11;
+-	port->pcie = pcie;
+-	port->np = np;
+-
+-	raw_spin_lock_init(&port->lock);
+-
+-	snprintf(name, sizeof(name), "port%d", port->idx);
+-	res = platform_get_resource_byname(platform, IORESOURCE_MEM, name);
+-	if (!res)
+-		res = platform_get_resource(platform, IORESOURCE_MEM, port->idx + 2);
+-
+-	port->base = devm_ioremap_resource(&platform->dev, res);
+-	if (IS_ERR(port->base))
+-		return PTR_ERR(port->base);
++	u32 stat;
++	int ret;
+ 
+ 	snprintf(name, sizeof(name), "phy%d", port->idx);
+ 	res = platform_get_resource_byname(platform, IORESOURCE_MEM, name);
+@@ -634,6 +676,87 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
+ 
+ 	rmw_clear(PORT_APPCLK_CGDIS, port->base + PORT_APPCLK);
+ 
++	return 0;
++}
++
++static void apple_pcie_t7000_port_report(struct apple_pcie_port *port,
++					 const char *when);
++
++static int apple_pcie_setup_port(struct apple_pcie *pcie,
++				 struct device_node *np)
++{
++	struct platform_device *platform = to_platform_device(pcie->dev);
++	struct apple_pcie_port *port;
++	struct gpio_desc *reset, *pwren;
++	unsigned long perst_off = 0, timeout;
++	struct resource *res;
++	char name[16];
++	u32 idx;
++	int ret, i;
++
++	/*
++	 * Where PERST# is released late (T7000), request it asserted so the
++	 * endpoint never sees a glitch while its refclk is still off.
++	 */
++	reset = devm_fwnode_gpiod_get(pcie->dev, of_fwnode_handle(np), "reset",
++				      pcie->hw->port_enable ? GPIOD_OUT_HIGH :
++							      GPIOD_OUT_LOW,
++				      "PERST#");
++	if (IS_ERR(reset))
++		return PTR_ERR(reset);
++
++	/* Optional endpoint power enable (e.g. a Wi-Fi module's REG_ON) */
++	pwren = devm_fwnode_gpiod_get_optional(pcie->dev, of_fwnode_handle(np),
++					       "pwren", GPIOD_OUT_LOW, "PWREN");
++	if (IS_ERR(pwren))
++		return PTR_ERR(pwren);
++
++	port = devm_kzalloc(pcie->dev, sizeof(*port), GFP_KERNEL);
++	if (!port)
++		return -ENOMEM;
++
++	if (pcie->hw->max_rid2sid) {
++		port->sid_map = devm_bitmap_zalloc(pcie->dev,
++						   pcie->hw->max_rid2sid,
++						   GFP_KERNEL);
++		if (!port->sid_map)
++			return -ENOMEM;
++	}
++
++	ret = of_property_read_u32_index(np, "reg", 0, &idx);
++	if (ret)
++		return ret;
++
++	/* Use the first reg entry to work out the port index */
++	port->idx = idx >> 11;
++	port->pcie = pcie;
++	port->np = np;
++
++	raw_spin_lock_init(&port->lock);
++
++	snprintf(name, sizeof(name), "port%d", port->idx);
++	res = platform_get_resource_byname(platform, IORESOURCE_MEM, name);
++	if (!res)
++		res = platform_get_resource(platform, IORESOURCE_MEM, port->idx + 2);
++
++	port->base = devm_ioremap_resource(&platform->dev, res);
++	if (IS_ERR(port->base))
++		return PTR_ERR(port->base);
++
++	if (pwren) {
++		dev_info(pcie->dev, "%pOF: power enable, waiting %d ms\n", np,
++			 PWREN_TO_PERST_MS);
++		gpiod_set_value_cansleep(pwren, 1);
++		msleep(PWREN_TO_PERST_MS);
++	}
++
++	if (pcie->hw->port_enable)
++		ret = pcie->hw->port_enable(port);
++	else
++		ret = apple_pcie_port_enable_m1(port, reset);
++	if (ret)
++		return ret;
++
+ 	ret = apple_pcie_port_setup_irq(port);
+ 	if (ret)
+ 		return ret;
+@@ -658,11 +781,35 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
+ 	ret = apple_pcie_port_register_irqs(port);
+ 	WARN_ON(ret);
+ 
+-	writel_relaxed(PORT_LTSSMCTL_START, port->base + PORT_LTSSMCTL);
++	if (pcie->hw->port_enable) {
++		apple_pcie_t7000_port_report(port, "IRQs and MSIs set up");
++		/* iOS releases PERST# right before starting the LTSSM */
++		dev_info(pcie->dev, "%pOF: deasserting PERST#\n", np);
++		gpiod_set_value_cansleep(reset, 0);
++		perst_off = jiffies;
++		/* iOS sets the bit with a read-modify-write */
++		rmw_set(PORT_LTSSMCTL_START, port->base + PORT_LTSSMCTL);
++	} else {
++		writel_relaxed(PORT_LTSSMCTL_START, port->base + PORT_LTSSMCTL);
++	}
+ 
+-	if (!wait_for_completion_timeout(&pcie->event, HZ / 10))
++	timeout = msecs_to_jiffies(pcie->hw->link_timeout_ms);
++	if (!wait_for_completion_timeout(&pcie->event, timeout))
+ 		dev_warn(pcie->dev, "%pOF link didn't come up\n", np);
+ 
++	if (pcie->hw->port_enable) {
++		unsigned long ready = perst_off + msecs_to_jiffies(100);
++
++		apple_pcie_t7000_port_report(port, "after link training");
++
++		/*
++		 * No config requests to the endpoint until 100ms after
++		 * PERST# (PCIe r5.0, 6.6.1).
++		 */
++		if (time_before(jiffies, ready))
++			msleep(jiffies_to_msecs(ready - jiffies));
++	}
++
+ 	return 0;
+ }
+ 
+@@ -713,7 +860,9 @@ static int apple_msi_init(struct apple_pcie *pcie)
+ 		return -ENXIO;
+ 	}
+ 
+-	if (!msi_create_parent_irq_domain(&info, &apple_msi_parent_ops)) {
++	pcie->msi_domain = msi_create_parent_irq_domain(&info,
++							&apple_msi_parent_ops);
++	if (!pcie->msi_domain) {
+ 		dev_err(pcie->dev, "failed to create IRQ domain\n");
+ 		return -ENOMEM;
+ 	}
+@@ -825,6 +974,14 @@ static int apple_pcie_init(struct pci_config_window *cfg)
+ 	if (WARN_ON(!pcie))
+ 		return -ENOENT;
+ 
++	pcie->cfg = cfg;
++
++	if (pcie->hw->init_rc) {
++		ret = pcie->hw->init_rc(pcie);
++		if (ret)
++			return ret;
++	}
++
+ 	for_each_available_child_of_node_scoped(dev->of_node, of_port) {
+ 		ret = apple_pcie_setup_port(pcie, of_port);
+ 		if (ret) {
+@@ -847,6 +1004,270 @@ static const struct pci_ecam_ops apple_pcie_cfg_ecam_ops = {
+ 	}
+ };
+ 
++/*
++ * T7000 (A8) support.
++ *
++ * Everything below follows the order of AppleT7000PCIe/AppleEmbeddedPCIE
++ * in iOS 12. Every step is logged, and the "t7000_stage" module parameter
++ * stops the bring-up (and fails the probe) after a given stage, so that a
++ * new board can be brought up one register block at a time:
++ *
++ *   0: don't touch the controller at all
++ *   1: power domains on, common registers dumped (read only)
++ *   2: + PHY init
++ *   3: + port enable through the common block (no port/ECAM access yet)
++ *   4: + port registers read (link status, LTSSM state)
++ *   5: + root port config space (IDs, target link speed) and tunables
++ *   6: everything: IRQs, MSIs, PERST#, link training, enumeration
++ *
++ * While this is unproven on hardware, a built-in driver defaults to 0 and
++ * a module to 6, so the bring-up only ever runs on an explicit insmod.
++ */
++static unsigned int t7000_stage = IS_MODULE(CONFIG_PCIE_APPLE) ? 6 : 0;
++module_param(t7000_stage, uint, 0444);
++MODULE_PARM_DESC(t7000_stage,
++		 "T7000: last bring-up stage to run (0 = none ... 6 = all)");
++
++static int apple_pcie_t7000_stop(struct apple_pcie *pcie, unsigned int stage)
++{
++	if (t7000_stage > stage)
++		return 0;
++
++	dev_info(pcie->dev, "T7000: stopping after stage %u as requested\n",
++		 stage);
++	return -ENODEV;
++}
++
++static void apple_pcie_t7000_rc_dump(struct apple_pcie *pcie, int p,
++				     const char *when)
++{
++	void __iomem *rc = pcie->base;
++
++	dev_info(pcie->dev,
++		 "T7000: rc port%d %s: ctl %08x refclk %08x pwrdn %08x rst %08x phyctl %08x\n",
++		 p, when,
++		 readl_relaxed(rc + T7000_RC_PORT_CTL(p)),
++		 readl_relaxed(rc + T7000_RC_PORT_REFCLK(p)),
++		 readl_relaxed(rc + T7000_RC_PORT_PWRDN(p)),
++		 readl_relaxed(rc + T7000_RC_PORT_RST(p)),
++		 readl_relaxed(rc + T7000_RC_PHY_CTL(p / 2)));
++}
++
++static void apple_pcie_t7000_port_report(struct apple_pcie_port *port,
++					 const char *when)
++{
++	u32 sts = readl_relaxed(port->base + T7000_PORT_LINKSTS);
++	u32 ltssm = readl_relaxed(port->base + T7000_PORT_LTSSM);
++
++	dev_info(port->pcie->dev,
++		 "T7000: port%d %s: linksts %08x (up %d, L2 %d) ltssm %08x (state %#lx) intstat %08x intmsk %08x msicfg %08x\n",
++		 port->idx, when, sts, !!(sts & T7000_PORT_LINKSTS_UP),
++		 !!(sts & T7000_PORT_LINKSTS_L2), ltssm,
++		 FIELD_GET(T7000_PORT_LTSSM_STATE, ltssm),
++		 readl_relaxed(port->base + PORT_INTSTAT),
++		 readl_relaxed(port->base + PORT_INTMSK),
++		 readl_relaxed(port->base + PORT_MSICFG));
++}
++
++static void apple_pcie_t7000_phy_write(struct apple_pcie *pcie, u32 reg,
++				       u32 val)
++{
++	writel(val, pcie->phy + reg);
++	dev_info(pcie->dev, "T7000: phy0[%#x] = %#x, reads back %#x\n", reg,
++		 val, readl(pcie->phy + reg));
++}
++
++static int apple_pcie_t7000_init_rc(struct apple_pcie *pcie)
++{
++	struct platform_device *pdev = to_platform_device(pcie->dev);
++	void __iomem *rc = pcie->base;
++	int ret;
++
++	pcie->phy = devm_platform_ioremap_resource_byname(pdev, "phy0");
++	if (IS_ERR(pcie->phy))
++		return PTR_ERR(pcie->phy);
++
++	/* iOS: IODelay(10) after the PCIE, PCIE_AUX and PCIE_REF gates */
++	usleep_range(10, 20);
++
++	apple_pcie_t7000_rc_dump(pcie, 0, "at probe");
++	apple_pcie_t7000_rc_dump(pcie, 1, "at probe");
++
++	ret = apple_pcie_t7000_stop(pcie, 1);
++	if (ret)
++		return ret;
++
++	/*
++	 * PHY 0 (ports 0 and 1) settings from the ADT "phy0-settings". iOS
++	 * opens the PHY config path through port 0's fields even when only
++	 * port 1 is used. The refclk is internal on N61, so no 0xc3c write.
++	 */
++	dev_info(pcie->dev, "T7000: PHY 0 init\n");
++	rmw_set(T7000_RC_PHY_CTL_CFG_EN, rc + T7000_RC_PHY_CTL(0));
++	rmw_set(T7000_RC_PORT_CTL_EN, rc + T7000_RC_PORT_CTL(0));
++	rmw_set(T7000_RC_PORT_RST_DEASSERT, rc + T7000_RC_PORT_RST(0));
++
++	apple_pcie_t7000_phy_write(pcie, T7000_PHY_CFG0, T7000_PHY_CFG_VAL);
++	apple_pcie_t7000_phy_write(pcie, T7000_PHY_CFG1, T7000_PHY_CFG_VAL);
++
++	rmw_clear(T7000_RC_PORT_RST_DEASSERT, rc + T7000_RC_PORT_RST(0));
++	rmw_clear(T7000_RC_PORT_CTL_EN, rc + T7000_RC_PORT_CTL(0));
++	rmw_clear(T7000_RC_PHY_CTL_CFG_EN, rc + T7000_RC_PHY_CTL(0));
++
++	apple_pcie_t7000_rc_dump(pcie, 0, "after PHY init");
++
++	return apple_pcie_t7000_stop(pcie, 2);
++}
++
++/* Root port config space, which is also the DesignWare DBI */
++static void __iomem *apple_pcie_t7000_rc_cfg(struct apple_pcie_port *port)
++{
++	/* 64-bit only: the whole ECAM window is mapped at once */
++	return port->pcie->cfg->win + (PCI_DEVFN(port->idx, 0) << 12);
++}
++
++static int apple_pcie_t7000_find_pcie_cap(void __iomem *cfg)
++{
++	int pos, ttl = 48;
++
++	if (!(readw(cfg + PCI_STATUS) & PCI_STATUS_CAP_LIST))
++		return 0;
++
++	pos = readb(cfg + PCI_CAPABILITY_LIST) & ~3;
++	while (pos >= PCI_STD_HEADER_SIZEOF && ttl--) {
++		if (readb(cfg + pos + PCI_CAP_LIST_ID) == PCI_CAP_ID_EXP)
++			return pos;
++		pos = readb(cfg + pos + PCI_CAP_LIST_NEXT) & ~3;
++	}
++
++	return 0;
++}
++
++static int apple_pcie_t7000_port_enable(struct apple_pcie_port *port)
++{
++	struct apple_pcie *pcie = port->pcie;
++	struct device *dev = pcie->dev;
++	void __iomem *rc = pcie->base;
++	void __iomem *cfg;
++	int p = port->idx, cap, speed, ret;
++	u32 id, val;
++
++	/* AppleEmbeddedPCIEPort::enablePortHardware */
++	apple_pcie_t7000_rc_dump(pcie, p, "before enable");
++
++	rmw_clear(T7000_RC_PORT_RST_DEASSERT, rc + T7000_RC_PORT_RST(p));
++	rmw_set(T7000_RC_PORT_REFCLK_EN, rc + T7000_RC_PORT_REFCLK(p));
++	usleep_range(100, 200);
++	rmw_clear(T7000_RC_PORT_PWRDN_EN, rc + T7000_RC_PORT_PWRDN(p));
++	rmw_set(T7000_RC_PORT_CTL_EN, rc + T7000_RC_PORT_CTL(p));
++	msleep(T7000_REFCLK_TO_RESET_MS);
++	rmw_set(T7000_RC_PORT_RST_DEASSERT, rc + T7000_RC_PORT_RST(p));
++	/*
++	 * iOS then clears REFCLK_CGDIS to allow refclk gating; keep the
++	 * clock ungated until the link is known to work.
++	 */
++	apple_pcie_t7000_rc_dump(pcie, p, "after enable");
++
++	ret = apple_pcie_t7000_stop(pcie, 3);
++	if (ret)
++		return ret;
++
++	apple_pcie_t7000_port_report(port, "after enable");
++
++	ret = apple_pcie_t7000_stop(pcie, 4);
++	if (ret)
++		return ret;
++
++	cfg = apple_pcie_t7000_rc_cfg(port);
++	id = readl(cfg + PCI_VENDOR_ID);
++	dev_info(dev, "T7000: root port %02x.0: id %08x class %08x dwc version %08x type %08x\n",
++		 p, id, readl(cfg + PCI_CLASS_REVISION), readl(cfg + 0x8f8),
++		 readl(cfg + 0x8fc));
++	if (PCI_POSSIBLE_ERROR(id) || !id) {
++		dev_err(dev, "T7000: root port config space is dead\n");
++		return -ENODEV;
++	}
++
++	/* Target link speed, from the ADT "maximum-link-speed" */
++	cap = apple_pcie_t7000_find_pcie_cap(cfg);
++	speed = of_pci_get_max_link_speed(port->np);
++	if (cap && speed > 0) {
++		val = readl(cfg + cap + PCI_EXP_LNKCTL2);
++		/* Same mask as iOS: this leaves LNKSTA2 (RW1C) alone */
++		writel((val & 0xfff0) | speed, cfg + cap + PCI_EXP_LNKCTL2);
++		dev_info(dev, "T7000: root port %02x.0: PCIe cap %#x lnkcap %08x lnkcap2 %08x lnkctl2 %08x -> %08x\n",
++			 p, cap, readl(cfg + cap + PCI_EXP_LNKCAP),
++			 readl(cfg + cap + PCI_EXP_LNKCAP2), val,
++			 readl(cfg + cap + PCI_EXP_LNKCTL2));
++	} else {
++		dev_warn(dev, "T7000: root port %02x.0: PCIe cap %#x, speed %d, link speed left alone\n",
++			 p, cap, speed);
++	}
++
++	/* ADT "apcie-config-tunables" */
++	val = readl_relaxed(port->base + T7000_PORT_TUN90);
++	val &= ~T7000_PORT_TUN90_MASK;
++	writel_relaxed(val | T7000_PORT_TUN90_VAL,
++		       port->base + T7000_PORT_TUN90);
++	rmw_set(T7000_PORT_TUN130_VAL, port->base + T7000_PORT_TUN130);
++	rmw_set(T7000_PORT_TUN134_VAL, port->base + T7000_PORT_TUN134);
++	dev_info(dev, "T7000: port%d tunables: [0x90] %08x [0x130] %08x [0x134] %08x\n",
++		 p, readl_relaxed(port->base + T7000_PORT_TUN90),
++		 readl_relaxed(port->base + T7000_PORT_TUN130),
++		 readl_relaxed(port->base + T7000_PORT_TUN134));
++
++	/* AppleEmbeddedPCIEPort::enableInterrupts, purpose unknown */
++	writel_relaxed(0, port->base + T7000_PORT_IRQCFG);
++
++	return apple_pcie_t7000_stop(pcie, 5);
++}
++
++/*
++ * iOS panics on config accesses to unpowered ports, and port 0 (the
++ * unused NVMe port on phones) is never powered up here. Only expose
++ * the root ports we brought up, and their buses only when a link is up.
++ */
++static void __iomem *apple_pcie_t7000_map_bus(struct pci_bus *bus,
++					      unsigned int devfn, int where)
++{
++	struct pci_config_window *cfg = bus->sysdata;
++	struct apple_pcie *pcie = apple_pcie_lookup(cfg->parent);
++	struct apple_pcie_port *port;
++
++	list_for_each_entry(port, &pcie->ports, entry) {
++		if (pci_is_root_bus(bus)) {
++			if (devfn == PCI_DEVFN(port->idx, 0))
++				return pci_ecam_map_bus(bus, devfn, where);
++		} else if (readl_relaxed(port->base + T7000_PORT_LINKSTS) &
++			   T7000_PORT_LINKSTS_UP) {
++			return pci_ecam_map_bus(bus, devfn, where);
++		}
++	}
++
++	return NULL;
++}
++
++static const struct pci_ecam_ops apple_pcie_t7000_cfg_ecam_ops = {
++	.init		= apple_pcie_init,
++	.pci_ops	= {
++		.map_bus	= apple_pcie_t7000_map_bus,
++		.read		= pci_generic_config_read,
++		.write		= pci_generic_config_write,
++	}
++};
++
++static const struct hw_info t7000_hw = {
++	.port_msiaddr		= 0,
++	.port_linkcmdsts	= T7000_PORT_LINKCMDSTS,
++	.max_rid2sid		= 0,
++	.fixed_msi_doorbell	= T7000_MSI_DOORBELL,
++	/* iOS uses 100ms; be generous on a first bring-up */
++	.link_timeout_ms	= 500,
++	.init_rc		= apple_pcie_t7000_init_rc,
++	.port_enable		= apple_pcie_t7000_port_enable,
++	.ecam_ops		= &apple_pcie_t7000_cfg_ecam_ops,
++};
++
+ static int apple_pcie_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -863,6 +1284,20 @@ static int apple_pcie_probe(struct platform_device *pdev)
+ 	pcie->hw = of_device_get_match_data(dev);
+ 	if (!pcie->hw)
+ 		return -ENODEV;
++
++	if (pcie->hw == &t7000_hw && !t7000_stage) {
++		dev_info(dev, "T7000: bring-up disabled (t7000_stage=0)\n");
++		return -ENODEV;
++	}
++
++	if (pcie->hw->fixed_msi_doorbell &&
++	    pcie->hw->fixed_msi_doorbell != DOORBELL_ADDR) {
++		dev_err(dev, "MSI doorbell is hardwired at %#x, build with CONFIG_PCIE_APPLE_MSI_DOORBELL_ADDR=%#x\n",
++			pcie->hw->fixed_msi_doorbell,
++			pcie->hw->fixed_msi_doorbell);
++		return -EINVAL;
++	}
++
+ 	pcie->base = devm_platform_ioremap_resource(pdev, 1);
+ 	if (IS_ERR(pcie->base))
+ 		return PTR_ERR(pcie->base);
+@@ -874,11 +1309,18 @@ static int apple_pcie_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		return ret;
+ 
+-	return pci_host_common_init(pdev, bridge, &apple_pcie_cfg_ecam_ops);
++	ret = pci_host_common_init(pdev, bridge,
++				   pcie->hw->ecam_ops ?: &apple_pcie_cfg_ecam_ops);
++	if (ret)
++		/* Nothing uses the MSI domain yet; allow a clean re-probe */
++		irq_domain_remove(pcie->msi_domain);
++
++	return ret;
+ }
+ 
+ static const struct of_device_id apple_pcie_of_match[] = {
+ 	{ .compatible = "apple,t6020-pcie",	.data = &t602x_hw },
++	{ .compatible = "apple,t7000-pcie",	.data = &t7000_hw },
+ 	{ .compatible = "apple,pcie",		.data = &t8103_hw },
+ 	{ }
+ };

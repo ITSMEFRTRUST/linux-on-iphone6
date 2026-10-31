@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 03:19:03 +0000
+Subject: [PATCH 035/138] arm64: dts: apple: t7000-n61: Add Bluetooth
+
+The Bluetooth half of the BCM4345 module sits on UART1. It is powered
+by PMU GPIO 8 and woken by GPIO 50. The S5L UART reaches 1.5 Mbaud at
+most from its 24 MHz clock.
+
+Not yet tested on hardware.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ arch/arm64/boot/dts/apple/t7000-n61.dts | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/apple/t7000-n61.dts b/arch/arm64/boot/dts/apple/t7000-n61.dts
+index 8d21b1f19..bc1ff8d8a 100644
+--- a/arch/arm64/boot/dts/apple/t7000-n61.dts
++++ b/arch/arm64/boot/dts/apple/t7000-n61.dts
+@@ -147,3 +147,21 @@ touchscreen@0 {
+ 		 */
+ 	};
+ };
++
++&serial1 {
++	status = "okay";
++
++	/* ADT /arm-io/uart1/bluetooth: the BT half of a BCM4345 module */
++	bluetooth {
++		compatible = "brcm,bcm4345c5";
++		/*
++		 * iOS runs 3 Mbaud with extra divider bits; the S5L divider
++		 * alone tops out at 1.5 Mbaud from the 24 MHz clock.
++		 */
++		max-speed = <1500000>;
++		/* ADT function-power_enable: PMU GPIO 8 = BT_REG_ON */
++		shutdown-gpios = <&pmic_gpio 8 GPIO_ACTIVE_HIGH>;
++		/* ADT function-bt_wake: GPIO 50 */
++		device-wakeup-gpios = <&pinctrl 50 GPIO_ACTIVE_HIGH>;
++	};
++};

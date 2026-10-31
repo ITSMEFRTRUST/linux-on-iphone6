@@ -1,0 +1,263 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 00:29:26 +0000
+Subject: [PATCH 023/138] clk: Add a driver for the Apple A8 touch clock
+
+Add a driver for the TOUCH_CTL clock in the A8 PMGR, using the same
+sequence as iOS: ungate, wait 8 us, program the divider (0x2dc) and the
+enable bit, then wait for the busy bit to clear.
+
+Tested on the iPhone 6 (N61) together with the touchscreen.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/clk/Kconfig           |   9 ++
+ drivers/clk/Makefile          |   1 +
+ drivers/clk/clk-apple-touch.c | 206 ++++++++++++++++++++++++++++++++++
+ 3 files changed, 216 insertions(+)
+ create mode 100644 drivers/clk/clk-apple-touch.c
+
+diff --git a/drivers/clk/Kconfig b/drivers/clk/Kconfig
+index f9592fd9e..861b8c936 100644
+--- a/drivers/clk/Kconfig
++++ b/drivers/clk/Kconfig
+@@ -66,6 +66,15 @@ config COMMON_CLK_APPLE_NCO
+ 	  found on Apple SoCs such as t8103 (M1). The blocks are typically
+ 	  generators of audio clocks.
+ 
++config COMMON_CLK_APPLE_TOUCH
++	tristate "Clock driver for the Apple A8 touch clock"
++	depends on ARCH_APPLE || COMPILE_TEST
++	select MFD_SYSCON
++	help
++	  This driver supports the TOUCH_CTL clock gate and divider in the
++	  PMGR of the Apple A8 (t7000), which generates the 32.768 kHz clock for
++	  the multi-touch controller from the 24 MHz reference clock.
++
+ config COMMON_CLK_MAX77686
+ 	tristate "Clock driver for Maxim 77620/77686/77802 MFD"
+ 	depends on MFD_MAX77686 || MFD_MAX77620 || COMPILE_TEST
+diff --git a/drivers/clk/Makefile b/drivers/clk/Makefile
+index b18af485d..0e32a734d 100644
+--- a/drivers/clk/Makefile
++++ b/drivers/clk/Makefile
+@@ -56,6 +56,7 @@ endif
+ # hardware specific clock types
+ # please keep this section sorted lexicographically by file path name
+ obj-$(CONFIG_COMMON_CLK_APPLE_NCO)  	+= clk-apple-nco.o
++obj-$(CONFIG_COMMON_CLK_APPLE_TOUCH)	+= clk-apple-touch.o
+ obj-$(CONFIG_MACH_ASM9260)		+= clk-asm9260.o
+ obj-$(CONFIG_COMMON_CLK_AXI_CLKGEN)	+= clk-axi-clkgen.o
+ obj-$(CONFIG_ARCH_AXXIA)		+= clk-axm5516.o
+diff --git a/drivers/clk/clk-apple-touch.c b/drivers/clk/clk-apple-touch.c
+new file mode 100644
+index 000000000..c0edee33a
+--- /dev/null
++++ b/drivers/clk/clk-apple-touch.c
+@@ -0,0 +1,206 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Apple A8 (t7000) PMGR touch clock
++ *
++ * The PMGR on the A8 (t7000) has a TOUCH_CTL register that gates and divides
++ * the 24 MHz reference clock down to the 32.768 kHz sleep clock the
++ * multi-touch controller wants. The register is a plain PMGR control register
++ * and lives in the PMGR syscon, so this is a child of that node.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/clk-provider.h>
++#include <linux/device.h>
++#include <linux/math.h>
++#include <linux/mfd/syscon.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++
++#define TOUCH_CTL_DIV		GENMASK(9, 0)
++#define TOUCH_CTL_BUSY		BIT(18)
++#define TOUCH_CTL_EN		BIT(19)
++#define TOUCH_CTL_GATE		BIT(31)
++
++/* 24 MHz / 732 is the closest integer divider to 32.768 kHz */
++#define TOUCH_CLK_DEFAULT_DIV	732
++
++#define TOUCH_CLK_ENABLE_DELAY_US	8
++#define TOUCH_CLK_DISABLE_DELAY_US	100
++#define TOUCH_CLK_BUSY_TIMEOUT_US	1000
++
++struct apple_touch_clk {
++	struct clk_hw hw;
++	struct regmap *regmap;
++	u32 offset;
++	u32 div;
++};
++
++#define to_apple_touch_clk(_hw) container_of(_hw, struct apple_touch_clk, hw)
++
++static int apple_touch_clk_wait_idle(struct apple_touch_clk *clk)
++{
++	u32 val;
++
++	return regmap_read_poll_timeout(clk->regmap, clk->offset, val,
++					!(val & TOUCH_CTL_BUSY), 1,
++					TOUCH_CLK_BUSY_TIMEOUT_US);
++}
++
++static int apple_touch_clk_prepare(struct clk_hw *hw)
++{
++	struct apple_touch_clk *clk = to_apple_touch_clk(hw);
++	u32 val;
++	int ret;
++
++	ret = regmap_read(clk->regmap, clk->offset, &val);
++	if (ret)
++		return ret;
++
++	/* Ungate, give the clock tree a moment, then divide and enable. */
++	ret = regmap_write(clk->regmap, clk->offset, val & ~TOUCH_CTL_GATE);
++	if (ret)
++		return ret;
++
++	fsleep(TOUCH_CLK_ENABLE_DELAY_US);
++
++	val &= ~(TOUCH_CTL_GATE | TOUCH_CTL_DIV);
++	val |= TOUCH_CTL_EN | FIELD_PREP(TOUCH_CTL_DIV, clk->div);
++	ret = regmap_write(clk->regmap, clk->offset, val);
++	if (ret)
++		return ret;
++
++	return apple_touch_clk_wait_idle(clk);
++}
++
++static void apple_touch_clk_unprepare(struct clk_hw *hw)
++{
++	struct apple_touch_clk *clk = to_apple_touch_clk(hw);
++
++	regmap_clear_bits(clk->regmap, clk->offset, TOUCH_CTL_EN);
++	apple_touch_clk_wait_idle(clk);
++	regmap_set_bits(clk->regmap, clk->offset, TOUCH_CTL_GATE);
++	fsleep(TOUCH_CLK_DISABLE_DELAY_US);
++}
++
++static int apple_touch_clk_is_prepared(struct clk_hw *hw)
++{
++	struct apple_touch_clk *clk = to_apple_touch_clk(hw);
++	u32 val;
++
++	if (regmap_read(clk->regmap, clk->offset, &val))
++		return 0;
++
++	return (val & TOUCH_CTL_EN) && !(val & TOUCH_CTL_GATE);
++}
++
++static unsigned long apple_touch_clk_recalc_rate(struct clk_hw *hw,
++						 unsigned long parent_rate)
++{
++	struct apple_touch_clk *clk = to_apple_touch_clk(hw);
++
++	return DIV_ROUND_CLOSEST(parent_rate, clk->div);
++}
++
++static u32 apple_touch_clk_calc_div(unsigned long rate, unsigned long parent_rate)
++{
++	if (!rate)
++		return TOUCH_CTL_DIV;
++
++	return clamp(DIV_ROUND_CLOSEST(parent_rate, rate), 1UL,
++		     (unsigned long)FIELD_MAX(TOUCH_CTL_DIV));
++}
++
++static int apple_touch_clk_determine_rate(struct clk_hw *hw,
++					  struct clk_rate_request *req)
++{
++	u32 div = apple_touch_clk_calc_div(req->rate, req->best_parent_rate);
++
++	req->rate = DIV_ROUND_CLOSEST(req->best_parent_rate, div);
++
++	return 0;
++}
++
++static int apple_touch_clk_set_rate(struct clk_hw *hw, unsigned long rate,
++				    unsigned long parent_rate)
++{
++	struct apple_touch_clk *clk = to_apple_touch_clk(hw);
++	u32 div = apple_touch_clk_calc_div(rate, parent_rate);
++	int ret;
++
++	clk->div = div;
++
++	if (!apple_touch_clk_is_prepared(hw))
++		return 0;
++
++	ret = regmap_update_bits(clk->regmap, clk->offset, TOUCH_CTL_DIV,
++				 FIELD_PREP(TOUCH_CTL_DIV, div));
++	if (ret)
++		return ret;
++
++	return apple_touch_clk_wait_idle(clk);
++}
++
++static const struct clk_ops apple_touch_clk_ops = {
++	.prepare = apple_touch_clk_prepare,
++	.unprepare = apple_touch_clk_unprepare,
++	.is_prepared = apple_touch_clk_is_prepared,
++	.recalc_rate = apple_touch_clk_recalc_rate,
++	.determine_rate = apple_touch_clk_determine_rate,
++	.set_rate = apple_touch_clk_set_rate,
++};
++
++static int apple_touch_clk_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct device_node *np = dev->of_node;
++	static const struct clk_parent_data parent_data = { .index = 0 };
++	struct clk_init_data init = {
++		.name = "touch",
++		.ops = &apple_touch_clk_ops,
++		.parent_data = &parent_data,
++		.num_parents = 1,
++	};
++	struct apple_touch_clk *clk;
++	int ret;
++
++	clk = devm_kzalloc(dev, sizeof(*clk), GFP_KERNEL);
++	if (!clk)
++		return -ENOMEM;
++
++	clk->regmap = syscon_node_to_regmap(np->parent);
++	if (IS_ERR(clk->regmap))
++		return PTR_ERR(clk->regmap);
++
++	ret = of_property_read_u32_index(np, "reg", 0, &clk->offset);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to read reg\n");
++
++	clk->div = TOUCH_CLK_DEFAULT_DIV;
++	clk->hw.init = &init;
++
++	ret = devm_clk_hw_register(dev, &clk->hw);
++	if (ret)
++		return ret;
++
++	return devm_of_clk_add_hw_provider(dev, of_clk_hw_simple_get, &clk->hw);
++}
++
++static const struct of_device_id apple_touch_clk_of_match[] = {
++	{ .compatible = "apple,t7000-touch-clk" },
++	{}
++};
++MODULE_DEVICE_TABLE(of, apple_touch_clk_of_match);
++
++static struct platform_driver apple_touch_clk_driver = {
++	.probe = apple_touch_clk_probe,
++	.driver = {
++		.name = "apple-touch-clk",
++		.of_match_table = apple_touch_clk_of_match,
++	},
++};
++module_platform_driver(apple_touch_clk_driver);
++
++MODULE_DESCRIPTION("Apple PMGR touch clock driver");
++MODULE_LICENSE("GPL");

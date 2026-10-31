@@ -1,0 +1,85 @@
+#!/bin/sh
+# btup - start the Bluetooth userspace stack on the phone (after `tar -xzf bt.tgz -C /`; audioboot does both).
+# dbus-daemon (system bus) -> bluetoothd -> bluealsa (A2DP source). Idempotent: running daemons are left alone.
+# Logs: /tmp/bluetoothd.log, /tmp/bluealsad.log; dbus-daemon logs to syslog (`logread | grep dbus`).
+# Env: BTDEBUG=1 (bluetoothd -d + bluealsa debug)  BLUETOOTHD_ARGS="--noplugin=hog"  BLUEALSA_ARGS="-c SBC"
+# Needs the adapter (hci0) only for pairing/audio, not to start: with no controller the daemons idle.
+# Stop: kill $(pidof bluealsa bluetoothd dbus-daemon)   (by name, never pkill -f)
+PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH
+fail=0
+log() { echo "btup: $*"; }
+
+# running NAME -> true if a process with exactly that name exists
+running() { pidof "$1" >/dev/null 2>&1; }
+
+# --- dirs, user, bus id --------------------------------------------------------------------
+mkdir -p /run/dbus /var/lib/dbus /var/lib/bluetooth /etc/bluetooth /tmp
+[ -e /var/run ] || ln -s /run /var/run
+# the initramfs has no /etc/passwd or /etc/group. dbus-daemon drops to messagebus, AND its policy files name root
+# (bluetoothd/bluealsa run as root and may only own org.bluez/org.bluealsa if "root" resolves) and group audio.
+# Entries are only ever appended when missing, existing lines are never touched.
+addent() { # addent FILE NAME LINE
+	grep -q "^$2:" "$1" 2>/dev/null || echo "$3" >> "$1"
+}
+addent /etc/passwd root 'root:x:0:0:root:/root:/bin/sh'
+addent /etc/passwd messagebus 'messagebus:x:100:101:D-Bus:/dev/null:/sbin/nologin'
+addent /etc/group root 'root:x:0:'
+addent /etc/group audio 'audio:x:29:'
+addent /etc/group messagebus 'messagebus:x:101:'
+chown messagebus:messagebus /run/dbus
+[ -s /var/lib/dbus/machine-id ] || dbus-uuidgen --ensure
+
+# --- dbus-daemon ---------------------------------------------------------------------------
+if running dbus-daemon; then
+	log "dbus-daemon already running ($(pidof dbus-daemon))"
+else
+	rm -f /run/dbus/dbus.pid /run/dbus/system_bus_socket
+	dbus-daemon --system --fork || { log "dbus-daemon FAILED (logread | grep dbus)"; fail=1; }
+fi
+i=0
+while [ ! -S /run/dbus/system_bus_socket ] && [ $i -lt 25 ]; do usleep 200000; i=$((i + 1)); done
+[ -S /run/dbus/system_bus_socket ] || { log "no system bus socket, giving up"; exit 1; }
+
+# bus_name_owned NAME
+bus_name_owned() {
+	dbus-send --system --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus \
+		org.freedesktop.DBus.NameHasOwner string:"$1" 2>/dev/null | grep -q 'boolean true'
+}
+# wait_name NAME PROC: wait up to 10 s for NAME on the bus while PROC is alive
+wait_name() {
+	i=0
+	while [ $i -lt 50 ]; do
+		bus_name_owned "$1" && return 0
+		running "$2" || return 1
+		usleep 200000; i=$((i + 1))
+	done
+	return 1
+}
+
+# --- bluetoothd ----------------------------------------------------------------------------
+if running bluetoothd; then
+	log "bluetoothd already running ($(pidof bluetoothd))"
+else
+	# plugins that need kernel pieces this kernel lacks (RFCOMM/UHID) only log errors, they don't stop bluetoothd
+	setsid /usr/lib/bluetooth/bluetoothd -n ${BTDEBUG:+-d} $BLUETOOTHD_ARGS > /tmp/bluetoothd.log 2>&1 < /dev/null &
+	wait_name org.bluez bluetoothd || { log "bluetoothd FAILED to appear on the bus; tail of /tmp/bluetoothd.log:"; tail -5 /tmp/bluetoothd.log; fail=1; }
+fi
+
+# --- bluealsa ------------------------------------------------------------------------------
+# 4.3.1 ships the daemon as `bluealsa` (renamed `bluealsad` upstream later): use whichever exists
+BA=bluealsad; command -v $BA >/dev/null 2>&1 || BA=bluealsa
+if running $BA; then
+	log "$BA already running ($(pidof $BA))"
+else
+	setsid $BA -p a2dp-source ${BTDEBUG:+--loglevel=debug} $BLUEALSA_ARGS > /tmp/bluealsad.log 2>&1 < /dev/null &
+	wait_name org.bluealsa $BA || { log "$BA FAILED to appear on the bus; tail of /tmp/bluealsad.log:"; tail -5 /tmp/bluealsad.log; fail=1; }
+fi
+# audio ahead of Orchard's animations: every bluealsa thread + its autogroup (setsid gave it its own) at nice -11
+p=$(pidof $BA) && { for t in /proc/$p/task/*; do renice -11 -p "${t##*/}" >/dev/null; done; echo -11 > /proc/$p/autogroup; } 2>/dev/null
+
+# --- summary -------------------------------------------------------------------------------
+for p in dbus-daemon bluetoothd $BA; do
+	if running $p; then log "$p up (pid $(pidof $p))"; else log "$p NOT running"; fail=1; fi
+done
+[ -e /sys/class/bluetooth/hci0 ] && log "hci0 present" || log "no hci0 yet (controller not registered)"
+exit $fail

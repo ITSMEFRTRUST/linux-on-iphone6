@@ -1,0 +1,559 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 17:44:07 +0000
+Subject: [PATCH 004/138] ASoC: cs35l33: Add CS35L19 support
+
+The CS35L19 is a Cirrus boosted mono class D amplifier used in the Apple
+iPhone 6 (n61). It has no public datasheet. It reports ID 35 A1 9x and
+shares the CS35L33 register map, with these differences found by reading
+a rev B0 part and the iOS 12.5.5 driver (AppleCS35L19Amp):
+
+ - different power-on values for CLK_CTL, BST_PEAK_CTL, ADC_CTL,
+   HG_REL_RATE, LDO_DEL and BST_CTL4, plus four boost loop coefficient
+   registers at 0x3A-0x3D
+ - its own sample rate codes in CLK_CTL[4:0], known for a 6 MHz internal
+   MCLK (12 MHz with MCLKDIV2, which is what iOS uses)
+ - the CS35L33 register patch must not be applied (iOS never touches
+   BST_CTL4); rev B0 and later need a different trim, part of which is
+   board specific
+ - iOS clears all of PROTECT_CTL[3:0] to disable the alive watchdog and
+   never sets CLK_CTL bit 5, which is SDOUT_3ST_TDM on the CS35L33
+
+Add a variant struct for these and the optional "cirrus,boost-slew-step",
+"cirrus,boost-coeffs" and "cirrus,trim" properties for the CS35L19.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../devicetree/bindings/sound/cs35l33.txt     |  14 +-
+ include/sound/cs35l33.h                       |   8 +
+ sound/soc/codecs/cs35l33.c                    | 285 +++++++++++++++---
+ sound/soc/codecs/cs35l33.h                    |   7 +
+ 4 files changed, 272 insertions(+), 42 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/sound/cs35l33.txt b/Documentation/devicetree/bindings/sound/cs35l33.txt
+index 552717135..b8c34f457 100644
+--- a/Documentation/devicetree/bindings/sound/cs35l33.txt
++++ b/Documentation/devicetree/bindings/sound/cs35l33.txt
+@@ -1,8 +1,8 @@
+-CS35L33 Speaker Amplifier
++CS35L33 / CS35L19 Speaker Amplifier
+ 
+ Required properties:
+ 
+-  - compatible : "cirrus,cs35l33"
++  - compatible : "cirrus,cs35l33" or "cirrus,cs35l19"
+ 
+   - reg : the I2C address of the device for I2C
+ 
+@@ -39,6 +39,16 @@ Optional properties:
+     ADC data word. This property can be set as a value of 0 for bits 15 down
+     to 0, 6 for 21 down to 6, 7, for 22 down to 7, 8 for 23 down to 8.
+ 
++Optional properties, "cirrus,cs35l19" only:
++
++  - cirrus,boost-slew-step : Boost converter VBST slew step, 0 to 3.
++
++  - cirrus,boost-coeffs : Four bytes for the boost loop coefficient
++    registers 0x3A to 0x3D.
++
++  - cirrus,trim : Three bytes of board specific trim, written to the
++    registers 0x46, 0x54 and 0x66.
++
+ 
+ Optional H/G Algorithm sub-node:
+ 
+diff --git a/include/sound/cs35l33.h b/include/sound/cs35l33.h
+index a25084c4f..9e2dccbdb 100644
+--- a/include/sound/cs35l33.h
++++ b/include/sound/cs35l33.h
+@@ -40,6 +40,14 @@ struct cs35l33_pdata {
+ 
+ 	/* H/G algo configuration */
+ 	struct cs35l33_hg hg_config;
++
++	/* CS35L19 only: boost slew step, boost loop coefficients, trim */
++	bool set_bst_slew;
++	unsigned int bst_slew;
++	bool set_bst_coeff;
++	u8 bst_coeff[4];
++	bool set_trim;
++	u8 trim[3];
+ };
+ 
+ #endif /* __CS35L33_H */
+diff --git a/sound/soc/codecs/cs35l33.c b/sound/soc/codecs/cs35l33.c
+index 23ff3d240..8661e6628 100644
+--- a/sound/soc/codecs/cs35l33.c
++++ b/sound/soc/codecs/cs35l33.c
+@@ -34,7 +34,28 @@
+ 
+ #define CS35L33_BOOT_DELAY	50
+ 
++struct cs35l33_mclk_div {
++	int mclk;
++	int srate;
++	u8 adsp_rate;
++	u8 int_fs_ratio;
++};
++
++struct cs35l33_variant {
++	const char *name;
++	unsigned int devid;
++	const struct regmap_config *regmap;
++	const struct cs35l33_mclk_div *coeffs;
++	int num_coeffs;
++	const struct snd_pcm_hw_constraint_list *constraints;
++	/* PROTECT_CTL bits written to disable the alive watchdog */
++	unsigned int alive_wd_mask;
++	/* CLK_CTL[5] is SDOUT_3ST_TDM (CS35L33 only) */
++	bool clk_sdout_3st;
++};
++
+ struct cs35l33_private {
++	const struct cs35l33_variant *variant;
+ 	struct snd_soc_component *component;
+ 	struct cs35l33_pdata pdata;
+ 	struct regmap *regmap;
+@@ -87,6 +108,50 @@ static const struct reg_default cs35l33_reg[] = {
+ 	{CS35L33_BST_CTL4, 0x63},
+ };
+ 
++/* Same map as CS35L33, power-on values read from a rev B0 part */
++static const struct reg_default cs35l19_reg[] = {
++	{CS35L33_PWRCTL1, 0x85},
++	{CS35L33_PWRCTL2, 0xFE},
++	{CS35L33_CLK_CTL, 0x0B},
++	{CS35L33_BST_PEAK_CTL, 0x40},
++	{CS35L33_PROTECT_CTL, 0x55},
++	{CS35L33_BST_CTL1, 0x00},
++	{CS35L33_BST_CTL2, 0x01},
++	{CS35L33_ADSP_CTL, 0x00},
++	{CS35L33_ADC_CTL, 0x07},
++	{CS35L33_DAC_CTL, 0x14},
++	{CS35L33_DIG_VOL_CTL, 0x00},
++	{CS35L33_CLASSD_CTL, 0x04},
++	{CS35L33_AMP_CTL, 0x90},
++	{CS35L33_INT_MASK_1, 0xFF},
++	{CS35L33_INT_MASK_2, 0xFF},
++	{CS35L33_DIAG_LOCK, 0x00},
++	{CS35L33_DIAG_CTRL_1, 0x40},
++	{CS35L33_DIAG_CTRL_2, 0x00},
++	{CS35L33_HG_MEMLDO_CTL, 0x62},
++	{CS35L33_HG_REL_RATE, 0x01},
++	{CS35L33_LDO_DEL, 0x30},
++	{CS35L33_HG_HEAD, 0x0A},
++	{CS35L33_HG_EN, 0x05},
++	{CS35L33_TX_VMON, 0x00},
++	{CS35L33_TX_IMON, 0x03},
++	{CS35L33_TX_VPMON, 0x02},
++	{CS35L33_TX_VBSTMON, 0x05},
++	{CS35L33_TX_FLAG, 0x06},
++	{CS35L33_TX_EN1, 0x00},
++	{CS35L33_TX_EN2, 0x00},
++	{CS35L33_TX_EN3, 0x00},
++	{CS35L33_TX_EN4, 0x00},
++	{CS35L33_RX_AUD, 0x40},
++	{CS35L33_RX_SPLY, 0x03},
++	{CS35L33_RX_ALIVE, 0x04},
++	{CS35L33_BST_CTL4, 0x00},
++	{0x3A, 0x06},
++	{0x3B, 0x32},
++	{0x3C, 0x74},
++	{0x3D, 0x03},
++};
++
+ static const struct reg_sequence cs35l33_patch[] = {
+ 	{ 0x00,  0x99, 0 },
+ 	{ 0x59,  0x02, 0 },
+@@ -181,6 +246,14 @@ static bool cs35l33_readable_register(struct device *dev, unsigned int reg)
+ 	}
+ }
+ 
++static bool cs35l19_readable_register(struct device *dev, unsigned int reg)
++{
++	if (reg >= CS35L19_BST_COEFF1 && reg <= CS35L19_BST_COEFF4)
++		return true;
++
++	return cs35l33_readable_register(dev, reg);
++}
++
+ static DECLARE_TLV_DB_SCALE(classd_ctl_tlv, 900, 100, 0);
+ static DECLARE_TLV_DB_SCALE(dac_tlv, -10200, 50, 0);
+ 
+@@ -267,7 +340,8 @@ static int cs35l33_sdout_event(struct snd_soc_dapm_widget *w,
+ 	struct snd_soc_component *component = snd_soc_dapm_to_component(w->dapm);
+ 	struct cs35l33_private *priv = snd_soc_component_get_drvdata(component);
+ 	unsigned int mask = CS35L33_SDOUT_3ST_I2S | CS35L33_PDN_TDM;
+-	unsigned int mask2 = CS35L33_SDOUT_3ST_TDM;
++	unsigned int mask2 = priv->variant->clk_sdout_3st ?
++			     CS35L33_SDOUT_3ST_TDM : 0;
+ 	unsigned int val, val2;
+ 
+ 	switch (event) {
+@@ -297,8 +371,9 @@ static int cs35l33_sdout_event(struct snd_soc_dapm_widget *w,
+ 
+ 	regmap_update_bits(priv->regmap, CS35L33_PWRCTL2,
+ 		mask, val);
+-	regmap_update_bits(priv->regmap, CS35L33_CLK_CTL,
+-		mask2, val2);
++	if (mask2)
++		regmap_update_bits(priv->regmap, CS35L33_CLK_CTL,
++			mask2, val2);
+ 
+ 	return 0;
+ }
+@@ -387,13 +462,6 @@ static int cs35l33_set_bias_level(struct snd_soc_component *component,
+ 	return 0;
+ }
+ 
+-struct cs35l33_mclk_div {
+-	int mclk;
+-	int srate;
+-	u8 adsp_rate;
+-	u8 int_fs_ratio;
+-};
+-
+ static const struct cs35l33_mclk_div cs35l33_mclk_coeffs[] = {
+ 	/* MCLK, Sample Rate, adsp_rate, int_fs_ratio */
+ 	{5644800, 11025, 0x4, CS35L33_INT_FS_RATE},
+@@ -421,16 +489,30 @@ static const struct cs35l33_mclk_div cs35l33_mclk_coeffs[] = {
+ 	{6144000, 48000, 0xC, CS35L33_INT_FS_RATE},
+ };
+ 
+-static int cs35l33_get_mclk_coeff(int mclk, int srate)
++/* CS35L19 rate codes, only known for a 6 MHz internal MCLK */
++static const struct cs35l33_mclk_div cs35l19_mclk_coeffs[] = {
++	{6000000,  8000, 0xD, CS35L33_INT_FS_RATE},
++	{6000000, 11025, 0xB, CS35L33_INT_FS_RATE},
++	{6000000, 12000, 0x9, CS35L33_INT_FS_RATE},
++	{6000000, 16000, 0x5, CS35L33_INT_FS_RATE},
++	{6000000, 22050, 0x3, CS35L33_INT_FS_RATE},
++	{6000000, 24000, 0x1, CS35L33_INT_FS_RATE},
++	{6000000, 32000, 0xD, 0},
++	{6000000, 44100, 0xB, 0},
++	{6000000, 48000, 0x9, 0},
++};
++
++static const struct cs35l33_mclk_div *
++cs35l33_get_mclk_coeff(struct cs35l33_private *priv, int mclk, int srate)
+ {
+ 	int i;
+ 
+-	for (i = 0; i < ARRAY_SIZE(cs35l33_mclk_coeffs); i++) {
+-		if (cs35l33_mclk_coeffs[i].mclk == mclk &&
+-			cs35l33_mclk_coeffs[i].srate == srate)
+-			return i;
++	for (i = 0; i < priv->variant->num_coeffs; i++) {
++		if (priv->variant->coeffs[i].mclk == mclk &&
++			priv->variant->coeffs[i].srate == srate)
++			return &priv->variant->coeffs[i];
+ 	}
+-	return -EINVAL;
++	return NULL;
+ }
+ 
+ static int cs35l33_set_dai_fmt(struct snd_soc_dai *codec_dai, unsigned int fmt)
+@@ -480,15 +562,15 @@ static int cs35l33_pcm_hw_params(struct snd_pcm_substream *substream,
+ 	struct snd_soc_component *component = dai->component;
+ 	struct cs35l33_private *priv = snd_soc_component_get_drvdata(component);
+ 	int sample_size = params_width(params);
+-	int coeff = cs35l33_get_mclk_coeff(priv->mclk_int, params_rate(params));
++	const struct cs35l33_mclk_div *coeff;
+ 
+-	if (coeff < 0)
+-		return coeff;
++	coeff = cs35l33_get_mclk_coeff(priv, priv->mclk_int, params_rate(params));
++	if (!coeff)
++		return -EINVAL;
+ 
+ 	regmap_update_bits(priv->regmap, CS35L33_CLK_CTL,
+ 		CS35L33_ADSP_FS | CS35L33_INT_FS_RATE,
+-		cs35l33_mclk_coeffs[coeff].int_fs_ratio
+-		| cs35l33_mclk_coeffs[coeff].adsp_rate);
++		coeff->int_fs_ratio | coeff->adsp_rate);
+ 
+ 	if (priv->is_tdm_mode) {
+ 		sample_size = (sample_size / 8) - 1;
+@@ -515,12 +597,24 @@ static const struct snd_pcm_hw_constraint_list cs35l33_constraints = {
+ 	.list   = cs35l33_src_rates,
+ };
+ 
++static const unsigned int cs35l19_src_rates[] = {
++	8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000
++};
++
++static const struct snd_pcm_hw_constraint_list cs35l19_constraints = {
++	.count  = ARRAY_SIZE(cs35l19_src_rates),
++	.list   = cs35l19_src_rates,
++};
++
+ static int cs35l33_pcm_startup(struct snd_pcm_substream *substream,
+ 			       struct snd_soc_dai *dai)
+ {
++	struct cs35l33_private *priv =
++		snd_soc_component_get_drvdata(dai->component);
++
+ 	snd_pcm_hw_constraint_list(substream->runtime, 0,
+ 					SNDRV_PCM_HW_PARAM_RATE,
+-					&cs35l33_constraints);
++					priv->variant->constraints);
+ 	return 0;
+ }
+ 
+@@ -532,13 +626,15 @@ static int cs35l33_set_tristate(struct snd_soc_dai *dai, int tristate)
+ 	if (tristate) {
+ 		regmap_update_bits(priv->regmap, CS35L33_PWRCTL2,
+ 			CS35L33_SDOUT_3ST_I2S, CS35L33_SDOUT_3ST_I2S);
+-		regmap_update_bits(priv->regmap, CS35L33_CLK_CTL,
+-			CS35L33_SDOUT_3ST_TDM, CS35L33_SDOUT_3ST_TDM);
++		if (priv->variant->clk_sdout_3st)
++			regmap_update_bits(priv->regmap, CS35L33_CLK_CTL,
++				CS35L33_SDOUT_3ST_TDM, CS35L33_SDOUT_3ST_TDM);
+ 	} else {
+ 		regmap_update_bits(priv->regmap, CS35L33_PWRCTL2,
+ 			CS35L33_SDOUT_3ST_I2S, 0);
+-		regmap_update_bits(priv->regmap, CS35L33_CLK_CTL,
+-			CS35L33_SDOUT_3ST_TDM, 0);
++		if (priv->variant->clk_sdout_3st)
++			regmap_update_bits(priv->regmap, CS35L33_CLK_CTL,
++				CS35L33_SDOUT_3ST_TDM, 0);
+ 	}
+ 
+ 	return 0;
+@@ -780,7 +876,7 @@ static int cs35l33_probe(struct snd_soc_component *component)
+ 	pm_runtime_get_sync(component->dev);
+ 
+ 	regmap_update_bits(cs35l33->regmap, CS35L33_PROTECT_CTL,
+-		CS35L33_ALIVE_WD_DIS, 0x8);
++		cs35l33->variant->alive_wd_mask, 0x8);
+ 	regmap_update_bits(cs35l33->regmap, CS35L33_BST_CTL2,
+ 				CS35L33_ALIVE_WD_DIS2,
+ 				CS35L33_ALIVE_WD_DIS2);
+@@ -795,6 +891,15 @@ static int cs35l33_probe(struct snd_soc_component *component)
+ 	if (cs35l33->pdata.boost_ipk)
+ 		cs35l33_set_bst_ipk(component, cs35l33->pdata.boost_ipk);
+ 
++	if (cs35l33->pdata.set_bst_slew)
++		regmap_update_bits(cs35l33->regmap, CS35L33_BST_CTL2,
++			CS35L33_VBST_SR_STEP, cs35l33->pdata.bst_slew);
++
++	if (cs35l33->pdata.set_bst_coeff)
++		regmap_bulk_write(cs35l33->regmap, CS35L19_BST_COEFF1,
++			cs35l33->pdata.bst_coeff,
++			ARRAY_SIZE(cs35l33->pdata.bst_coeff));
++
+ 	if (cs35l33->enable_soft_ramp) {
+ 		snd_soc_component_update_bits(component, CS35L33_DAC_CTL,
+ 			CS35L33_DIGSFT, CS35L33_DIGSFT);
+@@ -854,6 +959,21 @@ static const struct regmap_config cs35l33_regmap = {
+ 	.use_single_write = true,
+ };
+ 
++static const struct regmap_config cs35l19_regmap = {
++	.reg_bits = 8,
++	.val_bits = 8,
++
++	.max_register = CS35L19_MAX_REGISTER,
++	.reg_defaults = cs35l19_reg,
++	.num_reg_defaults = ARRAY_SIZE(cs35l19_reg),
++	.volatile_reg = cs35l33_volatile_register,
++	.readable_reg = cs35l19_readable_register,
++	.writeable_reg = cs35l33_writeable_register,
++	.cache_type = REGCACHE_MAPLE,
++	.use_single_read = true,
++	.use_single_write = true,
++};
++
+ static int cs35l33_runtime_resume(struct device *dev)
+ {
+ 	struct cs35l33_private *cs35l33 = dev_get_drvdata(dev);
+@@ -1116,9 +1236,62 @@ static int cs35l33_of_get_pdata(struct device *dev,
+ 
+ 	cs35l33_get_hg_data(np, pdata);
+ 
++	if (cs35l33->variant->devid != CS35L19_CHIP_ID)
++		return 0;
++
++	if (of_property_read_u32(np, "cirrus,boost-slew-step", &val32) >= 0) {
++		pdata->bst_slew = val32 & CS35L33_VBST_SR_STEP;
++		pdata->set_bst_slew = true;
++	}
++
++	pdata->set_bst_coeff = !of_property_read_u8_array(np,
++		"cirrus,boost-coeffs", pdata->bst_coeff,
++		ARRAY_SIZE(pdata->bst_coeff));
++
++	pdata->set_trim = !of_property_read_u8_array(np, "cirrus,trim",
++		pdata->trim, ARRAY_SIZE(pdata->trim));
++
+ 	return 0;
+ }
+ 
++/*
++ * CS35L19 rev B0 and later need a trim, as applied by the iPhone 6
++ * firmware; the registers are undocumented. Registers 0x46, 0x54 and 0x66
++ * are board specific and only written when "cirrus,trim" is present.
++ */
++static int cs35l19_apply_patch(struct cs35l33_private *cs35l33,
++			       unsigned int rev)
++{
++	struct cs35l33_pdata *pdata = &cs35l33->pdata;
++	struct reg_sequence patch[11];
++	int n = 0;
++
++#define CS35L19_PATCH(r, v) (patch[n++] = (struct reg_sequence){ (r), (v) })
++	if (rev >= CS35L19_TRIM_REV) {
++		CS35L19_PATCH(0x00, 0x99);
++		CS35L19_PATCH(0x45, 0x3F);
++		if (pdata->set_trim)
++			CS35L19_PATCH(0x46, pdata->trim[0]);
++		CS35L19_PATCH(0x51, 0xFF);
++		CS35L19_PATCH(0x59, 0x0A);
++		CS35L19_PATCH(0x6B, 0x20);
++		if (pdata->set_trim)
++			CS35L19_PATCH(0x54, pdata->trim[1]);
++		CS35L19_PATCH(0x00, 0x00);
++	}
++	if (pdata->set_trim) {
++		CS35L19_PATCH(0x00, 0x99);
++		CS35L19_PATCH(0x66, pdata->trim[2]);
++		CS35L19_PATCH(0x00, 0x00);
++	}
++#undef CS35L19_PATCH
++
++	if (!n)
++		return 0;
++
++	return regmap_register_patch(cs35l33->regmap, patch, n);
++}
++
+ static int cs35l33_i2c_probe(struct i2c_client *i2c_client)
+ {
+ 	struct cs35l33_private *cs35l33;
+@@ -1131,8 +1304,13 @@ static int cs35l33_i2c_probe(struct i2c_client *i2c_client)
+ 	if (!cs35l33)
+ 		return -ENOMEM;
+ 
++	cs35l33->variant = i2c_get_match_data(i2c_client);
++	if (!cs35l33->variant)
++		return -ENODEV;
++
+ 	i2c_set_clientdata(i2c_client, cs35l33);
+-	cs35l33->regmap = devm_regmap_init_i2c(i2c_client, &cs35l33_regmap);
++	cs35l33->regmap = devm_regmap_init_i2c(i2c_client,
++					       cs35l33->variant->regmap);
+ 	if (IS_ERR(cs35l33->regmap)) {
+ 		ret = PTR_ERR(cs35l33->regmap);
+ 		dev_err(&i2c_client->dev, "regmap_init() failed: %d\n", ret);
+@@ -1202,10 +1380,10 @@ static int cs35l33_i2c_probe(struct i2c_client *i2c_client)
+ 		goto err_enable;
+ 	}
+ 
+-	if (devid != CS35L33_CHIP_ID) {
++	if (devid != cs35l33->variant->devid) {
+ 		dev_err(&i2c_client->dev,
+-			"CS35L33 Device ID (%X). Expected ID %X\n",
+-			devid, CS35L33_CHIP_ID);
++			"%s Device ID (%X). Expected ID %X\n",
++			cs35l33->variant->name, devid, cs35l33->variant->devid);
+ 		ret = -EINVAL;
+ 		goto err_enable;
+ 	}
+@@ -1216,11 +1394,14 @@ static int cs35l33_i2c_probe(struct i2c_client *i2c_client)
+ 		goto err_enable;
+ 	}
+ 
+-	dev_info(&i2c_client->dev,
+-		 "Cirrus Logic CS35L33, Revision: %02X\n", reg & 0xFF);
++	dev_info(&i2c_client->dev, "Cirrus Logic %s, Revision: %02X\n",
++		 cs35l33->variant->name, reg & 0xFF);
+ 
+-	ret = regmap_register_patch(cs35l33->regmap,
+-			cs35l33_patch, ARRAY_SIZE(cs35l33_patch));
++	if (cs35l33->variant->devid == CS35L19_CHIP_ID)
++		ret = cs35l19_apply_patch(cs35l33, reg & 0xFF);
++	else
++		ret = regmap_register_patch(cs35l33->regmap, cs35l33_patch,
++					    ARRAY_SIZE(cs35l33_patch));
+ 	if (ret < 0) {
+ 		dev_err(&i2c_client->dev,
+ 			"Error in applying regmap patch: %d\n", ret);
+@@ -1228,9 +1409,10 @@ static int cs35l33_i2c_probe(struct i2c_client *i2c_client)
+ 	}
+ 
+ 	/* disable mclk and tdm */
+-	regmap_update_bits(cs35l33->regmap, CS35L33_CLK_CTL,
+-		CS35L33_MCLKDIS | CS35L33_SDOUT_3ST_TDM,
+-		CS35L33_MCLKDIS | CS35L33_SDOUT_3ST_TDM);
++	reg = CS35L33_MCLKDIS;
++	if (cs35l33->variant->clk_sdout_3st)
++		reg |= CS35L33_SDOUT_3ST_TDM;
++	regmap_update_bits(cs35l33->regmap, CS35L33_CLK_CTL, reg, reg);
+ 
+ 	pm_runtime_set_autosuspend_delay(&i2c_client->dev, 100);
+ 	pm_runtime_use_autosuspend(&i2c_client->dev);
+@@ -1267,14 +1449,37 @@ static void cs35l33_i2c_remove(struct i2c_client *client)
+ 		cs35l33->core_supplies);
+ }
+ 
++static const struct cs35l33_variant cs35l33_variant = {
++	.name = "CS35L33",
++	.devid = CS35L33_CHIP_ID,
++	.regmap = &cs35l33_regmap,
++	.coeffs = cs35l33_mclk_coeffs,
++	.num_coeffs = ARRAY_SIZE(cs35l33_mclk_coeffs),
++	.constraints = &cs35l33_constraints,
++	.alive_wd_mask = CS35L33_ALIVE_WD_DIS,
++	.clk_sdout_3st = true,
++};
++
++static const struct cs35l33_variant cs35l19_variant = {
++	.name = "CS35L19",
++	.devid = CS35L19_CHIP_ID,
++	.regmap = &cs35l19_regmap,
++	.coeffs = cs35l19_mclk_coeffs,
++	.num_coeffs = ARRAY_SIZE(cs35l19_mclk_coeffs),
++	.constraints = &cs35l19_constraints,
++	.alive_wd_mask = 0xF,
++};
++
+ static const struct of_device_id cs35l33_of_match[] = {
+-	{ .compatible = "cirrus,cs35l33", },
++	{ .compatible = "cirrus,cs35l33", .data = &cs35l33_variant },
++	{ .compatible = "cirrus,cs35l19", .data = &cs35l19_variant },
+ 	{},
+ };
+ MODULE_DEVICE_TABLE(of, cs35l33_of_match);
+ 
+ static const struct i2c_device_id cs35l33_id[] = {
+-	{ .name = "cs35l33" },
++	{ .name = "cs35l33", .driver_data = (kernel_ulong_t)&cs35l33_variant },
++	{ .name = "cs35l19", .driver_data = (kernel_ulong_t)&cs35l19_variant },
+ 	{ }
+ };
+ 
+diff --git a/sound/soc/codecs/cs35l33.h b/sound/soc/codecs/cs35l33.h
+index fcb5e1723..6b41df0f0 100644
+--- a/sound/soc/codecs/cs35l33.h
++++ b/sound/soc/codecs/cs35l33.h
+@@ -11,6 +11,7 @@
+ #define __CS35L33_H__
+ 
+ #define CS35L33_CHIP_ID		0x00035A33
++#define CS35L19_CHIP_ID		0x00035A19
+ #define CS35L33_DEVID_AB	0x01	/* Device ID A & B [RO] */
+ #define CS35L33_DEVID_CD	0x02	/* Device ID C & D [RO] */
+ #define CS35L33_DEVID_E		0x03	/* Device ID E [RO] */
+@@ -57,6 +58,12 @@
+ #define CS35L33_HG_STATUS	0x3F	/* H/G Status */
+ #define CS35L33_MAX_REGISTER	0x59
+ 
++/* CS35L19 only */
++#define CS35L19_BST_COEFF1	0x3A	/* Boost Loop Coefficients 1-4 */
++#define CS35L19_BST_COEFF4	0x3D
++#define CS35L19_MAX_REGISTER	0x6B
++#define CS35L19_TRIM_REV	0xB0	/* first revision needing the trim */
++
+ #define CS35L33_MCLK_5644	5644800
+ #define CS35L33_MCLK_6144	6144000
+ #define CS35L33_MCLK_6		6000000

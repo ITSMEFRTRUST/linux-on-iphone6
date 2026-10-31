@@ -1,0 +1,589 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 23:11:35 +0000
+Subject: [PATCH 113/138] media: apple: t7000 ISP test module (WIP: mini DART +
+ surfaces, fw load, CPU start, boot stages 2-3)
+
+isp-ipc.c (rings, commands, shutdown) not yet written; does not build yet.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../media/platform/apple/isp-t7000/isp-boot.c | 287 ++++++++++++++++++
+ .../media/platform/apple/isp-t7000/isp-dart.c | 274 +++++++++++++++++
+ 2 files changed, 561 insertions(+)
+ create mode 100644 drivers/media/platform/apple/isp-t7000/isp-boot.c
+ create mode 100644 drivers/media/platform/apple/isp-t7000/isp-dart.c
+
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-boot.c b/drivers/media/platform/apple/isp-t7000/isp-boot.c
+new file mode 100644
+index 000000000..10e76448a
+--- /dev/null
++++ b/drivers/media/platform/apple/isp-t7000/isp-boot.c
+@@ -0,0 +1,287 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Apple A8 (T7000) ISP: firmware load (stage 3), CPU start (4) and the boot
++ * handshakes (5, 6), following AppleH6CamIn::ISP_Init for HW rev 4.
++ */
++#include <linux/delay.h>
++#include <linux/firmware.h>
++#include <linux/jiffies.h>
++#include <linux/platform_device.h>
++#include <linux/sizes.h>
++#include <linux/string.h>
++
++#include "isp.h"
++
++#define ISP_FW_NAME	"apple/isp-t7000.bin"
++
++/* fabric TLIMIT list (kext __const 0xfffffff00712f9f0), rev 4/5 */
++static const u16 isp_tlimit[] = {
++	0x24, 0x28, 0x2c, 0x30, 0x34, 0x38, 0x3c, 0x40,
++	0x48, 0x4c, 0x50, 0x54, 0x58, 0x5c, 0x60, 0x64,
++};
++
++/* Poll (reg & mask) == want every 10 ms; a DART fault aborts early. */
++int isp_wait(struct t7000_isp *isp, u32 off, u32 mask, u32 want, uint ms,
++	     const char *what)
++{
++	unsigned long start = jiffies, end = start + msecs_to_jiffies(ms);
++	u32 v;
++
++	dev_info(isp->dev, "waiting for %s: reg +0x%x & 0x%x == 0x%x (timeout %u ms)\n",
++		 what, off, mask, want, ms);
++	for (;;) {
++		v = isp_rd(isp, off);
++		if ((v & mask) == want) {
++			dev_info(isp->dev, "got %s after %u ms (reg 0x%08x)\n", what,
++				 jiffies_to_msecs(jiffies - start), v);
++			return 0;
++		}
++		if (isp_dart_fault(isp)) {
++			dev_err(isp->dev, "DART fault while waiting for %s (reg 0x%08x)\n", what, v);
++			isp_log_window(isp, "on fault");
++			return -EIO;
++		}
++		if (time_after(jiffies, end))
++			break;
++		msleep(10);
++	}
++	dev_err(isp->dev, "TIMEOUT after %u ms waiting for %s: reg +0x%x = 0x%08x, want (& 0x%x) 0x%x\n",
++		ms, what, off, v, mask, want);
++	isp_log_window(isp, "on timeout");
++	isp_dart_log(isp, "on timeout");
++	return -ETIMEDOUT;
++}
++
++static void isp_fw_strings(struct t7000_isp *isp, const u8 *d, size_t len)
++{
++	if (len < 0x10a0) {
++		dev_err(isp->dev, "firmware too short for the header strings\n");
++		return;
++	}
++	dev_info(isp->dev, "fw header: mode '%.8s' (adc = normal) '%.8s' build '%.12s %.12s' version '%.16s' tree '%.8s'\n",
++		 d + 0x1040, d + 0x1050, d + 0x1060, d + 0x106c, d + 0x1080, d + 0x1090);
++}
++
++/* dry_run: load the file, log size + strings, map nothing. */
++void isp_fw_peek(struct t7000_isp *isp)
++{
++	const struct firmware *fw;
++	int ret = request_firmware_direct(&fw, ISP_FW_NAME, isp->dev);
++
++	if (ret) {
++		dev_err(isp->dev, "dry_run: request_firmware(%s) = %d\n", ISP_FW_NAME, ret);
++		return;
++	}
++	dev_info(isp->dev, "dry_run: %s is 0x%zx bytes (fw surface 0x%x), word0 0x%08x\n",
++		 ISP_FW_NAME, fw->size, ISP_FW_SIZE_V34,
++		 fw->size >= 4 ? *(const u32 *)fw->data : 0);
++	isp_fw_strings(isp, fw->data, fw->size);
++	release_firmware(fw);
++}
++
++int isp_stage_fw(struct t7000_isp *isp)
++{
++	const struct firmware *fw;
++	int ret;
++
++	ret = isp_dart_init(isp);
++	if (ret)
++		return ret;
++	ret = request_firmware_direct(&fw, ISP_FW_NAME, isp->dev);
++	if (ret) {
++		dev_err(isp->dev, "request_firmware(%s) = %d (copy it to /lib/firmware/apple/)\n",
++			ISP_FW_NAME, ret);
++		return ret;
++	}
++	if (fw->size > ISP_FW_SIZE_V34 || fw->size < 0x2000) {
++		dev_err(isp->dev, "firmware size 0x%zx not in 0x2000..0x%x\n", fw->size,
++			ISP_FW_SIZE_V34);
++		release_firmware(fw);
++		return -EINVAL;
++	}
++	isp->fw = isp_surf_alloc(isp, ISP_FW_SIZE_V34, 0x20205746 /* "FW  " */);
++	if (!isp->fw) {
++		release_firmware(fw);
++		return -ENOMEM;
++	}
++	memcpy(isp->fw->virt, fw->data, fw->size);
++	dma_wmb();
++	dev_info(isp->dev, "firmware 0x%zx bytes copied to iova 0x%08x, word0 0x%08x\n",
++		 fw->size, isp->fw->iova, *(u32 *)isp->fw->virt);
++	isp_fw_strings(isp, fw->data, fw->size);
++	release_firmware(fw);
++	isp_dart_log(isp, "after fw load");
++	return 0;
++}
++
++/* ResetISPCPU (kext 0x846a2f4), rev 4: only when gpio1 says it was not power-cycled */
++static void isp_reset_cpu(struct t7000_isp *isp)
++{
++	int i;
++
++	dev_info(isp->dev, "gpio1 == 0xfeedbabe: ISP not power-cycled, running ResetISPCPU\n");
++	isp_wr(isp, ISP_CTRL_V34, 0);
++	msleep(50);
++	for (i = 0; i < ARRAY_SIZE(isp_tlimit); i++)
++		isp_wr(isp, isp_tlimit[i], 0xffff);
++	for (i = 0; i < 3; i++)
++		isp_wr(isp, ISP_IRQMASK(i), 0xffffffff);
++	for (i = 0; i < 8; i++)
++		isp_rd(isp, ISP_CPU_STAT);
++	msleep(50);
++}
++
++int isp_stage_cpu(struct t7000_isp *isp)
++{
++	int i;
++
++	if (isp_rd(isp, ISP_GPIO(1)) == ISP_MAGIC_IDLE)
++		isp_reset_cpu(isp);
++	for (i = 0; i < 8; i++)
++		isp_wr(isp, ISP_GPIO(i), 0);
++	isp_wr(isp, ISP_FW_BASE, isp->fw->iova);
++	isp_wr(isp, ISP_WIN_0C, 0);
++	isp_wr(isp, ISP_WIN_10, 0);
++	isp_wr(isp, ISP_WIN_14, 0);
++	isp_wr(isp, ISP_WIN_18, 0xfffff000);
++	isp_wr(isp, ISP_WIN_1C, 0);
++	isp_log_window(isp, "before CPU run");
++	wmb();
++	isp->cpu_started = true;
++	isp_wr(isp, ISP_CTRL_V34, ISP_CTRL_RUN_V34);
++	dev_info(isp->dev, "CTRL +0x100028 = 0x10 (readback 0x%08x): ISP CPU released\n",
++		 isp_rd(isp, ISP_CTRL_V34));
++	return isp_wait(isp, ISP_GPIO(7), ~0U, ISP_MAGIC_WAKE, isp_boot_timeout_ms,
++			"wake magic 0x8042006 in gpio7");
++}
++
++/* Hard stop: mbox off, CTRL = 0, block new transactions, wait for drain. */
++void isp_cpu_stop(struct t7000_isp *isp)
++{
++	int i;
++
++	isp_wr(isp, ISP_MBOX_ENABLE, 0);
++	isp_wr(isp, ISP_CTRL_V34, 0);
++	msleep(10);
++	for (i = 0; i < ARRAY_SIZE(isp_tlimit); i++)
++		isp_wr(isp, isp_tlimit[i], 0);
++	isp_wait(isp, ISP_TLIMIT0_OUT, ~0U, 0, 100, "TLIMIT0 drain (+0x44 == 0)");
++	isp_wait(isp, ISP_TLIMIT1_OUT, ~0U, 0, 100, "TLIMIT1 drain (+0x68 == 0)");
++	isp->cpu_started = false;
++	isp_log_window(isp, "after CPU stop");
++}
++
++/* 64-byte-aligned bump allocator in the IPC pool (kext FUN_846b4d4 granularity) */
++static int isp_pool_alloc(struct t7000_isp *isp, u32 size)
++{
++	u32 off = isp->pool_used;
++
++	size = ALIGN(size, 64);
++	if (!size || off + size > isp->ipc->size)
++		return -1;
++	isp->pool_used += size;
++	return off;
++}
++
++/* Boot stage 2: host-allocated IPC queue + heap + 0x74-byte u32 boot args */
++int isp_stage_args(struct t7000_isp *isp)
++{
++	u32 pool, heap, *a;
++	int q, args, cmd, i;
++
++	isp->nchans = isp_rd(isp, ISP_GPIO(0));
++	isp->qsize = isp_rd(isp, ISP_GPIO(1)) + 1;
++	heap = isp_rd(isp, ISP_GPIO(3));
++	dev_info(isp->dev, "fw asks: numIPCChannels %u, ipcQueueSize 0x%x (gpio1+1), heap 0x%x (gpio3)\n",
++		 isp->nchans, isp->qsize, heap);
++	if (!isp->nchans || isp->nchans > ISP_MAX_CHANS || isp->qsize > SZ_4M || heap > SZ_16M) {
++		dev_err(isp->dev, "implausible channel count / queue size / heap size\n");
++		return -EIO;
++	}
++	pool = max_t(u32, ISP_IPC_POOL_MIN,
++		     PAGE_ALIGN(ALIGN(isp->qsize, 64) + 0x80 + ISP_CMD_BUF_SIZE + 0x1000));
++	isp->ipc = isp_surf_alloc(isp, pool, 0x20435049 /* "IPC " */);
++	if (!isp->ipc)
++		return -ENOMEM;
++	q = isp_pool_alloc(isp, isp->qsize);
++	args = isp_pool_alloc(isp, ISP_ARGS_SIZE);
++	cmd = isp_pool_alloc(isp, ISP_CMD_BUF_SIZE);
++	if (q < 0 || args < 0 || cmd < 0)
++		return -ENOMEM;
++	isp->args_off = args;
++	isp->cmd_off = cmd;
++	if (heap) {
++		isp->heapsize = max_t(u32, heap, 0x1000);
++		isp->heap = isp_surf_alloc(isp, isp->heapsize, 0x50414548 /* "HEAP" */);
++		if (!isp->heap)
++			return -ENOMEM;
++	}
++
++	a = (u32 *)((u8 *)isp->ipc->virt + args);
++	a[0] = isp->fw->iova;				/* absolute fw IOVA */
++	a[1] = isp_rel(isp->ipc->iova + q);		/* queue, fw-relative */
++	a[2] = ISP_FW_SIZE_V34;
++	a[3] = ISP_IOVA_SPAN - ISP_FW_SIZE_V34;
++	a[4] = isp->heap ? isp_rel(isp->heap->iova) : 0;
++	a[5] = isp->heap ? isp->heapsize : 0;
++	a[6] = isp_platform_id;
++	a[0xf] = 0xc;
++	for (i = 0; i < ISP_ARGS_SIZE / 4; i += 8)
++		dev_info(isp->dev, "bootargs[%02x]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
++			 i, a[i], a[i + 1], a[i + 2], a[i + 3], a[i + 4], a[i + 5],
++			 i + 6 < ISP_ARGS_SIZE / 4 ? a[i + 6] : 0,
++			 i + 7 < ISP_ARGS_SIZE / 4 ? a[i + 7] : 0);
++	dma_wmb();
++	isp_wr(isp, ISP_GPIO(0), isp_rel(isp->ipc->iova + args));
++	dev_info(isp->dev, "gpio0 = 0x%08x (fw-rel boot args), gpio7 = 0xf7fbdff9\n",
++		 isp_rel(isp->ipc->iova + args));
++	isp_wr(isp, ISP_GPIO(7), ISP_MAGIC_ARGS);
++	return isp_wait(isp, ISP_GPIO(7), ~0U, ISP_MAGIC_WAKE, isp_boot_timeout_ms,
++			"second magic 0x8042006 in gpio7 (channel table ready)");
++}
++
++/* Boot stage 3: parse the channel table, prime the command rings, release the fw */
++int isp_stage_chans(struct t7000_isp *isp)
++{
++	u32 tbl = isp_rd(isp, ISP_GPIO(0)), n, j;
++	const u8 *d = isp_translate(isp, tbl, isp->nchans * ISP_CHAN_DESC_SIZE);
++
++	if (!d) {
++		dev_err(isp->dev, "channel table at fw-rel 0x%08x is outside every surface\n", tbl);
++		return -EIO;
++	}
++	dev_info(isp->dev, "channel table at fw-rel 0x%08x, %u channels\n", tbl, isp->nchans);
++	for (n = 0; n < isp->nchans; n++, d += ISP_CHAN_DESC_SIZE) {
++		struct isp_chan *c = &isp->chans[n];
++		const u32 *w = (const u32 *)(d + 0x40);
++
++		memcpy(c->name, d, 0x40);
++		c->name[0x40] = 0;
++		c->type = w[0];
++		c->src = w[1];
++		c->num = w[2];
++		c->rel = w[3];
++		c->idx = 0;
++		dev_info(isp->dev, "chan %u '%s': type %u src %u num %u ring fw-rel 0x%08x\n",
++			 n, c->name, c->type, c->src, c->num, c->rel);
++		if (!c->num || c->num > 1024 || c->src > 31 ||
++		    !(c->ring = isp_translate(isp, c->rel, c->num * ISP_MSG_SIZE))) {
++			dev_err(isp->dev, "chan %u: bad ring (num %u src %u rel 0x%x)\n",
++				n, c->num, c->src, c->rel);
++			return -EIO;
++		}
++		if (c->type != CHAN_CMD)
++			continue;
++		for (j = 0; j < c->num; j++) {
++			u32 *m = (u32 *)(c->ring + j * ISP_MSG_SIZE);
++
++			m[1] = 0;
++			m[2] = 0;
++			m[0] = 1;	/* slot owned by the host */
++		}
++	}
++	dma_wmb();
++	isp_wr(isp, ISP_GPIO(3), ISP_MAGIC_WAKE);
++	return isp_wait(isp, ISP_GPIO(3), ~0U, 0, isp_boot_timeout_ms,
++			"gpio3 0x8042006 -> 0 (magic 1)");
++}
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-dart.c b/drivers/media/platform/apple/isp-t7000/isp-dart.c
+new file mode 100644
+index 000000000..77469309e
+--- /dev/null
++++ b/drivers/media/platform/apple/isp-t7000/isp-dart.c
+@@ -0,0 +1,274 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Apple A8 (T7000) ISP: minimal in-module driver for dart-isp (s5l8960x format) and
++ * the DART-mapped surfaces (firmware, IPC pool, heap, SHAREDMALLOC buffers).
++ *
++ * One TTBR (IOVA < 1 GB), 3 levels with 4K pages: L1 index = iova[29:21], L2 index =
++ * iova[20:12]. Tables are dma_alloc_coherent (non-cacheable here); surface pages are
++ * single pages, cache-cleaned with dma_map_page and accessed through a write-combine
++ * vmap, so DART walk coherency does not matter. Only the DART block is programmed;
++ * the SMMU block at +0x24000 is read-only unless smmu_en=1.
++ */
++#include <linux/dma-mapping.h>
++#include <linux/iopoll.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++#include <linux/vmalloc.h>
++
++#include "isp.h"
++
++#define dart_rd(isp, o)		isp_rd(isp, ISP_DART + (o))
++#define dart_wr(isp, o, v)	isp_wr(isp, ISP_DART + (o), v)
++
++void isp_dart_log(struct t7000_isp *isp, const char *when)
++{
++	u32 s[16];
++	int i;
++
++	dev_info(isp->dev, "dart %s: cmd %08x tcr %08x err %08x erraddr %08x ttbr0 %08x %08x %08x %08x\n",
++		 when, dart_rd(isp, DART_STREAM_CMD), dart_rd(isp, DART_TCR),
++		 dart_rd(isp, DART_ERROR), dart_rd(isp, DART_ERROR_ADDR),
++		 dart_rd(isp, DART_TTBR(0, 0)), dart_rd(isp, DART_TTBR(1, 0)),
++		 dart_rd(isp, DART_TTBR(2, 0)), dart_rd(isp, DART_TTBR(3, 0)));
++	for (i = 0; i < 16; i++)
++		s[i] = isp_rd(isp, ISP_SMMU + 4 * i);
++	dev_info(isp->dev, "smmu %s: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
++		 when, s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9],
++		 s[10], s[11], s[12], s[13], s[14], s[15]);
++}
++
++bool isp_dart_fault(struct t7000_isp *isp)
++{
++	u32 err = dart_rd(isp, DART_ERROR);
++
++	if (!(err & DART_ERROR_FLAG))
++		return false;
++	if (isp->dart_err_logged++ < 5)
++		dev_err(isp->dev, "DART fault: error 0x%08x (stream %lu code 0x%02x) addr 0x%08x\n",
++			err, (unsigned long)((err >> 24) & 3), err & 0xff,
++			dart_rd(isp, DART_ERROR_ADDR));
++	return true;
++}
++
++static void isp_dart_flush(struct t7000_isp *isp)
++{
++	u32 v;
++
++	if (!isp->dart_on)
++		return;
++	dma_wmb();
++	dart_wr(isp, DART_STREAM_CMD, (isp_dart_sids << 8) | DART_STREAM_CMD_INVAL);
++	if (readl_poll_timeout_atomic(isp->regs + ISP_DART + DART_STREAM_CMD, v,
++				      !(v & DART_STREAM_CMD_BUSY), 1, 10000))
++		dev_err(isp->dev, "DART TLB invalidate: timeout (10 ms) waiting for BUSY to clear, cmd 0x%08x\n", v);
++}
++
++static u32 tcr_mask(void)
++{
++	u32 m = 0;
++	int sid;
++
++	for (sid = 0; sid < 4; sid++)
++		if (isp_dart_sids & BIT(sid))
++			m |= 0xffU << (8 * sid);
++	return m;
++}
++
++int isp_dart_init(struct t7000_isp *isp)
++{
++	u32 m = tcr_mask(), tcr, err;
++	int sid, i;
++
++	isp->l1 = dma_alloc_coherent(isp->dev, PAGE_SIZE, &isp->l1_dma, GFP_KERNEL);
++	if (!isp->l1)
++		return -ENOMEM;
++	if (isp->l1_dma >= BIT_ULL(36)) {
++		dev_err(isp->dev, "L1 table at %pad is above the 36-bit DART range\n", &isp->l1_dma);
++		return -EIO;
++	}
++	isp_dart_log(isp, "before init");
++
++	tcr = dart_rd(isp, DART_TCR);
++	dart_wr(isp, DART_TCR, tcr & ~m);
++	err = dart_rd(isp, DART_ERROR);
++	dart_wr(isp, DART_ERROR, err);
++	for (sid = 0; sid < 4; sid++) {
++		if (!(isp_dart_sids & BIT(sid)))
++			continue;
++		dart_wr(isp, DART_TTBR(sid, 0), DART_TTBR_VALID | (u32)(isp->l1_dma >> 12));
++		for (i = 1; i < 4; i++)
++			dart_wr(isp, DART_TTBR(sid, i), 0);
++	}
++	dart_wr(isp, DART_TCR, (tcr & ~m) | (0x80808080U & m));
++	isp->dart_on = true;
++	isp_dart_flush(isp);
++	if (isp_smmu_en) {
++		u32 v = isp_rd(isp, ISP_SMMU + 0xc);
++
++		isp_wr(isp, ISP_SMMU + 0xc, v | (0x80808080U & m));
++		dev_info(isp->dev, "smmu_en: SMMU+0xc 0x%08x -> 0x%08x\n", v,
++			 isp_rd(isp, ISP_SMMU + 0xc));
++	}
++	isp->iova_next = isp_fw_iova;
++	dev_info(isp->dev, "dart: L1 at %pad, sids 0x%x, old tcr 0x%08x, old err 0x%08x\n",
++		 &isp->l1_dma, isp_dart_sids, tcr, err);
++	isp_dart_log(isp, "after init");
++	return 0;
++}
++
++/* Hardware off (called while still powered). Tables are freed in isp_surf_free_all. */
++void isp_dart_fini(struct t7000_isp *isp)
++{
++	int sid, i;
++
++	isp_dart_fault(isp);
++	dart_wr(isp, DART_TCR, dart_rd(isp, DART_TCR) & ~tcr_mask());
++	for (sid = 0; sid < 4; sid++)
++		if (isp_dart_sids & BIT(sid))
++			for (i = 0; i < 4; i++)
++				dart_wr(isp, DART_TTBR(sid, i), 0);
++	isp->dart_on = false;
++	dev_info(isp->dev, "dart: translation disabled\n");
++}
++
++static int dart_map_page(struct t7000_isp *isp, u32 iova, dma_addr_t pa)
++{
++	unsigned int i1 = (iova >> 21) & 511, i2 = (iova >> 12) & 511;
++
++	if (!isp->l2[i1]) {
++		isp->l2[i1] = dma_alloc_coherent(isp->dev, PAGE_SIZE, &isp->l2_dma[i1], GFP_KERNEL);
++		if (!isp->l2[i1])
++			return -ENOMEM;
++		if (isp->l2_dma[i1] >= BIT_ULL(36))
++			return -EIO;
++		dma_wmb();
++		isp->l1[i1] = (isp->l2_dma[i1] & DART_PTE_PA) | DART_PTE_VALID;
++	}
++	isp->l2[i1][i2] = (pa & DART_PTE_PA) | DART_PTE_VALID;
++	return 0;
++}
++
++static void dart_unmap_page(struct t7000_isp *isp, u32 iova)
++{
++	unsigned int i1 = (iova >> 21) & 511, i2 = (iova >> 12) & 511;
++
++	if (isp->l2[i1])
++		isp->l2[i1][i2] = 0;
++}
++
++void isp_surf_free(struct t7000_isp *isp, struct isp_surf *s)
++{
++	unsigned int i;
++
++	if (s->virt)
++		vunmap(s->virt);
++	for (i = 0; s->pages && s->dma && i < s->npages; i++) {
++		if (!s->pages[i])
++			continue;
++		dart_unmap_page(isp, s->iova + i * PAGE_SIZE);
++		if (!dma_mapping_error(isp->dev, s->dma[i]))
++			dma_unmap_page(isp->dev, s->dma[i], PAGE_SIZE, DMA_BIDIRECTIONAL);
++		__free_page(s->pages[i]);
++	}
++	isp_dart_flush(isp);
++	isp->shared_bytes -= s->size;
++	list_del(&s->list);
++	kfree(s->pages);
++	kfree(s->dma);
++	kfree(s);
++}
++
++struct isp_surf *isp_surf_alloc(struct t7000_isp *isp, u32 size, u32 tag)
++{
++	struct isp_surf *s;
++	unsigned int i;
++
++	size = PAGE_ALIGN(size);
++	if (!size || (u64)isp->iova_next + size > (u64)isp_fw_iova + ISP_IOVA_SPAN ||
++	    isp->shared_bytes + size > (u64)isp_max_shared_mb << 20) {
++		dev_err(isp->dev, "surface '%4.4s' 0x%x: out of IOVA space or over max_shared_mb\n",
++			(char *)&tag, size);
++		return NULL;
++	}
++	s = kzalloc(sizeof(*s), GFP_KERNEL);
++	if (!s)
++		return NULL;
++	s->npages = size >> PAGE_SHIFT;
++	s->pages = kcalloc(s->npages, sizeof(*s->pages), GFP_KERNEL);
++	s->dma = kcalloc(s->npages, sizeof(*s->dma), GFP_KERNEL);
++	s->iova = isp->iova_next;
++	s->size = size;
++	s->tag = tag;
++	INIT_LIST_HEAD(&s->list);
++	list_add_tail(&s->list, &isp->surfs);
++	isp->shared_bytes += size;
++	if (!s->pages || !s->dma)
++		goto fail;
++	for (i = 0; i < s->npages; i++)
++		s->dma[i] = DMA_MAPPING_ERROR;
++	for (i = 0; i < s->npages; i++) {
++		s->pages[i] = alloc_page(GFP_KERNEL | __GFP_ZERO);
++		if (!s->pages[i])
++			goto fail;
++		s->dma[i] = dma_map_page(isp->dev, s->pages[i], 0, PAGE_SIZE, DMA_BIDIRECTIONAL);
++		if (dma_mapping_error(isp->dev, s->dma[i]) ||
++		    s->dma[i] != page_to_phys(s->pages[i]) || s->dma[i] >= BIT_ULL(36)) {
++			dev_err(isp->dev, "page dma %pad != phys (bounce?) or >= 2^36\n", &s->dma[i]);
++			goto fail;
++		}
++		if (dart_map_page(isp, s->iova + i * PAGE_SIZE, s->dma[i]))
++			goto fail;
++	}
++	s->virt = vmap(s->pages, s->npages, VM_MAP, pgprot_writecombine(PAGE_KERNEL));
++	if (!s->virt)
++		goto fail;
++	isp_dart_flush(isp);
++	/* one unmapped guard page between surfaces: overruns become DART faults */
++	isp->iova_next += size + PAGE_SIZE;
++	dev_info(isp->dev, "surface '%4.4s': iova 0x%08x (fw-rel 0x%08x) size 0x%x\n",
++		 (char *)&tag, s->iova, isp_rel(s->iova), size);
++	return s;
++fail:
++	dev_err(isp->dev, "surface '%4.4s' 0x%x: allocation/mapping failed\n", (char *)&tag, size);
++	isp_surf_free(isp, s);
++	return NULL;
++}
++
++void isp_surf_free_all(struct t7000_isp *isp)
++{
++	struct isp_surf *s, *n;
++	int i;
++
++	list_for_each_entry_safe(s, n, &isp->surfs, list)
++		isp_surf_free(isp, s);
++	isp->fw = isp->ipc = isp->heap = NULL;
++	for (i = 0; i < 512; i++) {
++		if (isp->l2[i])
++			dma_free_coherent(isp->dev, PAGE_SIZE, isp->l2[i], isp->l2_dma[i]);
++		isp->l2[i] = NULL;
++	}
++	if (isp->l1)
++		dma_free_coherent(isp->dev, PAGE_SIZE, isp->l1, isp->l1_dma);
++	isp->l1 = NULL;
++}
++
++struct isp_surf *isp_surf_find(struct t7000_isp *isp, u32 iova)
++{
++	struct isp_surf *s;
++
++	list_for_each_entry(s, &isp->surfs, list)
++		if (iova >= s->iova && iova - s->iova < s->size)
++			return s;
++	return NULL;
++}
++
++/* fw-relative address -> CPU pointer, or NULL if [rel, rel+len) is not inside one surface */
++void *isp_translate(struct t7000_isp *isp, u32 rel, u32 len)
++{
++	u32 iova = isp_fw_iova + rel;
++	struct isp_surf *s = isp_surf_find(isp, iova);
++
++	if (!s || !s->virt || len > s->size - (iova - s->iova))
++		return NULL;
++	return (u8 *)s->virt + (iova - s->iova);
++}

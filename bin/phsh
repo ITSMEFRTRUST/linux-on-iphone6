@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+# run a command on the iPhone over USB serial: phsh "cmd" [timeout]
+import sys, os, time, termios, select
+cmd = sys.argv[1]; to = float(sys.argv[2]) if len(sys.argv) > 2 else 4
+fd = os.open("/dev/ttyACM0", os.O_RDWR | os.O_NOCTTY)
+a = termios.tcgetattr(fd); a[3] &= ~(termios.ECHO | termios.ICANON); termios.tcsetattr(fd, termios.TCSANOW, a)
+mark = "__END%d__" % os.getpid()
+os.write(fd, f"\n{cmd} 2>&1; echo {mark}\n".encode())
+buf = b""; end = time.time() + to
+while time.time() < end:
+    r, _, _ = select.select([fd], [], [], 0.3)
+    if r: buf += os.read(fd, 65536)
+    if (mark + "\r\n").encode() in buf or (mark + "\n").encode() in buf: break
+out = buf.decode(errors="replace")
+i = out.find(cmd + " 2>&1"); out = out[out.find("\n", i)+1:] if i >= 0 else out
+print(out.split(mark)[0].rstrip() if out.count(mark) > 1 else out.replace(mark, "").rstrip())

@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 19:44:49 +0000
+Subject: [PATCH 055/138] nfc: nxp-nci: Fix a deadlock when removing an open
+ device
+
+nxp_nci_remove() holds info_lock across nci_unregister_device(). When
+the device is up, unregistering closes it, and nxp_nci_close() takes
+info_lock again: the remove hangs forever (the controller is already
+powered down by then, so the RESET sent by the close times out first).
+
+Unregister before taking the lock.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/nfc/nxp-nci/core.c | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/nfc/nxp-nci/core.c b/drivers/nfc/nxp-nci/core.c
+index 15e53bae6..18d3bd96e 100644
+--- a/drivers/nfc/nxp-nci/core.c
++++ b/drivers/nfc/nxp-nci/core.c
+@@ -217,15 +217,19 @@ void nxp_nci_remove(struct nci_dev *ndev)
+ 		nxp_nci_fw_work_complete(info, -ESHUTDOWN);
+ 	cancel_work_sync(&info->fw_info.work);
+ 
+-	mutex_lock(&info->info_lock);
++	/*
++	 * Unregister first: if the device is still up this closes it, and
++	 * nxp_nci_close() takes info_lock itself.
++	 */
++	nci_unregister_device(ndev);
+ 
++	mutex_lock(&info->info_lock);
+ 	if (info->phy_ops->set_mode)
+ 		info->phy_ops->set_mode(info->phy_id, NXP_NCI_MODE_COLD);
++	info->mode = NXP_NCI_MODE_COLD;
++	mutex_unlock(&info->info_lock);
+ 
+-	nci_unregister_device(ndev);
+ 	nci_free_device(ndev);
+-
+-	mutex_unlock(&info->info_lock);
+ }
+ EXPORT_SYMBOL(nxp_nci_remove);
+ 

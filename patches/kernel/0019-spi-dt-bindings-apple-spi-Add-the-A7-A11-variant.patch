@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 23:58:22 +0000
+Subject: [PATCH 019/138] spi: dt-bindings: apple,spi: Add the A7-A11 variant
+
+Apple's A7-A11 SoCs have an older version of the SPI block (ADT
+"spi-1,samsung"). It shares the low registers with the M1 one but has
+no FIFOSTAT/IE/IF registers, so it is not compatible with apple,spi.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ Documentation/devicetree/bindings/spi/apple,spi.yaml | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/Documentation/devicetree/bindings/spi/apple,spi.yaml b/Documentation/devicetree/bindings/spi/apple,spi.yaml
+index 9356b9c33..860bac15c 100644
+--- a/Documentation/devicetree/bindings/spi/apple,spi.yaml
++++ b/Documentation/devicetree/bindings/spi/apple,spi.yaml
+@@ -15,6 +15,8 @@ maintainers:
+ properties:
+   compatible:
+     oneOf:
++      - description: Older (A7-A11) variant of the block
++        const: apple,t7000-spi
+       - items:
+           - const: apple,t6020-spi
+           - const: apple,t8103-spi

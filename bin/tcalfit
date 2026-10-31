@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+"""Fit raw touch -> screen pixels from tools/tcal output (lines "T i sx sy rx ry n spreadx spready").
+Usage: bin/tcalfit [--drop 'sx,sy;…'] tcal.log… -> compares an affine and a quadratic model by leave-one-out
+error and prints the TOUCHCAL_X/Y defines for hal_phone.c (u, v = raw / absinfo max; terms 1 u v u² v² uv)."""
+import sys
+
+XMAX, YMAX = 5849, 10404
+args = sys.argv[1:]
+drop = set()
+if args and args[0] == "--drop":
+    drop = {tuple(map(int, d.split(","))) for d in args[1].split(";")}
+    args = args[2:]
+pts = []
+for fn in args:
+    for line in open(fn):
+        f = line.split()
+        if f and f[0] == "T":
+            sx, sy, rx, ry = map(int, f[2:6])
+            pts.append((sx, sy, rx, ry))
+
+def terms(rx, ry, quad):
+    u, v = rx / XMAX, ry / YMAX
+    return [1, u, v, u * u, v * v, u * v] if quad else [1, u, v]
+
+def lstsq(rows, rhs):
+    n = len(rows[0])
+    A = [[sum(r[i] * r[j] for r in rows) + (1e-9 if i == j else 0) for j in range(n)] for i in range(n)]
+    b = [sum(r[i] * y for r, y in zip(rows, rhs)) for i in range(n)]
+    for i in range(n):
+        p = max(range(i, n), key=lambda k: abs(A[k][i]))
+        A[i], A[p], b[i], b[p] = A[p], A[i], b[p], b[i]
+        for k in range(i + 1, n):
+            m = A[k][i] / A[i][i]
+            A[k] = [x - m * y for x, y in zip(A[k], A[i])]
+            b[k] -= m * b[i]
+    x = [0.0] * n
+    for i in reversed(range(n)):
+        x[i] = (b[i] - sum(A[i][j] * x[j] for j in range(i + 1, n))) / A[i][i]
+    return x
+
+def fit(ps, quad):
+    rows = [terms(p[2], p[3], quad) for p in ps]
+    return lstsq(rows, [p[0] for p in ps]), lstsq(rows, [p[1] for p in ps])
+
+def err(c, p, quad):
+    t = terms(p[2], p[3], quad)
+    fx = sum(a * b for a, b in zip(c[0], t))
+    fy = sum(a * b for a, b in zip(c[1], t))
+    return ((fx - p[0]) ** 2 + (fy - p[1]) ** 2) ** .5, fx - p[0], fy - p[1]
+
+def loo(ps, quad):
+    return [err(fit(ps[:i] + ps[i + 1:], quad), ps[i], quad)[0] for i in range(len(ps))]
+
+# reject wild taps: a point whose leave-one-out affine error is > 3x the median of the others
+ps = [p for p in pts if (p[0], p[1]) not in drop]
+while True:
+    e = loo(ps, False)
+    med = sorted(e)[len(e) // 2]
+    worst = max(range(len(ps)), key=lambda i: e[i])
+    if e[worst] > max(3 * med, 40):
+        print(f"rejected wild tap at target {ps[worst][0]},{ps[worst][1]} (loo err {e[worst]:.0f} px)")
+        ps.pop(worst)
+    else:
+        break
+
+print(f"{len(ps)} taps used of {len(pts)}")
+for quad in (False, True):
+    e = loo(ps, quad)
+    print(f"{'quadratic' if quad else 'affine   '}: leave-one-out mean {sum(e)/len(e):5.1f} px, max {max(e):5.1f} px")
+quad = sum(loo(ps, True)) < 0.85 * sum(loo(ps, False))
+c = fit(ps, quad)
+full = [list(a) + [0.0] * (6 - len(a)) for a in c]
+print(f"chosen: {'quadratic' if quad else 'affine'}")
+print("#define TOUCHCAL_X { " + ", ".join(f"{v:.4f}" for v in full[0]) + " }")
+print("#define TOUCHCAL_Y { " + ", ".join(f"{v:.4f}" for v in full[1]) + " }")
+print("TOUCHCAL " + " ".join(f"{v:.4f}" for v in full[0] + full[1]))
+by = {}
+for p in ps:
+    e, dx, dy = err(c, p, quad)
+    by.setdefault((p[0], p[1]), []).append((dx, dy))
+print("per target, fit residual (dx,dy) px of each tap; old stretch mapping offset:")
+for (sx, sy), r in sorted(by.items(), key=lambda k: (k[0][1], k[0][0])):
+    print(f"  {sx:4d},{sy:4d}: " + "  ".join(f"{dx:+5.1f},{dy:+5.1f}" for dx, dy in r))

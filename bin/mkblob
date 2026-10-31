@@ -1,0 +1,112 @@
+#!/bin/bash
+# Rebuild m1n1-linux.bin from the current kernel build:
+# m1n1.bin + bootargs + all apple dtbs + Image.gz + HoolockRD initramfs.
+# M1N1=path overrides the m1n1 build (default dl/m1n1/m1n1.bin). Extra files are appended to the
+# initramfs as a second cpio archive in the same gzip stream (m1n1 only keeps one initramfs payload):
+#   var/extra-rd/   local blobs (e.g. lib/firmware/apple/dfrmtfw-n61.bin, etc/flashdata.conf)
+#   tools/disk.tgz  e2fsprogs + dmsetup, with tools/flashdata (writable data area on the iOS flash)
+#   rd/             tracked overlay: patched /init + /etc/hl-rd.d hooks (Orchard autostart)
+#   Orchard         ui/build/phone/orchard.stripped -> /usr/bin/orchard, ui/build/theme -> /etc/orchard
+# NO_ORCHARD=1 leaves out rd/ and Orchard (plain HoolockRD shell).
+# BOOTARGS_EXTRA="a=b c=d" appends kernel cmdline params.
+# Side-by-side test blobs (defaults = the paths above): STAGE=<dir> stages the rd there instead of var/rd-stage,
+# RDOUT=<file> writes the combined initramfs there instead of var/initramfs-combined.gz, OUT=<file> writes the blob
+# there instead of m1n1-linux.bin, RD_OVERLAY=<dir> is copied over the staged rd last (wins over var/extra-rd and rd/).
+# KB=<kernel build dir> selects the kernel (default hoolock-linux; with `make O=dir` pass KB=dir). When it has the PCIe/DART/
+# brcmfmac modules (config-n61 does) the Wi-Fi pieces are baked in as well (firmware from re/wififw/: your own, see README):
+#   /lib/modules/pcie/*.ko (stripped) + the request_module() shim, brcm firmware, tools/wifi-user.tgz (iw, wpa_supplicant),
+#   /usr/sbin/wifiup + wifi-action + /usr/share/udhcpc/wlan0.script; rd/etc/hl-rd.d/45-wifi.sh starts it at boot.
+# Network extras (always): /usr/sbin/tsup (Tailscale control; the binaries live on /data/tailscale) + tools/net-user.tgz
+# (bin/mknet: ssl_client for busybox wget https + the CA bundle /etc/ssl/certs/ca-certificates.crt); rd/etc/hl-rd.d/
+# 46-tailscale.sh + 47-ntp.sh start Tailscale and ntpd at boot.
+# asp.ko, snd-soc-cs42l67.ko (KB with the n61-codec branch; hook 42-codec.sh) and Image.gz always come from the same
+# build (vermagic).
+set -e
+cd "$(dirname "$0")/.."
+KB=${KB:-hoolock-linux}
+K=$KB/arch/arm64/boot
+RD=dl/initramfs.gz
+X=${STAGE:-var/rd-stage}
+rm -rf $X && mkdir -p $X
+[ -d var/extra-rd ] && cp -a var/extra-rd/. $X/
+# out-of-tree-loaded kernel modules (insmod by hand / boot hooks): flash driver asp.ko, headset codec (42-codec.sh)
+for m in drivers/block/asp.ko sound/soc/codecs/snd-soc-cs42l67.ko; do
+	[ -f $KB/$m ] && install -D -m644 $KB/$m $X/lib/modules/$(basename $m)
+done
+# display-pipe driver (built in-tree with the kernel; hook 48-display.sh; ADP_KO=<path> picks another build) — only
+# when its vermagic matches this kernel's (both read and non-empty: fail closed), else simpledrm stays
+ADP_KO=${ADP_KO:-$KB/drivers/gpu/drm/adp/adp-t7000.ko}
+if [ -f "$ADP_KO" ]; then
+	VM_ADP=$(modinfo -F vermagic "$ADP_KO" 2>/dev/null)
+	VM_K=$([ -f $KB/drivers/block/asp.ko ] && modinfo -F vermagic $KB/drivers/block/asp.ko 2>/dev/null)
+	if [ -n "$VM_ADP" ] && [ -n "$VM_K" ] && [ "$VM_ADP" = "$VM_K" ]; then
+		install -D -m644 "$ADP_KO" $X/lib/modules/adp-t7000.ko
+		echo "display driver adp-t7000 baked in ($ADP_KO)"
+	else
+		echo "!!! display driver adp-t7000 NOT baked in: vermagic '${VM_ADP:-?}' vs kernel '${VM_K:-?}'" \
+		     "(empty = modinfo missing / unreadable module) — simpledrm only" >&2
+	fi
+fi
+# camera driver apple-isp (built in-tree with the kernel; hook 43-isp.sh; ISP_KO=<path> picks another build) — same
+# vermagic guard as the display driver. Firmware + Apple setfiles come from var/extra-rd/lib/firmware/apple/ (your own, local only)
+ISP_KO=${ISP_KO:-$KB/drivers/media/platform/apple/isp-t7000/apple-isp.ko}
+if [ -f "$ISP_KO" ]; then
+	VM_ISP=$(modinfo -F vermagic "$ISP_KO" 2>/dev/null)
+	VM_K=$([ -f $KB/drivers/block/asp.ko ] && modinfo -F vermagic $KB/drivers/block/asp.ko 2>/dev/null)
+	if [ -n "$VM_ISP" ] && [ -n "$VM_K" ] && [ "$VM_ISP" = "$VM_K" ]; then
+		install -D -m644 "$ISP_KO" $X/lib/modules/apple-isp.ko
+		echo "camera driver apple-isp baked in ($ISP_KO)"
+		[ -f $X/lib/firmware/apple/isp-t7000.bin ] || echo "!!! no lib/firmware/apple/isp-t7000.bin in var/extra-rd: the camera won't boot" >&2
+	else
+		echo "!!! camera driver apple-isp NOT baked in: vermagic '${VM_ISP:-?}' vs kernel '${VM_K:-?}'" >&2
+	fi
+fi
+# Wi-Fi: PCIe host + DART + brcmfmac modules (loaded by wifiup in this order), firmware, userspace, scripts
+if [ -f $KB/drivers/pci/controller/pcie-apple.ko ]; then
+	mkdir -p $X/lib/modules/pcie $X/lib/firmware/brcm
+	for m in drivers/pci/controller/pci-host-common.ko drivers/pci/controller/pcie-apple.ko drivers/iommu/apple-dart.ko \
+		drivers/net/wireless/broadcom/brcm80211/brcmutil/brcmutil.ko \
+		drivers/net/wireless/broadcom/brcm80211/brcmfmac/brcmfmac.ko \
+		drivers/net/wireless/broadcom/brcm80211/brcmfmac/wcc/brcmfmac-wcc.ko; do
+		llvm-strip --strip-debug -o $X/lib/modules/pcie/$(basename $m) $KB/$m
+	done
+	F=$X/lib/firmware/brcm/brcmfmac4345b1-pcie.apple,tempranillo
+	cp re/wififw/tempranillo.trx $F.bin; cp re/wififw/tempranillo.clmb $F.clm_blob
+	cp re/wififw/tempranillo.txcb $F.txcap_blob; cp re/wififw/n61-unit-MUR.txt $F.txt
+	# request_module() helper: brcmfmac loads brcmfmac-wcc after the fw download via /proc/sys/kernel/modprobe
+	printf '#!/bin/sh\nfor a; do m=$a; done\n[ -f /lib/modules/pcie/$m.ko ] && exec insmod /lib/modules/pcie/$m.ko\nexit 1\n' > $X/lib/modules/pcie/modprobe
+	chmod +x $X/lib/modules/pcie/modprobe
+	tar -xzf tools/wifi-user.tgz -C $X --no-same-owner
+	install -D -m755 tools/wifiup $X/usr/sbin/wifiup
+	install -D -m755 tools/wifi-action $X/usr/sbin/wifi-action
+	install -D -m755 tools/udhcpc-wlan0.script $X/usr/share/udhcpc/wlan0.script
+	echo "Wi-Fi baked in from $KB"
+fi
+# network extras: Tailscale control script, TLS client + CA bundle (bin/mknet)
+install -D -m755 tools/tsup $X/usr/sbin/tsup
+if [ -f tools/net-user.tgz ]; then tar -xzf tools/net-user.tgz -C $X --no-same-owner; else echo "no tools/net-user.tgz (bin/mknet): no https/CA bundle"; fi
+if [ -f tools/net.tgz ]; then tar -xzf tools/net.tgz -C $X --no-same-owner; else echo "no tools/net.tgz (bin/mkcurl): Web/Weather have no curl"; fi
+# amixer from tools/alsa.tgz (the base rd has aplay + libasound but no amixer; Voice Memos switches mics with it)
+[ -f tools/alsa.tgz ] && tar -xzf tools/alsa.tgz -C $X --no-same-owner usr/bin/amixer
+# writable data area tools (bin/mkdisk: e2fsprogs + dmsetup) + tools/flashdata; config comes from var/extra-rd/etc
+[ -f tools/disk.tgz ] && tar -xzf tools/disk.tgz -C $X && install -D -m755 tools/flashdata $X/usr/sbin/flashdata
+if [ -z "$NO_ORCHARD" ]; then
+	cp -a rd/. $X/
+	mkdir -p $X/usr/bin $X/etc/orchard
+	cp ui/build/phone/orchard.stripped $X/usr/bin/orchard
+	[ -d ui/build/theme ] && cp ui/build/theme/* $X/etc/orchard/
+fi
+[ -n "$RD_OVERLAY" ] && cp -a "$RD_OVERLAY"/. $X/
+if [ -n "$(ls -A $X)" ]; then
+	RD=${RDOUT:-var/initramfs-combined.gz}
+	{ gzip -dc dl/initramfs.gz; (cd $X && find . -mindepth 1 | sort | cpio -o -H newc -R 0:0 --quiet); } | gzip -9 > $RD
+fi
+{
+	cat ${M1N1:-dl/m1n1/m1n1.bin}
+	printf 'chosen.bootargs=console=tty0 earlycon%s\n' "${BOOTARGS_EXTRA:+ $BOOTARGS_EXTRA}"
+	cat $K/dts/apple/*.dtb
+	cat $K/Image.gz
+	cat $RD
+} > ${OUT:-m1n1-linux.bin}.new
+mv ${OUT:-m1n1-linux.bin}.new ${OUT:-m1n1-linux.bin}
+ls -l ${OUT:-m1n1-linux.bin}; modinfo -F vermagic $X/lib/modules/asp.ko || true

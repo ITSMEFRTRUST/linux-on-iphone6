@@ -1,0 +1,18 @@
+#!/bin/sh
+# mcamaster - MCA2 speaker TX in clock-MASTER mode (values: re/MCA-V1.md "Decoded clock config"). Needs /tmp/mem, /tmp/nco.cmd
+M=/tmp/mem; A=0x20a0a8; S=0x20a0a9
+MCLKSEL=${MCLKSEL:-0x58}
+$M w 0x20e020140 0x20f
+$M $(cat /tmp/nco.cmd) >/dev/null
+$M w 0x20a002008 $MCLKSEL
+$M w ${A}044 3 w ${A}048 1 s 2 r ${A}048
+$M w ${A}010 0 w ${A}01c d w ${A}030 d w ${A}008 1010 w ${A}020 00170018 w ${A}034 00030004 \
+   w ${A}014 0 w ${A}024 1 w ${A}038 f w ${A}018 208 w ${A}02c 10a w ${A}010 1 w ${A}040 b0003000 w ${A}00c 0f107005 >/dev/null
+# shim
+$M w ${S}014 0 w ${S}010 0 w ${S}000 21 w ${S}004 0 w ${S}008 00330000 w ${S}00c ac w ${S}010 1 >/dev/null
+# i2s-switch: AUD2 -> PIN2 master
+[ -n "${NOSW:-}" ] || $M w 0x20a00301c ${AUD2:-00181818} w 0x20a003008 ${PIN2:-00180202} w 0x20a003044 ${PINCTL:-11} >/dev/null
+echo "before start: st $($M r ${A}040) shim $($M r ${S}018)"
+$M w ${A}018 209 w ${A}00c 0f107007 s 5 >/dev/null
+echo "after start:  st $($M r ${A}040) shim $($M r ${S}018)"
+$M w ${A}040 b0003000 s 10 r ${A}040 r ${S}018

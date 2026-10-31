@@ -1,0 +1,5 @@
+#!/bin/sh
+# nfcraw - send raw frames through nxp-nci_uart's debug hook (insmod ... debug=1), 300 ms apart, then show the frame log
+R=/sys/module/nxp_nci_uart/parameters/raw
+for f in "$@"; do echo "$f" > $R; usleep 300000; done
+dmesg | grep -E 'nfc (raw )?(tx|rx)' | tail -$((2 * $# + 4))

@@ -1,0 +1,15 @@
+#!/bin/bash
+# audioboot - boot Linux on the phone (DFU -> checkm8 -> pongo -> m1n1+Linux), install ALSA/mpg123,
+# set iOS-like levels (volume keys are handled by Orchard). Nothing plays by itself.
+# usage: bin/audioboot [blob]   (default: path in var/autoboot-blob, else m1n1-linux.bin from bin/mkblob). Play: bin/ph "mpg123 /tmp/x.mp3"
+# Runs automatically when the phone enters DFU (udev -> iphone6-linux-boot.service); touch var/no-autoboot to stop that.
+cd "$(dirname "$(readlink -f "$0")")/.."
+BLOB=$PWD/${1:-$(cat var/autoboot-blob 2>/dev/null || echo m1n1-linux.bin)} bin/boot || exit 1
+bin/push i2c mem gpio alsa.tgz >/dev/null
+bin/ph "cd / && tar -xzf /tmp/alsa.tgz && rm /tmp/alsa.tgz; amixer -q sset 'Speaker SPK Amp' 7; dmesg | grep -iE 'mca|cs35l|sn2400|asoc|simple-card' | tail -8; cat /proc/asound/cards" 20
+# Bluetooth userspace (tools/bt.tgz from bin/mkbt: BlueZ + dbus + BlueALSA): untar, start the daemons. Skipped when not built.
+# bin/push returns after 8 s even if the wget is still running, so wait for wget before untarring.
+if [ -f tools/bt.tgz ]; then
+	bin/push bt.tgz btup btcal >/dev/null
+	bin/ph "while pidof wget >/dev/null; do usleep 300000; done; cd / && tar -xzf /tmp/bt.tgz && rm /tmp/bt.tgz && /tmp/btup && /tmp/btcal | tail -2" 60
+fi

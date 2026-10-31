@@ -1,0 +1,7 @@
+#!/bin/sh
+# swscan - try i2s-switch PIN2 (0x08) / AUD2 (0x1c) values, report amp ADSPCLK_ERR (0x15 bit4) for each
+M=/tmp/mem; I="/tmp/i2c 1 40"
+try() { $M w 0x20a003008 $1 w 0x20a00301c $2 >/dev/null; sleep 1; $I r 15 >/dev/null; v=$($I r 15 | sed 's/.*=//'); echo "pin2=$1 aud2=$2 -> amp 0x15=$v"; }
+for a in 00180a0a 00180a18 000a0a0a 0a0a0a0a; do
+  for p in 00181802 00180202 00020202 00181818 0018180a 000a0a0a; do try $p $a; done
+done

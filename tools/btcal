@@ -1,0 +1,44 @@
+#!/bin/sh
+# btcal - send the N61 (iPhone 6) Broadcom calibration vendor commands to hci0, like BlueTool's `bcm -Q`
+# (re/BLUETOOTH.md sec. 3/5): 0xFD18 = 20-byte BTTx blob, 0xFD1E = 206-byte BTRx blob. hci_bcm does NOT do this.
+# Run once after the controller is up (firmware loaded, hci0 registered; btup's bluetoothd powers it, or this
+# script runs `hciconfig hci0 up`). Idempotent; the controller forgets the values on power-off, so redo after a
+# BT_REG_ON cycle. Exit 0 only if both Command Complete events carry status 00.
+# Data = YOUR phone's own calibration, never shipped: the BTTx / BTRx blobs from its syscfg, saved as
+# $BTCAL_DIR/n61-bt-tx-cal.bin (20 B) and n61-bt-rx-cal.bin (206 B), and its Bluetooth address (ADT "BMac",
+# e.g. 12:34:56:78:9A:BC) as one line in $BTCAL_DIR/address. BTCAL_DIR defaults to /data/bt.
+# usage: btcal [hciN]   (default hci0)
+PATH=/tmp:/usr/bin:/bin:/usr/sbin:/sbin; export PATH
+D=${1:-hci0}
+C=${BTCAL_DIR:-/data/bt}
+hex() { od -An -tx1 -v "$1" | tr -s ' 
+' ' ' | sed 's/^ //; s/ $//'; }
+[ -s "$C/n61-bt-tx-cal.bin" ] && [ -s "$C/n61-bt-rx-cal.bin" ] || { echo "btcal: no calibration in $C (see the header)"; exit 1; }
+TX=$(hex "$C/n61-bt-tx-cal.bin")
+RX=$(hex "$C/n61-bt-rx-cal.bin")
+ADDR=$(head -n 1 "$C/address" 2>/dev/null | tr a-f A-F)
+
+i=0
+while [ ! -e /sys/class/bluetooth/$D ]; do
+	i=$((i + 1)); [ $i -gt 30 ] && { echo "btcal: $D not found after 30 s"; exit 1; }
+	sleep 1
+done
+hciconfig $D 2>/dev/null | grep -q 'UP RUNNING' || hciconfig $D up || { echo "btcal: $D won't come up"; exit 1; }
+
+rc=0
+send() { # send OCF "bytes"; prints the controller's reply and checks the status byte
+	out=$(hcitool -i $D cmd 0x3f $1 $2 2>&1)
+	echo "$out"
+	# Command Complete params: <ncmd> <opcode LE16> <status> [return params] (0xFD1E returns one byte)
+	echo "$out" | grep -qiE "^ *[0-9a-f]{2} $3 00( [0-9a-f]{2})* *$" || { echo "btcal: OCF $1 FAILED"; rc=1; }
+}
+send 0x118 "$TX" "18 fd"
+send 0x11e "$RX" "1e fd"
+[ $rc = 0 ] && echo "btcal: TX (20 B) + RX (206 B) calibration accepted"
+# the chip boots with Broadcom's placeholder 43:45:B0:00:1F:AC; give it this phone's own address (ADT BMac)
+if [ -n "$ADDR" ] && ! hciconfig $D | grep -q "$ADDR"; then
+	btmgmt power off >/dev/null && btmgmt public-addr "$ADDR" >/dev/null && btmgmt power on >/dev/null
+	hciconfig $D | grep -q "$ADDR" && echo "btcal: address $ADDR" || { echo "btcal: address not set"; rc=1; }
+fi
+[ -n "$ADDR" ] && echo "$ADDR" > /tmp/bt-address
+exit $rc

@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 02:35:15 +0000
+Subject: [PATCH 105/138] dt-bindings: power: supply: sn2400: Allow a VBUS
+ detect interrupt
+
+On the iPhone 6 the system PMU reports VBUS plug and unplug as an event,
+which is the practical interrupt for the charger. Allow it by name and
+allow the charger to be a wakeup source.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../bindings/power/supply/ti,sn2400.yaml          | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/Documentation/devicetree/bindings/power/supply/ti,sn2400.yaml b/Documentation/devicetree/bindings/power/supply/ti,sn2400.yaml
+index c4c5ba5f5..ef390443e 100644
+--- a/Documentation/devicetree/bindings/power/supply/ti,sn2400.yaml
++++ b/Documentation/devicetree/bindings/power/supply/ti,sn2400.yaml
+@@ -23,7 +23,20 @@ properties:
+     maxItems: 1
+ 
+   interrupts:
+-    maxItems: 1
++    minItems: 1
++    items:
++      - description: The chip's own interrupt output, or VBUS detect alone
++      - description: VBUS detect event of the system PMIC
++
++  interrupt-names:
++    oneOf:
++      - items:
++          - const: irq
++          - const: vbus
++      - items:
++          - enum: [ irq, vbus ]
++
++  wakeup-source: true
+ 
+   input-current-limit-microamp:
+     description: Input current limit, 0 suspends the input.

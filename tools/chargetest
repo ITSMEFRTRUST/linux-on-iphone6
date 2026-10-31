@@ -1,0 +1,39 @@
+#!/bin/sh
+# chargetest - poke the SN2400 charger (i2c1 0x75) from userspace. Runs ON THE PHONE next to /tmp/i2c.
+# Push with: bin/push i2c chargetest      Register map: re/SN2400.md (mostly inferred, verify!)
+# usage: sh /tmp/chargetest dump | on [INPUT_MA] [CHG_MA] | keep [INPUT_MA] [CHG_MA]
+#   dump  - read 0x00..0x1f + VBUS/VBAT ADC (do this FIRST, before any write)
+#   on    - iOS-style setup once: mask+clear events, 0x10=0x04, input limit, charge current
+#   keep  - 'on' then re-write and read back every 5 s (Ctrl-C to stop)
+set -u
+I=/tmp/i2c
+B="$I 1 75"
+CMD=${1:-dump}
+IN=${2:-500}     # PC USB = 500, wall = 1000+
+CHG=${3:-1000}
+
+hex() { printf '%x' "$1"; }
+code_in() { m=$1; [ "$m" -lt 90 ] && m=90; [ "$m" -gt 2000 ] && m=2000; hex $(( (m - 90) / 10 )); }
+code_chg() { m=$1; [ "$m" -gt 2550 ] && m=2550; hex $(( m / 10 )); }
+
+dump() {
+	$B d 00 1f
+	# ADC: write (chan&0xe)|0x10 to 0x11 (bit4 = start, self-clears), result in 0x12
+	echo "ADC ch0 VBUS (25 mV/LSB), ch2 IBUS (7.8 mA/LSB), ch6 VBAT (2500 + 10 mV/LSB):"
+	$B w 11 10 s 10 r 11 r 12 w 11 12 s 10 r 12 w 11 16 s 10 r 12
+	echo "0x09 input limit: mA = 90 + 10*code   0x0f float V: 3000 + 10*code mV"
+}
+
+on() {
+	echo "== input $IN mA (0x09=$(code_in $IN)), charge $CHG mA (0x0d=$(code_chg $CHG))"
+	$B w 01 ff w 02 ff w 03 ff r 04 r 05 r 06 \
+	   w 10 04 w 09 $(code_in $IN) w 0d $(code_chg $CHG) \
+	   r 07 r 09 r 0d r 10
+}
+
+case $CMD in
+	dump) dump ;;
+	on) on ;;
+	keep) while :; do on; sleep 5; done ;;
+	*) echo "usage: $0 dump | on [IN_MA] [CHG_MA] | keep [IN_MA] [CHG_MA]"; exit 1 ;;
+esac

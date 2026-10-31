@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""btcheck [tools/bt.tgz] - verify a phone tarball is self-sufficient on the Hoolock initramfs.
+
+Union checked = tarball + initramfs (var/initramfs-combined.gz, nested extract.cpio.lzma too)
+              + var/rd-stage + var/extra-rd + tools/alsa.tgz (what audioboot pushes before it).
+For every ELF in the tarball:
+  1. PT_INTERP exists in the union
+  2. every DT_NEEDED resolves (musl search path /lib:/usr/local/lib:/usr/lib) in the union
+  3. every undefined non-weak dynamic symbol (name + symbol version if any) is defined by
+     some library in that ELF's transitive DT_NEEDED closure (catches soname-compatible but
+     too-old libs, e.g. alsa.tgz's libasound vs. a newer bluealsa)
+Also: dangling symlinks in the tarball, and tar members that would overwrite a file the
+initramfs / alsa.tgz already has (reported as CLOBBER; directories are ignored).
+Exit status 0 = all good.
+"""
+import os, re, subprocess, sys, tarfile, tempfile, shutil
+
+P = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+tgz = sys.argv[1] if len(sys.argv) > 1 else P + "/tools/bt.tgz"
+SEARCH = ["lib", "usr/local/lib", "usr/lib"]
+
+
+def sh(*a, **k):
+    return subprocess.run(a, capture_output=True, text=True, **k).stdout
+
+
+tmp = tempfile.mkdtemp(prefix="btcheck.")
+base, new = tmp + "/base", tmp + "/new"
+os.makedirs(base); os.makedirs(new)
+
+# --- base = what the phone already has
+stub = tmp + "/stub"; os.makedirs(stub)
+subprocess.run(f"gzip -dc {P}/var/initramfs-combined.gz | (cd {stub} && cpio -idm --quiet)", shell=True, check=True)
+nested = stub + "/extract.cpio.lzma"
+if os.path.exists(nested):
+    subprocess.run(f"xz -dc --format=lzma {nested} | (cd {stub} && cpio -idm --quiet)", shell=True, check=True)
+    os.remove(nested)
+subprocess.run(["cp", "-a", stub + "/.", base], check=True)
+for d in (P + "/var/rd-stage", P + "/var/extra-rd"):
+    if os.path.isdir(d):
+        subprocess.run(["cp", "-a", d + "/.", base], check=True)
+subprocess.run(["tar", "xzf", P + "/tools/alsa.tgz", "-C", base], check=True)
+
+# --- new = the tarball
+subprocess.run(["tar", "xzf", tgz, "-C", new], check=True)
+
+fail = 0
+def bad(msg):
+    global fail; fail += 1; print("FAIL", msg)
+
+# --- clobbers
+with tarfile.open(tgz) as t:
+    for m in t.getmembers():
+        if m.isdir(): continue
+        if os.path.lexists(os.path.join(base, m.name.lstrip("./"))):
+            bad(f"CLOBBER {m.name} already exists in initramfs/alsa.tgz")
+        if m.issym():
+            tgt = m.linkname if m.linkname.startswith("/") else os.path.normpath(os.path.join(os.path.dirname(m.name), m.linkname))
+            tgt = tgt.lstrip("/")
+            if not (os.path.lexists(os.path.join(new, tgt)) or os.path.lexists(os.path.join(base, tgt))):
+                bad(f"dangling symlink {m.name} -> {m.linkname}")
+
+def lookup(rel):
+    """resolve path rel (no leading /) in new first, then base; follow symlinks inside the union"""
+    for _ in range(16):
+        for root in (new, base):
+            p = os.path.join(root, rel)
+            if os.path.islink(p):
+                t = os.readlink(p)
+                rel = t.lstrip("/") if t.startswith("/") else os.path.normpath(os.path.join(os.path.dirname(rel), t))
+                break
+            if os.path.exists(p): return p
+        else:
+            return None
+    return None
+
+def is_elf(p):
+    try:
+        with open(p, "rb") as f: return f.read(4) == b"\x7fELF"
+    except OSError: return False
+
+cache = {}
+def info(path):
+    """(interp, needed, undef, defined) for an ELF file"""
+    if path in cache: return cache[path]
+    hdr = sh("readelf", "-lW", "-d", path)
+    interp = re.search(r"Requesting program interpreter: (\S+)\]", hdr)
+    needed = re.findall(r"\(NEEDED\)\s+Shared library: \[(.+?)\]", hdr)
+    undef, defd = set(), set()
+    for l in sh("readelf", "--dyn-syms", "-W", path).splitlines():
+        f = l.split()
+        if len(f) < 8 or not f[0].endswith(":") or f[0] == "0:": continue
+        bind, ndx, nm = f[4], f[6], f[7]
+        name, _, ver = nm.partition("@")
+        ver = ver.lstrip("@")
+        if ndx == "UND":
+            if bind != "WEAK" and name: undef.add((name, ver))
+        elif name:
+            defd.add((name, ver)); defd.add((name, ""))
+    cache[path] = (interp.group(1) if interp else None, needed, undef, defd)
+    return cache[path]
+
+def closure(path):
+    libs, todo, seen = [], [path], set()
+    while todo:
+        cur = todo.pop(0)
+        for so in info(cur)[1]:
+            if so in seen: continue
+            seen.add(so)
+            p = None
+            for d in SEARCH:
+                p = lookup(f"{d}/{so}")
+                if p: break
+            if not p: return None, so
+            libs.append(p); todo.append(p)
+    return libs, None
+
+n = 0
+for root, _, files in os.walk(new):
+    for fn in sorted(files):
+        p = os.path.join(root, fn)
+        if os.path.islink(p) or not is_elf(p): continue
+        rel = os.path.relpath(p, new)
+        n += 1
+        interp, needed, undef, _ = info(p)
+        if interp and not lookup(interp.lstrip("/")):
+            bad(f"{rel}: interpreter {interp} missing")
+        libs, miss = closure(p)
+        if libs is None:
+            bad(f"{rel}: DT_NEEDED {miss} not found in tarball/initramfs/alsa.tgz"); continue
+        # a shared object is also its own provider for self-references
+        provided = set()
+        for l in libs: provided |= info(l)[3]
+        provided |= info(p)[3]
+        # musl's libc is the interpreter and always in scope
+        mu = lookup("lib/ld-musl-aarch64.so.1")
+        if mu: provided |= info(mu)[3]
+        miss_sym = sorted((nm, v) for nm, v in undef if (nm, v) not in provided)
+        if miss_sym:
+            bad(f"{rel}: {len(miss_sym)} unresolved symbols, e.g. " + ", ".join(f"{a}@{b}" if b else a for a, b in miss_sym[:6]))
+        else:
+            print(f"ok   {rel}  ({len(needed)} needed, {len(undef)} undef syms)")
+
+print(f"\n{n} ELF files checked; {'ALL OK' if not fail else str(fail) + ' PROBLEM(S)'}")
+shutil.rmtree(tmp, ignore_errors=True)
+sys.exit(1 if fail else 0)

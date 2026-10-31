@@ -1,0 +1,222 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 20:39:30 +0000
+Subject: [PATCH 084/138] misc: Add a timed wakeup for suspend-to-idle without
+ an RTC alarm
+
+Nothing can wake an Apple A8 running Linux on a timer: the PMU's alarm
+and its interrupt line (AP GPIO 106) have no driver. The tick, however,
+keeps running in suspend-to-idle there, because the only idle state
+(WFI) has no ->enter_s2idle and the tick is never frozen. An hrtimer
+still fires while the system is suspended.
+
+Add a small driver that arms an hrtimer in the noirq suspend phase when
+/sys/module/s2idle_wake_timer/parameters/wake_after_ms is non-zero and
+reports a hard wakeup event when it expires. It ends suspend-to-idle the
+way a wake interrupt does, and its wakeup source shows up in
+/sys/class/wakeup. Inert while the parameter is 0.
+
+It is the safety net for the first suspend tests (the phone comes back
+even if no wake interrupt works), gives fixed-length suspends for
+battery measurements, and lets userspace wake up periodically.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/misc/Kconfig             |  13 +++
+ drivers/misc/Makefile            |   1 +
+ drivers/misc/s2idle-wake-timer.c | 153 +++++++++++++++++++++++++++++++
+ 3 files changed, 167 insertions(+)
+ create mode 100644 drivers/misc/s2idle-wake-timer.c
+
+diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
+index 7364931da..0623ccaf0 100644
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -390,6 +390,19 @@ config LATTICE_ECP3_CONFIG
+ 
+ 	  If unsure, say N.
+ 
++config S2IDLE_WAKE_TIMER
++	tristate "Timed wakeup from suspend-to-idle"
++	depends on SUSPEND
++	help
++	  Wake the system from suspend-to-idle after a time set in
++	  /sys/module/s2idle_wake_timer/parameters/wake_after_ms, without
++	  an RTC alarm. It relies on the tick running during s2idle, which
++	  is the case when no cpuidle state implements ->enter_s2idle (for
++	  example the Apple A7/A8, where only WFI exists). Inert until a
++	  time is set.
++
++	  If unsure, say N.
++
+ config SRAM
+ 	bool "Generic on-chip SRAM driver"
+ 	depends on HAS_IOMEM
+diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
+index e8d8d5d88..2f18484c2 100644
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -71,3 +71,4 @@ obj-y				+= keba/
+ obj-y				+= amd-sbi/
+ obj-$(CONFIG_MISC_RP1)		+= rp1/
+ obj-$(CONFIG_INTEL_SSEI)	+= issei/
++obj-$(CONFIG_S2IDLE_WAKE_TIMER)	+= s2idle-wake-timer.o
+diff --git a/drivers/misc/s2idle-wake-timer.c b/drivers/misc/s2idle-wake-timer.c
+new file mode 100644
+index 000000000..737727331
+--- /dev/null
++++ b/drivers/misc/s2idle-wake-timer.c
+@@ -0,0 +1,153 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Timed wakeup from suspend-to-idle without an RTC alarm.
++ *
++ * Meant for platforms like the Apple A8 under Linux, where nothing can wake
++ * the system on a timer (the PMU alarm interrupt has no driver) but the tick
++ * keeps running in s2idle, because no cpuidle state has ->enter_s2idle. An
++ * hrtimer therefore still fires while suspended. This driver arms one in the
++ * noirq phase of suspend and turns its expiry into a hard wakeup event, which
++ * ends suspend-to-idle like a button press would.
++ *
++ * Uses: a safety net for the first suspend tests (the system comes back even
++ * if no wake interrupt works), fixed-length suspends for battery measurements,
++ * and periodic wakeups for userspace (e.g. to look at the charger).
++ *
++ * /sys/module/s2idle_wake_timer/parameters/wake_after_ms (0644): 0 = off; any
++ * other value applies to every following suspend until it is set back to 0.
++ * .../fired (0444): number of suspends this timer ended.
++ */
++
++#include <linux/hrtimer.h>
++#include <linux/ktime.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/pm.h>
++#include <linux/pm_wakeup.h>
++#include <linux/suspend.h>
++
++#define DRV_NAME "s2idle-wake-timer"
++
++static unsigned int wake_after_ms;
++module_param(wake_after_ms, uint, 0644);
++MODULE_PARM_DESC(wake_after_ms, "Wake from suspend-to-idle after this many ms (0 = off)");
++
++static unsigned int fired;
++module_param(fired, uint, 0444);
++MODULE_PARM_DESC(fired, "Number of suspends ended by this timer");
++
++struct s2wt {
++	struct hrtimer timer;
++	struct wakeup_source *ws;
++	bool armed;
++};
++
++static struct platform_device *s2wt_pdev;
++
++static enum hrtimer_restart s2wt_expired(struct hrtimer *timer)
++{
++	struct s2wt *w = container_of(timer, struct s2wt, timer);
++
++	WRITE_ONCE(fired, READ_ONCE(fired) + 1);
++	pm_wakeup_ws_event(w->ws, 0, true);
++
++	return HRTIMER_NORESTART;
++}
++
++static int s2wt_suspend_noirq(struct device *dev)
++{
++	struct s2wt *w = dev_get_drvdata(dev);
++	unsigned int ms = READ_ONCE(wake_after_ms);
++
++	w->armed = false;
++	/* Only s2idle keeps the CPUs and the tick running */
++	if (!ms || pm_suspend_target_state != PM_SUSPEND_TO_IDLE)
++		return 0;
++
++	hrtimer_start(&w->timer, ms_to_ktime(ms), HRTIMER_MODE_REL_HARD);
++	w->armed = true;
++	dev_info(dev, "wakeup in %u ms\n", ms);
++
++	return 0;
++}
++
++static int s2wt_resume_noirq(struct device *dev)
++{
++	struct s2wt *w = dev_get_drvdata(dev);
++
++	if (w->armed) {
++		hrtimer_cancel(&w->timer);
++		w->armed = false;
++	}
++
++	return 0;
++}
++
++static const struct dev_pm_ops s2wt_pm_ops = {
++	NOIRQ_SYSTEM_SLEEP_PM_OPS(s2wt_suspend_noirq, s2wt_resume_noirq)
++};
++
++static int s2wt_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct s2wt *w;
++
++	w = devm_kzalloc(dev, sizeof(*w), GFP_KERNEL);
++	if (!w)
++		return -ENOMEM;
++
++	hrtimer_setup(&w->timer, s2wt_expired, CLOCK_MONOTONIC, HRTIMER_MODE_REL_HARD);
++
++	w->ws = wakeup_source_register(dev, "s2idle_wake_timer");
++	if (!w->ws)
++		return -ENOMEM;
++
++	platform_set_drvdata(pdev, w);
++
++	return 0;
++}
++
++static void s2wt_remove(struct platform_device *pdev)
++{
++	struct s2wt *w = platform_get_drvdata(pdev);
++
++	hrtimer_cancel(&w->timer);
++	wakeup_source_unregister(w->ws);
++}
++
++static struct platform_driver s2wt_driver = {
++	.driver = {
++		.name = DRV_NAME,
++		.pm = pm_sleep_ptr(&s2wt_pm_ops),
++	},
++	.probe = s2wt_probe,
++	.remove = s2wt_remove,
++};
++
++static int __init s2wt_init(void)
++{
++	int ret;
++
++	ret = platform_driver_register(&s2wt_driver);
++	if (ret)
++		return ret;
++
++	s2wt_pdev = platform_device_register_simple(DRV_NAME, PLATFORM_DEVID_NONE, NULL, 0);
++	if (IS_ERR(s2wt_pdev)) {
++		platform_driver_unregister(&s2wt_driver);
++		return PTR_ERR(s2wt_pdev);
++	}
++
++	return 0;
++}
++module_init(s2wt_init);
++
++static void __exit s2wt_exit(void)
++{
++	platform_device_unregister(s2wt_pdev);
++	platform_driver_unregister(&s2wt_driver);
++}
++module_exit(s2wt_exit);
++
++MODULE_DESCRIPTION("Timed wakeup from suspend-to-idle without an RTC alarm");
++MODULE_LICENSE("GPL");

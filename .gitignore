@@ -1,0 +1,69 @@
+# Downloads, local state, build output: never commit
+dl/
+var/
+hoolock-linux/
+m1n1-src/
+.venv/
+__pycache__/
+*.o
+*.ko
+build.log
+m1n1-linux.bin
+
+# Firmware and anything extracted from your own device or IPSW (Apple-owned: never commit)
+fw/
+firmware/
+*.bin
+*.dat
+*.trx
+*.clmb
+*.txcb
+*.hcd
+*.img4
+*.im4p
+*.ipsw
+re/wififw/
+re/mtfw/
+re/isp/
+re/dis/
+re/*.macho
+re/dtree*.txt
+re/live-adt*.txt
+
+# Bundles made by bin/mk* from your host's packages
+tools/*.tgz
+tools/*.raw
+tools/*.mp3
+
+# Tool binaries (built from the .c files next to them)
+tools/buzz
+tools/drv
+tools/i2c
+tools/gpio
+tools/mem
+tools/spi
+tools/mtread
+tools/tcal
+tools/mcat
+tools/tone
+tools/volkeys
+tools/nfcpoll
+tools/hdqtest
+tools/*.c~
+tools/disp/disp
+tools/disp/flipt
+tools/disp/vbltest
+tools/isp/ispcat
+tools/isp/ispfocus
+
+# Orchard
+ui/assets/icons/raw/
+ui/build/
+ui/build-*/
+ui/third_party/
+
+# Apple firmware disassembly / dumps — never commit
+*.s
+tools/sio-fw*
+re/*.macho
+re/live-adt.txt

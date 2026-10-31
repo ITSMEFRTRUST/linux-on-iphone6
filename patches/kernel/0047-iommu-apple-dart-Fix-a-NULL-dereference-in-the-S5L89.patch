@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 17:43:53 +0000
+Subject: [PATCH 047/138] iommu: apple-dart: Fix a NULL dereference in the
+ S5L8960X fault handler
+
+apple_dart_s5l8960x_irq() looks up the master config of dart->dev, which
+is the DART itself and never has one, so the first translation fault
+dereferences NULL (cfg->dma_min) in hard IRQ context and panics. Seen on
+the A8 when the BCM4345 does its first DMA through dart-apcie1.
+
+Report the raw faulting address instead.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/iommu/apple-dart.c | 5 ++---
+ 1 file changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/iommu/apple-dart.c b/drivers/iommu/apple-dart.c
+index 85311e95f..2753b3eb9 100644
+--- a/drivers/iommu/apple-dart.c
++++ b/drivers/iommu/apple-dart.c
+@@ -1182,7 +1182,6 @@ static const struct iommu_ops apple_dart_iommu_ops = {
+ static irqreturn_t apple_dart_s5l8960x_irq(int irq, void *dev)
+ {
+ 	struct apple_dart *dart = dev;
+-	struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dart->dev);
+ 	const char *fault_name = NULL;
+ 	u32 error = readl(dart->regs + DART_S5L8960X_ERROR);
+ 	u32 error_code = FIELD_GET(DART_S5L8960X_ERROR_CODE, error);
+@@ -1208,8 +1207,8 @@ static irqreturn_t apple_dart_s5l8960x_irq(int irq, void *dev)
+ 
+ 	dev_err_ratelimited(
+ 		dart->dev,
+-		"translation fault: status:0x%x stream:%d code:0x%x (%s) at 0x%llx",
+-		error, stream_idx, error_code, fault_name, addr | cfg->dma_min);
++		"translation fault: status:0x%x stream:%d code:0x%x (%s) at 0x%x",
++		error, stream_idx, error_code, fault_name, addr);
+ 
+ 	writel(error, dart->regs + DART_S5L8960X_ERROR);
+ 	return IRQ_HANDLED;

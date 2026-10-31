@@ -1,0 +1,202 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 00:23:30 +0000
+Subject: [PATCH 123/138] media: apple: t7000 ISP: fw TERMINAL lines at dev_dbg
+ unless fwlog=1, printed unlocked
+
+Review S4: every ISPCPU line was a dev_info printed while holding
+isp->lock; with console=tty0 and loglevel 7 fbcon renders it
+synchronously, so a chatty fw could stretch a 2 s command wait into a
+false timeout and flush the stage lines out of the 128 KB log buffer.
+
+- fwlog=0 (default): lines go to dev_dbg (dynamic debug) and are counted.
+- fwlog=1 (writable at runtime): lines are buffered (64) under a spinlock
+  and printed by isp_term_flush() after isp->lock is dropped (poll worker,
+  IRQ thread, stage runner, teardown): the first 200 at info level, then
+  rate-limited; overflow is counted and reported.
+- isp_ipc_stop logs the total line count.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../media/platform/apple/isp-t7000/isp-ipc.c  | 52 ++++++++++++++++++-
+ .../media/platform/apple/isp-t7000/isp-main.c |  6 +++
+ drivers/media/platform/apple/isp-t7000/isp.h  | 13 ++++-
+ 3 files changed, 68 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-ipc.c b/drivers/media/platform/apple/isp-t7000/isp-ipc.c
+index 44e795a5d..678d67be4 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-ipc.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-ipc.c
+@@ -27,7 +27,6 @@
+ #include "isp.h"
+ 
+ #define ISP_AIC_IRQ		91	/* ADT isp interrupts[0]; the kext uses only index 0 */
+-#define ISP_TERM_MAX		0x80	/* kext caps TERMINAL strings at 0x80 */
+ #define ISP_SM_MAX		SZ_32M	/* largest single SHAREDMALLOC we honour */
+ #define ISP_IRQ_STORM		100000	/* give up on the IRQ after this many */
+ #define ISP_IRQ_SAFETY_MS	1000	/* poll interval while the IRQ is in use */
+@@ -67,7 +66,49 @@ static void isp_terminal(struct t7000_isp *isp, u32 rel, u32 len)
+ 	for (i = 0; i < len; i++)
+ 		if (buf[i] < 0x20 || buf[i] > 0x7e)
+ 			buf[i] = '.';
+-	dev_info(isp->dev, "ISPCPU: %s\n", buf);
++	isp->term_lines++;
++	if (!READ_ONCE(isp_fwlog)) {
++		dev_dbg(isp->dev, "ISPCPU: %s\n", buf);
++		return;
++	}
++	/* printing (fbcon!) under isp->lock could stretch a command wait: defer it */
++	spin_lock(&isp->term_lock);
++	if (isp->term_count < ISP_TERM_LINES) {
++		strscpy(isp->term_buf[(isp->term_head + isp->term_count) % ISP_TERM_LINES], buf,
++			ISP_TERM_MAX + 1);
++		isp->term_count++;
++	} else {
++		isp->term_dropped++;
++	}
++	spin_unlock(&isp->term_lock);
++}
++
++/* Print buffered TERMINAL lines. Call without isp->lock. */
++void isp_term_flush(struct t7000_isp *isp)
++{
++	char line[ISP_TERM_MAX + 1];
++	unsigned long dropped;
++
++	for (;;) {
++		spin_lock(&isp->term_lock);
++		if (!isp->term_count) {
++			dropped = isp->term_dropped;
++			isp->term_dropped = 0;
++			spin_unlock(&isp->term_lock);
++			break;
++		}
++		strscpy(line, isp->term_buf[isp->term_head], sizeof(line));
++		isp->term_head = (isp->term_head + 1) % ISP_TERM_LINES;
++		isp->term_count--;
++		spin_unlock(&isp->term_lock);
++		if (isp->term_shown++ < ISP_TERM_SHOW)
++			dev_info(isp->dev, "ISPCPU: %s\n", line);
++		else
++			dev_info_ratelimited(isp->dev, "ISPCPU: %s\n", line);
++	}
++	if (dropped)
++		dev_warn(isp->dev, "ISPCPU: %lu line(s) dropped (buffer full while a command was waiting)\n",
++			 dropped);
+ }
+ 
+ /*
+@@ -303,6 +344,7 @@ static irqreturn_t isp_irq_thread(int irq, void *data)
+ 	isp_service(isp);
+ 	isp_dart_fault(isp);
+ 	mutex_unlock(&isp->lock);
++	isp_term_flush(isp);
+ 	return IRQ_HANDLED;
+ }
+ 
+@@ -356,6 +398,7 @@ static void isp_poll_fn(struct work_struct *work)
+ 		isp_dart_fault(isp);
+ 	}
+ 	mutex_unlock(&isp->lock);
++	isp_term_flush(isp);
+ 	if (n && isp->irq >= 0)
+ 		dev_info_ratelimited(isp->dev, "safety poll handled %d message(s) the IRQ did not (irqs so far: %d)\n",
+ 				     n, atomic_read(&isp->irq_count));
+@@ -473,6 +516,11 @@ void isp_ipc_stop(struct t7000_isp *isp)
+ 		isp->poll_init = false;
+ 		dev_info(isp->dev, "poll worker stopped\n");
+ 	}
++	isp_term_flush(isp);
++	if (isp->term_lines)
++		dev_info(isp->dev, "TERMINAL: %lu fw line(s), %s\n", isp->term_lines,
++			 isp_fwlog ? "printed as ISPCPU: (rate-limited)" :
++				     "not printed (fwlog=0; dynamic debug or fwlog=1 shows them)");
+ 	for (i = 0; i < isp->nchans; i++)
+ 		if (isp->chans[i].msgs)
+ 			dev_info(isp->dev, "ring '%s': %lu message(s)\n", isp->chans[i].name,
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-main.c b/drivers/media/platform/apple/isp-t7000/isp-main.c
+index ba3e31244..770f756b4 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-main.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-main.c
+@@ -38,6 +38,9 @@ MODULE_PARM_DESC(smmu_en, "1 = also set SMMU+0xc byte[sid] |= 0x80 like iOS (def
+ int isp_graceful = 1;
+ module_param_named(graceful, isp_graceful, int, 0444);
+ MODULE_PARM_DESC(graceful, "1 = STOP + POWER_DOWN handshake before halting a booted fw");
++int isp_fwlog;
++module_param_named(fwlog, isp_fwlog, int, 0644);
++MODULE_PARM_DESC(fwlog, "1 = print fw TERMINAL lines (ISPCPU:) at info level, rate-limited; default dev_dbg");
+ uint isp_fw_iova;
+ module_param_named(fw_iova, isp_fw_iova, uint, 0444);
+ MODULE_PARM_DESC(fw_iova, "DART IOVA of the firmware (default 0: fw-relative == absolute)");
+@@ -108,6 +111,7 @@ static void isp_teardown(struct t7000_isp *isp)
+ 	}
+ 	isp->done = 0;
+ 	mutex_unlock(&isp->lock);
++	isp_term_flush(isp);
+ 	isp_pmgr_log(isp, "after teardown");
+ }
+ 
+@@ -129,6 +133,7 @@ static int isp_run(struct t7000_isp *isp)
+ 		mutex_lock(&isp->lock);
+ 		ret = isp_stages[n](isp);
+ 		mutex_unlock(&isp->lock);
++		isp_term_flush(isp);
+ 		if (ret) {
+ 			dev_err(isp->dev, "stage %d: FAILED (%d), unwinding\n", n, ret);
+ 			return ret;
+@@ -153,6 +158,7 @@ static int __init isp_init(void)
+ 	if (!isp)
+ 		return -ENOMEM;
+ 	mutex_init(&isp->lock);
++	spin_lock_init(&isp->term_lock);
+ 	INIT_LIST_HEAD(&isp->surfs);
+ 	atomic_set(&isp->irq_count, 0);
+ 	isp->irq = -1;
+diff --git a/drivers/media/platform/apple/isp-t7000/isp.h b/drivers/media/platform/apple/isp-t7000/isp.h
+index 9064108ea..584f60880 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp.h
++++ b/drivers/media/platform/apple/isp-t7000/isp.h
+@@ -13,6 +13,7 @@
+ #include <linux/io.h>
+ #include <linux/list.h>
+ #include <linux/mutex.h>
++#include <linux/spinlock.h>
+ #include <linux/types.h>
+ #include <linux/wait.h>
+ #include <linux/workqueue.h>
+@@ -86,6 +87,9 @@
+ #define ISP_CHAN_DESC_SIZE	0x100
+ #define ISP_MAX_CHANS		0x20
+ #define ISP_CMD_BUF_SIZE	0x400
++#define ISP_TERM_MAX		0x80	/* kext caps TERMINAL strings at 0x80 */
++#define ISP_TERM_LINES		64	/* fwlog=1: lines buffered until printed unlocked */
++#define ISP_TERM_SHOW		200	/* fwlog=1: lines printed before rate-limiting */
+ 
+ enum { CHAN_CMD = 0, CHAN_REPLY = 1, CHAN_REPORT = 2 };
+ 
+@@ -157,10 +161,16 @@ struct t7000_isp {
+ 	int irq;
+ 	atomic_t irq_count;
+ 	unsigned long dart_err_logged;
++
++	/* fw TERMINAL lines: dev_dbg, or (fwlog=1) buffered and printed without isp->lock */
++	spinlock_t term_lock;
++	char term_buf[ISP_TERM_LINES][ISP_TERM_MAX + 1];
++	unsigned int term_head, term_count;
++	unsigned long term_lines, term_shown, term_dropped;
+ };
+ 
+ /* module parameters (isp-main.c) */
+-extern int isp_dry_run, isp_irq_en, isp_sens, isp_smmu_en, isp_graceful;
++extern int isp_dry_run, isp_irq_en, isp_sens, isp_smmu_en, isp_graceful, isp_fwlog;
+ extern uint isp_fw_iova, isp_dart_sids, isp_platform_id, isp_poll_ms;
+ extern uint isp_boot_timeout_ms, isp_cmd_timeout_ms, isp_max_shared_mb;
+ 
+@@ -210,6 +220,7 @@ void isp_cpu_stop(struct t7000_isp *isp);
+ 
+ /* isp-ipc.c */
+ int isp_service(struct t7000_isp *isp);
++void isp_term_flush(struct t7000_isp *isp);
+ int isp_cmd_send(struct t7000_isp *isp, void *pkt, u32 insize, u32 outsize,
+ 		 bool wait, u16 *status);
+ int isp_stage_mbox(struct t7000_isp *isp);

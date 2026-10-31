@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 00:29:27 +0000
+Subject: [PATCH 028/138] dt-bindings: input: apple,z2-multitouch: Add the
+ iPhone 6 N1
+
+The iPhone 6 uses the N1 multi-touch controller, a member of the Z2
+family. It additionally needs two supplies, a 32 kHz clock and a
+proximity calibration blob.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../touchscreen/apple,z2-multitouch.yaml      | 30 +++++++++++++++++++
+ 1 file changed, 30 insertions(+)
+
+diff --git a/Documentation/devicetree/bindings/input/touchscreen/apple,z2-multitouch.yaml b/Documentation/devicetree/bindings/input/touchscreen/apple,z2-multitouch.yaml
+index 44158e89e..bfa4a6624 100644
+--- a/Documentation/devicetree/bindings/input/touchscreen/apple,z2-multitouch.yaml
++++ b/Documentation/devicetree/bindings/input/touchscreen/apple,z2-multitouch.yaml
+@@ -20,6 +20,7 @@ properties:
+     enum:
+       - apple,j293-touchbar
+       - apple,j493-touchbar
++      - apple,n61-touchscreen
+ 
+   interrupts:
+     maxItems: 1
+@@ -36,6 +37,22 @@ properties:
+     description:
+       Calibration blob supplied by the bootloader
+ 
++  apple,z2-prox-cal-blob:
++    $ref: /schemas/types.yaml#/definitions/uint8-array
++    maxItems: 4096
++    description:
++      Proximity sensor calibration blob supplied by the bootloader
++
++  vdd-supply:
++    description: Digital supply
++
++  vdd-ana-supply:
++    description: Analog supply
++
++  clocks:
++    maxItems: 1
++    description: 32 kHz reference clock
++
+ required:
+   - compatible
+   - interrupts
+@@ -44,6 +61,19 @@ required:
+   - touchscreen-size-x
+   - touchscreen-size-y
+ 
++if:
++  not:
++    properties:
++      compatible:
++        contains:
++          const: apple,n61-touchscreen
++then:
++  properties:
++    apple,z2-prox-cal-blob: false
++    vdd-supply: false
++    vdd-ana-supply: false
++    clocks: false
++
+ unevaluatedProperties: false
+ 
+ examples:

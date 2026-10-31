@@ -1,0 +1,438 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 23:36:54 +0000
+Subject: [PATCH 074/138] drm: adp: t7000: Stop the vram fetch when the CRTC is
+ turned off
+
+With the panel asleep the pipe still fetched a full 750x1334 XRGB frame
+from vram at 60 Hz, which keeps the memory controller busy while the
+screen is off.
+
+With the new deep_off parameter (default off, writable at runtime), CRTC
+off first does what iOS does first on display off
+(AppleMobileADBE0::do_power_state_change_gated -> AppleH7DisplayPipe
+"blank frame"): mask the non-vblank ADP interrupts and program a frame
+with no layer (ADP 0x1038 = its bit 16 only, the value mainline
+adp_drv.c also writes on plane disable), wait two frames for it to
+latch, then put the panel to sleep as panel_sleep=1 does. CRTC on writes
+the saved 0x1038 back, unmasks the interrupts it masked (after a W1C of
+what latched meanwhile), waits two frames and wakes the panel. Base,
+stride, format, blend, the timing generator and the DSI link are not
+touched, so the undo is one register write.
+
+iOS also stops the timing generator, the DSI link and the power domains
+after the panel is off, but it never restarts the timings under a DSI
+link left in video mode; that step is not known to be reversible here
+and is left out.
+
+Add a debugfs "power" file that runs the off/on sequence without DRM
+master and shows the registers involved. deep_off=0 keeps the existing
+panel_sleep behaviour.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/gpu/drm/adp/adp-t7000.c | 251 +++++++++++++++++++++++++++-----
+ 1 file changed, 215 insertions(+), 36 deletions(-)
+
+diff --git a/drivers/gpu/drm/adp/adp-t7000.c b/drivers/gpu/drm/adp/adp-t7000.c
+index d1c0e0725..4139c1cd4 100644
+--- a/drivers/gpu/drm/adp/adp-t7000.c
++++ b/drivers/gpu/drm/adp/adp-t7000.c
+@@ -17,6 +17,11 @@
+  * Test mode: with standalone=1 the module creates its own device on the running kernel (no DT node
+  * needed, hard-coded A8 addresses, the power domains taken from /chosen/framebuffer) and takes over
+  * from simpledrm.
++ *
++ * Screen off (CRTC off = DPMS off / ACTIVE=0): panel_sleep=1 sends the panel to sleep; deep_off=1
++ * first stops the pipe's vram fetch (no layer, ADP IRQs masked) the way iOS does, then sleeps the
++ * panel. The timing generator and the DSI link keep running in both cases. debugfs "panel" and
++ * "power" run the same sequences without DRM master.
+  */
+ 
+ #include <linux/aperture.h>
+@@ -73,6 +78,14 @@
+ #define ADP_IRQ_ERRORS		(ADP_IRQ_UNDERRUN | ADP_IRQ_PKT_MISSED | ADP_IRQ_PF_ALIGN | \
+ 				 ADP_IRQ_PF_OVER | ADP_IRQ_RDERR)
+ #define ADP_FRAME_COUNT		0x1034
++/*
++ * Layer control. iBoot leaves 0x11001 (bit 0 = pipe 0 on, bit 12 = a mode flag iOS sets from its
++ * state, bit 16 = a flag iOS copies from the hardware at start). iOS's "no layer" frame keeps only
++ * bit 16 (AppleH7DisplayPipe @0xfffffff0088ebf88), the same value mainline adp_drv.c writes on
++ * plane disable (ADBE_LAYER_CTL_ENABLE).
++ */
++#define ADP_LAYER_CTL		0x1038
++#define ADP_LAYER_CTL_KEEP	BIT(16)
+ #define ADP_FIFO_LEVEL		0x1040
+ #define ADP_FIFO_LEVEL_MASK	GENMASK(12, 0)
+ #define ADP_FIFO		0x10c0
+@@ -88,6 +101,7 @@
+ #define PIPE_SRC_SIZE		0x48
+ 
+ /* ADBE0 ("fe"): read only here */
++#define ADBE_VFTG_CTL		0x08	/* bit 31 = run, bit 30 = running (ADBE0Driver_Impl @0xfffffff008907978/a70) */
+ #define ADBE_SCREEN_SIZE	0x0c
+ 
+ /* A8 constants for standalone=1 (ADT disp0 / dart-disp0 / vram / PMGR) */
+@@ -114,6 +128,13 @@
+ /* MIPI DCS: 120 ms between sleep in and sleep out, and after sleep out before display on */
+ #define PANEL_SLEEP_MS		120
+ 
++/*
++ * A direct ADP register write latches at the next frame start (verified for pipe 0 BASE on hw);
++ * two frames at 60 Hz is the wait before relying on a LAYER_CTL change. iOS instead polls the
++ * IRQ status for packet-done/-missed with 1 ms sleeps (@0xfffffff0088ee778).
++ */
++#define ADPT_LATCH_MS		34
++
+ #define DART_TCR		0x0c
+ #define DART_TTBR(sid, i)	(0x40 + 0x10 * (sid) + 4 * (i))
+ #define DART_TTBR_VALID		BIT(31)
+@@ -160,6 +181,9 @@ MODULE_PARM_DESC(test_noack, "test: never ack ADP IRQs (forces a storm on the fi
+ static bool panel_sleep;
+ module_param(panel_sleep, bool, 0644);
+ MODULE_PARM_DESC(panel_sleep, "CRTC off (DPMS off / ACTIVE=0) also puts the panel to sleep: DCS display off + sleep in (default: off)");
++static bool deep_off;
++module_param(deep_off, bool, 0644);
++MODULE_PARM_DESC(deep_off, "CRTC off also stops the pipe's vram fetch (no layer, ADP IRQs masked) before the panel sleep; implies panel_sleep (default: off)");
+ 
+ struct adpt {
+ 	struct drm_device drm;
+@@ -197,10 +221,13 @@ struct adpt {
+ 	ktime_t vbl_period;
+ 
+ 	void __iomem *dsi;	/* NULL: no panel commands */
+-	struct mutex panel_lock;
++	struct mutex panel_lock;	/* panel and scanout power state below */
+ 	bool panel_asleep;	/* we sent sleep in; only then is sleep out sent */
+-	bool panel_keep;	/* remove/shutdown: CRTC off must not touch the panel */
++	bool panel_keep;	/* remove/shutdown: CRTC off must not touch the panel or the pipe */
+ 	ktime_t panel_sleep_at;
++	bool scanout_off;	/* we cleared the layer: only then is layer_ctl written back */
++	u32 layer_ctl;		/* ADP_LAYER_CTL before scanout off */
++	u32 irq_en_off;		/* non-VBI ADP_IRQ_EN bits masked by scanout off */
+ };
+ 
+ #define to_adpt(x) container_of(x, struct adpt, drm)
+@@ -315,6 +342,19 @@ static const struct drm_driver adpt_driver = {
+ 	.minor = 1,
+ };
+ 
++/* ---------------------------------------------------------------- param FIFO */
++
++/* latch shadowed registers with a sync word; never polls: a busy FIFO takes the values with the packet in flight */
++static void adpt_fifo_kick(struct adpt *adp)
++{
++	u32 st = readl(adp->adp + ADP_PARAM_STATE), lvl = readl(adp->adp + ADP_FIFO_LEVEL);
++
++	if (FIELD_GET(ADP_PARAM_STATE_PARMST, st) == 2 || (lvl & ADP_FIFO_LEVEL_MASK))
++		drm_err_ratelimited(&adp->drm, "param FIFO busy (%08x/%08x), no sync\n", st, lvl);
++	else
++		writel(ADP_FIFO_SYNC | (++adp->tag ?: ++adp->tag), adp->adp + ADP_FIFO);
++}
++
+ /* ---------------------------------------------------------------- IRQ */
+ 
+ static void adpt_irq_en(struct adpt *adp, u32 set, u32 clear)
+@@ -452,16 +492,12 @@ static int adpt_dcs(struct adpt *adp, u8 cmd)
+  * What ApplePinotLCD does first on display off (display off, then sleep in). iOS then also stops the
+  * DSI HS clock, resets the panel and cuts its LDO; none of that is done here: the DSI link, the timing
+  * generator and the pipe keep running, so waking needs no panel init (sleep out + display on).
++ * Called with panel_lock held and inside drm_dev_enter().
+  */
+-static void adpt_panel_sleep(struct adpt *adp, bool force)
++static void adpt_panel_sleep_locked(struct adpt *adp)
+ {
+-	int idx;
+-
+-	mutex_lock(&adp->panel_lock);
+-	if (!adp->dsi || adp->panel_asleep || (!force && (adp->panel_keep || !READ_ONCE(panel_sleep))))
+-		goto out;
+-	if (!drm_dev_enter(&adp->drm, &idx))
+-		goto out;
++	if (!adp->dsi || adp->panel_asleep)
++		return;
+ 	if (!adpt_dcs(adp, MIPI_DCS_SET_DISPLAY_OFF)) {
+ 		msleep(20);	/* a frame */
+ 		if (!adpt_dcs(adp, MIPI_DCS_ENTER_SLEEP_MODE)) {
+@@ -471,19 +507,14 @@ static void adpt_panel_sleep(struct adpt *adp, bool force)
+ 			adpt_dcs(adp, MIPI_DCS_SET_DISPLAY_ON);
+ 		}
+ 	}
+-	drm_dev_exit(idx);
+-out:
+-	mutex_unlock(&adp->panel_lock);
+ }
+ 
+-static void adpt_panel_wake(struct adpt *adp)
++static void adpt_panel_wake_locked(struct adpt *adp)
+ {
+ 	s64 ms;
+-	int idx;
+ 
+-	mutex_lock(&adp->panel_lock);
+-	if (!adp->panel_asleep || !drm_dev_enter(&adp->drm, &idx))
+-		goto out;
++	if (!adp->panel_asleep)
++		return;
+ 	ms = ktime_ms_delta(ktime_get(), adp->panel_sleep_at);
+ 	if (ms < PANEL_SLEEP_MS)
+ 		msleep(PANEL_SLEEP_MS - ms);
+@@ -492,9 +523,106 @@ static void adpt_panel_wake(struct adpt *adp)
+ 		if (!adpt_dcs(adp, MIPI_DCS_SET_DISPLAY_ON))
+ 			adp->panel_asleep = false;
+ 	}
+-	drm_dev_exit(idx);
+ 	if (adp->panel_asleep)
+ 		drm_err(&adp->drm, "panel did not take the wake-up commands\n");
++}
++
++/*
++ * Stop the pipe's vram fetch, so DRAM can drop into self-refresh while the screen is off. This is
++ * the first thing iOS does on display off (AppleMobileADBE0::do_power_state_change_gated, power-off
++ * branch @0xfffffff0088f5198 -> vtable 0xc00 = 0xfffffff0088ee678): with the timing generator still
++ * running it masks every ADP interrupt (0x1028 &= ~0xfff), queues a frame with no layer
++ * (0x1038 = bit 16 only, @0xfffffff0088ebf88) and waits until the frame has latched. Only after
++ * that come backlight off, panel off, timing generator stop and the power gate.
++ *
++ * Here VBI is left to the DRM vblank code (already off on the CRTC disable path; on the debugfs path
++ * flips keep completing). Nothing else changes: base, stride, format, blend and the timing
++ * generator stay as they are, so writing the saved LAYER_CTL back is the whole undo.
++ *
++ * Not done: iOS stops the timing generator (ADBE0 0x08 bit 31, then waits for bit 30) only after the
++ * panel and the DSI link are down, and power-gates the pipe right after; it never restarts timings
++ * under a DSI link left in video mode. Whether that restart works without a DSI/panel re-init is not
++ * known, so VFTG, the DSI link (no ULPS on n61 either) and the power domains stay on.
++ * Called with panel_lock held and inside drm_dev_enter().
++ */
++static void adpt_scanout_off_locked(struct adpt *adp)
++{
++	unsigned long flags;
++	u32 ctl;
++
++	if (adp->scanout_off)
++		return;
++
++	spin_lock_irqsave(&adp->irq_lock, flags);
++	adp->irq_en_off = readl(adp->adp + ADP_IRQ_EN) & ~ADP_IRQ_VBI;
++	writel(readl(adp->adp + ADP_IRQ_EN) & ADP_IRQ_VBI, adp->adp + ADP_IRQ_EN);
++	spin_unlock_irqrestore(&adp->irq_lock, flags);
++
++	ctl = readl(adp->adp + ADP_LAYER_CTL);
++	adp->layer_ctl = ctl;
++	writel(ctl & ADP_LAYER_CTL_KEEP, adp->adp + ADP_LAYER_CTL);
++	if (fifo_sync)
++		adpt_fifo_kick(adp);
++	adp->scanout_off = true;
++	msleep(ADPT_LATCH_MS);
++	drm_dbg_driver(&adp->drm, "scanout off: LAYER_CTL %08x -> %08x, IRQ_EN masked %08x\n", ctl,
++		       readl(adp->adp + ADP_LAYER_CTL), adp->irq_en_off);
++}
++
++static void adpt_scanout_on_locked(struct adpt *adp)
++{
++	if (!adp->scanout_off)
++		return;
++
++	writel(adp->layer_ctl, adp->adp + ADP_LAYER_CTL);
++	if (fifo_sync)
++		adpt_fifo_kick(adp);
++	/* drop what latched while masked (W1C, as iOS), then unmask what was enabled before */
++	if (!test_noack)
++		writel(readl(adp->adp + ADP_IRQ_STATUS) & adp->irq_en_off, adp->adp + ADP_IRQ_STATUS);
++	adpt_irq_en(adp, adp->irq_en_off, 0);
++	adp->scanout_off = false;
++	msleep(ADPT_LATCH_MS);	/* the first frame the panel shows after wake has the layer */
++}
++
++/*
++ * Screen off, in iOS's order: scanout off (deep), then the panel. @deep / @force come from debugfs;
++ * the CRTC disable path passes false/false and the module parameters decide.
++ */
++static void adpt_display_off(struct adpt *adp, bool deep, bool force)
++{
++	bool sleep;
++	int idx;
++
++	mutex_lock(&adp->panel_lock);
++	if (!force && adp->panel_keep)
++		goto out;
++	if (!force)
++		deep = READ_ONCE(deep_off);
++	sleep = force || deep || READ_ONCE(panel_sleep);
++	if (!drm_dev_enter(&adp->drm, &idx))
++		goto out;
++	if (deep)
++		adpt_scanout_off_locked(adp);
++	if (sleep)
++		adpt_panel_sleep_locked(adp);
++	drm_dev_exit(idx);
++out:
++	mutex_unlock(&adp->panel_lock);
++}
++
++/* undo whatever adpt_display_off() did (no-op otherwise): layer back first, then panel wake */
++static void adpt_display_on(struct adpt *adp, bool scanout)
++{
++	int idx;
++
++	mutex_lock(&adp->panel_lock);
++	if (!drm_dev_enter(&adp->drm, &idx))
++		goto out;
++	if (scanout)
++		adpt_scanout_on_locked(adp);
++	adpt_panel_wake_locked(adp);
++	drm_dev_exit(idx);
+ out:
+ 	mutex_unlock(&adp->panel_lock);
+ }
+@@ -521,9 +649,9 @@ static ssize_t adpt_panel_write(struct file *file, const char __user *ubuf, size
+ 	if (copy_from_user(buf, ubuf, min(len, sizeof(buf) - 1)))
+ 		return -EFAULT;
+ 	if (sysfs_streq(buf, "sleep"))
+-		adpt_panel_sleep(adp, true);
++		adpt_display_off(adp, false, true);
+ 	else if (sysfs_streq(buf, "wake"))
+-		adpt_panel_wake(adp);
++		adpt_display_on(adp, false);
+ 	else
+ 		return -EINVAL;
+ 	return len;
+@@ -538,6 +666,61 @@ static const struct file_operations adpt_panel_fops = {
+ 	.release = single_release,
+ };
+ 
++/*
++ * debugfs "power": the whole deep off/on sequence without DRM master or a DPMS change ("off" = scanout
++ * off + panel sleep regardless of deep_off/panel_sleep, "on" = undo). Reading shows the state and the
++ * registers involved.
++ */
++static int adpt_power_show(struct seq_file *m, void *unused)
++{
++	struct adpt *adp = m->private;
++	int idx;
++
++	mutex_lock(&adp->panel_lock);
++	seq_printf(m, "scanout %s, panel %s%s; deep_off=%d panel_sleep=%d\n", adp->scanout_off ? "off" : "on",
++		   adp->panel_asleep ? "asleep" : "awake", adp->dsi ? "" : " (no DSI)", READ_ONCE(deep_off),
++		   READ_ONCE(panel_sleep));
++	if (drm_dev_enter(&adp->drm, &idx)) {
++		seq_printf(m, "LAYER_CTL %08x (saved %08x) IRQ_EN %08x (masked %08x) IRQ_STATUS %08x frame %04x VFTG %08x\n",
++			   readl(adp->adp + ADP_LAYER_CTL), adp->layer_ctl, readl(adp->adp + ADP_IRQ_EN),
++			   adp->scanout_off ? adp->irq_en_off : 0, readl(adp->adp + ADP_IRQ_STATUS),
++			   readl(adp->adp + ADP_FRAME_COUNT) & 0xffff, readl(adp->adbe + ADBE_VFTG_CTL));
++		drm_dev_exit(idx);
++	}
++	mutex_unlock(&adp->panel_lock);
++	return 0;
++}
++
++static int adpt_power_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, adpt_power_show, inode->i_private);
++}
++
++static ssize_t adpt_power_write(struct file *file, const char __user *ubuf, size_t len, loff_t *ppos)
++{
++	struct adpt *adp = ((struct seq_file *)file->private_data)->private;
++	char buf[8] = {};
++
++	if (copy_from_user(buf, ubuf, min(len, sizeof(buf) - 1)))
++		return -EFAULT;
++	if (sysfs_streq(buf, "off"))
++		adpt_display_off(adp, true, true);
++	else if (sysfs_streq(buf, "on"))
++		adpt_display_on(adp, true);
++	else
++		return -EINVAL;
++	return len;
++}
++
++static const struct file_operations adpt_power_fops = {
++	.owner = THIS_MODULE,
++	.open = adpt_power_open,
++	.read = seq_read,
++	.write = adpt_power_write,
++	.llseek = seq_lseek,
++	.release = single_release,
++};
++
+ /* ---------------------------------------------------------------- plane / crtc */
+ 
+ static int adpt_plane_atomic_check(struct drm_plane *plane, struct drm_atomic_commit *state)
+@@ -623,7 +806,7 @@ static enum drm_mode_status adpt_crtc_mode_valid(struct drm_crtc *crtc, const st
+ 
+ static void adpt_crtc_atomic_enable(struct drm_crtc *crtc, struct drm_atomic_commit *state)
+ {
+-	adpt_panel_wake(to_adpt(crtc->dev));	/* no-op unless this driver put it to sleep */
++	adpt_display_on(to_adpt(crtc->dev), true);	/* no-op unless this driver turned it off */
+ 	drm_crtc_vblank_on(crtc);
+ }
+ 
+@@ -641,8 +824,9 @@ static void adpt_crtc_atomic_disable(struct drm_crtc *crtc, struct drm_atomic_co
+ 	}
+ 	spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
+ 
+-	drm_crtc_vblank_off(crtc);	/* timings keep running: stopping VFTG would need a DSI/panel re-init */
+-	adpt_panel_sleep(adp, false);	/* only with panel_sleep=1 */
++	/* timings keep running: see adpt_scanout_off_locked() for why VFTG is not stopped */
++	drm_crtc_vblank_off(crtc);
++	adpt_display_off(adp, false, false);	/* only with panel_sleep=1 or deep_off=1 */
+ }
+ 
+ static void adpt_crtc_atomic_flush(struct drm_crtc *crtc, struct drm_atomic_commit *state)
+@@ -653,13 +837,7 @@ static void adpt_crtc_atomic_flush(struct drm_crtc *crtc, struct drm_atomic_comm
+ 	int idx;
+ 
+ 	if (fifo_sync && drm_dev_enter(&adp->drm, &idx)) {
+-		u32 st = readl(adp->adp + ADP_PARAM_STATE), lvl = readl(adp->adp + ADP_FIFO_LEVEL);
+-
+-		/* never poll: if the FIFO is busy the shadowed values go out with the packet in flight */
+-		if (FIELD_GET(ADP_PARAM_STATE_PARMST, st) == 2 || (lvl & ADP_FIFO_LEVEL_MASK))
+-			drm_err_ratelimited(&adp->drm, "param FIFO busy (%08x/%08x), no sync\n", st, lvl);
+-		else
+-			writel(ADP_FIFO_SYNC | (++adp->tag ?: ++adp->tag), adp->adp + ADP_FIFO);
++		adpt_fifo_kick(adp);
+ 		drm_dev_exit(idx);
+ 	}
+ 
+@@ -1058,9 +1236,9 @@ static int adpt_probe(struct platform_device *pdev)
+ 	adp->irq_en_orig = readl(adp->adp + ADP_IRQ_EN);
+ 	fmt = readl(adp->adp + PIPE(0) + PIPE_PIX_FMT);
+ 	size = readl(adp->adbe + ADBE_SCREEN_SIZE);
+-	drm_info(&adp->drm, "iBoot pipe0: base %08x stride %u fmt %08x src %08x, ADBE size %08x, mask %08x\n",
++	drm_info(&adp->drm, "iBoot pipe0: base %08x stride %u fmt %08x src %08x, ADBE size %08x, mask %08x, layer ctl %08x\n",
+ 		 adp->boot.base, adp->boot.stride, fmt, readl(adp->adp + PIPE(0) + PIPE_SRC_SIZE), size,
+-		 adp->irq_en_orig);
++		 adp->irq_en_orig, readl(adp->adp + ADP_LAYER_CTL));
+ 	if (fmt != PIPE_PIX_FMT_XRGB32 && fmt != PIPE_PIX_FMT_XRGB32_N61 && !force)
+ 		return dev_err_probe(dev, -ENODEV, "unexpected pipe0 format %08x (force=1 to ignore)\n", fmt);
+ 
+@@ -1135,6 +1313,7 @@ static int adpt_probe(struct platform_device *pdev)
+ 	 */
+ 	aperture_remove_conflicting_devices(adp->vram_phys, adp->vram_size, adpt_driver.name);
+ 	debugfs_create_file("panel", 0600, adp->drm.debugfs_root, adp, &adpt_panel_fops);
++	debugfs_create_file("power", 0600, adp->drm.debugfs_root, adp, &adpt_power_fops);
+ 	return 0;
+ }
+ 
+@@ -1142,9 +1321,9 @@ static void adpt_remove(struct platform_device *pdev)
+ {
+ 	struct adpt *adp = platform_get_drvdata(pdev);
+ 
+-	/* leave the panel as iBoot did: awake */
++	/* leave the pipe and the panel as iBoot did: scanning out, awake */
+ 	adp->panel_keep = true;
+-	adpt_panel_wake(adp);
++	adpt_display_on(adp, true);
+ 	drm_dev_unplug(&adp->drm);
+ 	drm_atomic_helper_shutdown(&adp->drm);
+ 	hrtimer_cancel(&adp->vbl_timer);	/* no-op unless the storm guard started it */
+@@ -1162,7 +1341,7 @@ static void adpt_shutdown(struct platform_device *pdev)
+ 
+ 	if (adp) {
+ 		adp->panel_keep = true;
+-		adpt_panel_wake(adp);
++		adpt_display_on(adp, true);
+ 		drm_atomic_helper_shutdown(&adp->drm);
+ 	}
+ }

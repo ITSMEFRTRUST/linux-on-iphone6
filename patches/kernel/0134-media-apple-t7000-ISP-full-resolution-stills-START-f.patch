@@ -1,0 +1,565 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 22:53:44 +0000
+Subject: [PATCH 134/138] media: apple: t7000 ISP: full-resolution stills
+ (START flags, fw RAW buffer)
+
+ISP_IOC_START takes preset-choice flags next to the camera number:
+ISP_START_PHOTO_VIEW (smallest preset >= 640x480 with the full-res aspect:
+rear 1632x1224 @60, front 1376x968 @60), ISP_START_STILL (full resolution:
+rear 3264x2448, front 1376x968) and ISP_START_PRESET (an explicit index).
+Bare 0/1 keep the old choice; older drivers reject the flags with EINVAL.
+
+Full-res presets make the fw ask for a 48 MB RAW buffer ('0WAR' 0x2db887e);
+we refused anything over 32 MB, so CH_START asserted
+"CImageFlowH6.cpp, 2185: chEntryApple->icRawBufferOut != 0". SHAREDMALLOC
+now honours up to 64 MB and reuses a freed surface of the same tag (the fw
+re-allocates '0WAR' on every preset change); max_shared_mb defaults to 256.
+IMX190 preset 3 (2592x1936) never delivers a frame and hangs the fw: skipped.
+
+Knobs for experiments, off by default: raw_local (0x125
+LOCAL_RAW_BUFFER_ENABLE; accepted, not what the assert wants) and raw_pool
+(host buffers for the fw's RAW pool, type 3).
+
+Verified on hw (oscar kernel): rear STILL 3264x2448 at 15 fps (dim scene),
+PHOTO_VIEW rear 1632x1224 @59 fps, front 1376x968 @55 fps; '0WAR' reused on
+the second STILL start.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../media/platform/apple/isp-t7000/isp-ipc.c  |  24 ++-
+ .../media/platform/apple/isp-t7000/isp-main.c |   2 +-
+ .../media/platform/apple/isp-t7000/isp-scfg.c | 175 ++++++++++++++----
+ .../platform/apple/isp-t7000/isp-stream.c     |  35 ++--
+ drivers/media/platform/apple/isp-t7000/isp.h  |  13 +-
+ include/uapi/linux/apple-isp-t7000.h          |  15 +-
+ 6 files changed, 206 insertions(+), 58 deletions(-)
+
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-ipc.c b/drivers/media/platform/apple/isp-t7000/isp-ipc.c
+index 424834695..106fe11cd 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-ipc.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-ipc.c
+@@ -28,7 +28,7 @@
+ #include "isp.h"
+ 
+ #define ISP_AIC_IRQ		91	/* ADT isp interrupts[0]; the kext uses only index 0 */
+-#define ISP_SM_MAX		SZ_32M	/* largest single SHAREDMALLOC we honour */
++#define ISP_SM_MAX		SZ_64M	/* largest single SHAREDMALLOC we honour (full-res presets: '0WAR' 0x2db887e) */
+ #define ISP_IRQ_STORM		100000	/* give up on the IRQ after this many */
+ #define ISP_IRQ_SAFETY_MS	1000	/* poll interval while the IRQ is in use */
+ 
+@@ -118,6 +118,21 @@ void isp_term_flush(struct t7000_isp *isp)
+  * below), reply 1. Words 1/2 of the reply are 0 (kext 0x845ba18).
+  * A failed alloc replies 1 (= NULL) so the fw sees a failure, not a hang.
+  */
++/*
++ * A freed SHAREDMALLOC surface with the same tag and a fitting size (the fw re-allocates
++ * its RAW buffer '0WAR' on every preset change: 13 MB binned, 48 MB full-res), so a
++ * preview <-> still switch does not map a new one each time.
++ */
++static struct isp_surf *isp_sm_reuse(struct t7000_isp *isp, u32 size, u32 tag)
++{
++	struct isp_surf *s;
++
++	list_for_each_entry(s, &isp->surfs, list)
++		if (s->sm && s->sm_freed && s->tag == tag && s->size >= size && s->size / 2 < size)
++			return s;
++	return NULL;
++}
++
+ static u32 isp_sm_request(struct t7000_isp *isp, u32 w0, u32 size, u32 tag)
+ {
+ 	u32 rel = w0 & ~3U;
+@@ -135,6 +150,13 @@ static u32 isp_sm_request(struct t7000_isp *isp, u32 w0, u32 size, u32 tag)
+ 				size, (char *)&tag);
+ 			return 1;
+ 		}
++		s = isp_sm_reuse(isp, max_t(u32, size, 0x1000), tag);
++		if (s) {
++			s->sm_freed = false;
++			dev_info(isp->dev, "SHAREDMALLOC: alloc 0x%x '%4.4s' -> fw-rel 0x%08x (reused)\n",
++				 size, (char *)&tag, isp_rel(s->iova));
++			return isp_rel(s->iova) | 1;
++		}
+ 		s = isp_surf_alloc(isp, max_t(u32, size, 0x1000), tag);
+ 		if (!s) {
+ 			dev_err(isp->dev, "SHAREDMALLOC: alloc 0x%x '%4.4s' failed, replying NULL\n",
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-main.c b/drivers/media/platform/apple/isp-t7000/isp-main.c
+index 43fa38378..798557069 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-main.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-main.c
+@@ -63,7 +63,7 @@ MODULE_PARM_DESC(boot_timeout_ms, "timeout of each boot handshake (iOS: 10 s)");
+ uint isp_cmd_timeout_ms = 2000;
+ module_param_named(cmd_timeout_ms, isp_cmd_timeout_ms, uint, 0444);
+ MODULE_PARM_DESC(cmd_timeout_ms, "timeout of one fw command (iOS: 2 s)");
+-uint isp_max_shared_mb = 64;
++uint isp_max_shared_mb = 256;	/* full-res stills: 4 x 11.4 MB NV12 + the fw's 48 MB RAW */
+ module_param_named(max_shared_mb, isp_max_shared_mb, uint, 0444);
+ MODULE_PARM_DESC(max_shared_mb, "cap on SHAREDMALLOC memory");
+ 
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-scfg.c b/drivers/media/platform/apple/isp-t7000/isp-scfg.c
+index 53df7fe7e..1b426c49c 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-scfg.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-scfg.c
+@@ -11,6 +11,7 @@
+ #include <linux/sizes.h>
+ #include <linux/slab.h>
+ 
++#include <uapi/linux/apple-isp-t7000.h>
+ #include "isp.h"
+ 
+ #define ISP_INFO_SIZE		0xc4	/* kext ISP_InitialSensorDetection */
+@@ -81,6 +82,21 @@ static int isp_ae_stab2 = -1;	/* AE_STABILITY_TO_STABLE_SET 0x229; Asahi 20 */
+ module_param_named(ae_stab2, isp_ae_stab2, int, 0644);
+ static bool isp_ae_start;	/* AE_START 0x200 */
+ module_param_named(ae_start, isp_ae_start, bool, 0644);
++/*
++ * Full-resolution presets (no binning) make the fw run the back end from a RAW frame in
++ * memory: CH_START asserts "CImageFlowH6.cpp, 2185: chEntryApple->icRawBufferOut != 0"
++ * (hw, 2026-10-21) unless it may use its own RAW buffer ('0WAR', SHAREDMALLOC at boot).
++ * iOS H6ISPCaptureStreamStart sends EnableLocalRawBufferMode(ch, 1) = 0x125 for that.
++ * -1 = for ISP_START_STILL only, 0 = never, 1 = every START.
++ */
++static int isp_raw_local;
++module_param_named(raw_local, isp_raw_local, int, 0644);
++MODULE_PARM_DESC(raw_local, "LOCAL_RAW_BUFFER_MODE 0x125 before CH_START (-1 = STILL starts only; accepted but not what the assert wants)");
++
++/* host RAW pool (fw type 3) buffers for STILL starts: not needed (the fw's RAW is a SHAREDMALLOC) */
++static bool isp_raw_pool;
++module_param_named(raw_pool, isp_raw_pool, bool, 0644);
++
+ static bool isp_bufs_after_start;	/* iOS order: CH_START first, then post the buffers */
+ module_param_named(bufs_after_start, isp_bufs_after_start, bool, 0644);
+ 
+@@ -118,12 +134,37 @@ static void isp_extra_prestart(struct t7000_isp *isp, u32 ch)
+ 		isp_ch_simple(isp, "TEMPORAL_FILTER_ENABLE", 0xc113, ch, 0xc, 0, 0, false);
+ }
+ 
+-/* CH_INFO_GET + CAMERA_CONFIG_GET per preset; picks the preset to stream. */
++/*
++ * Preset choice for st->mode (ISP_START_*): the explicit index; the largest output (STILL);
++ * the smallest output >= 640x480 (default, PHOTO_VIEW). PHOTO_VIEW also wants the aspect
++ * ratio of the largest preset (st->full_w x st->full_h, set by the first pass) within 8 %.
++ */
++static bool isp_preset_ok(struct isp_stream *st, u32 p, u32 ow, u32 oh, u32 best_area)
++{
++	u64 a, b;
++
++	if (st->mode & ISP_START_PRESET)
++		return p == ((st->mode >> ISP_START_PRESET_SHIFT) & 0xff);
++	if (st->mode & ISP_START_STILL)
++		return ow == st->full_w && oh == st->full_h && best_area == U32_MAX;
++	if (!(st->mode & ISP_START_PHOTO_VIEW) && isp_preset >= 0)
++		return p == isp_preset;
++	if (ow < 640 || oh < 480 || ow * oh >= best_area)
++		return false;
++	if (!(st->mode & ISP_START_PHOTO_VIEW) || !st->full_w)
++		return true;
++	a = (u64)ow * st->full_h * 100;		/* ow/oh vs full_w/full_h, cross-multiplied */
++	b = (u64)st->full_w * oh;
++	return a <= b * 108 && a * 108 >= b * 100 * 100;
++}
++
++/* CH_INFO_GET + CAMERA_CONFIG_GET per preset; picks the preset to stream (isp_preset_ok). */
+ static int isp_pick_preset(struct t7000_isp *isp, u8 *buf)
+ {
+ 	struct isp_stream *st = &isp->st;
+-	u32 p, best = U32_MAX, best_area = U32_MAX, ow, oh, small = U32_MAX, small_area = U32_MAX;
+-	u16 small_dim[4] = {};
++	u32 p, n, best = U32_MAX, best_area = U32_MAX, small = U32_MAX, small_area = U32_MAX;
++	u32 full_area = 0;
++	u16 dim[ISP_MAX_PRESETS][4] = {};	/* in w, in h, out w, out h */
+ 	int ret;
+ 
+ 	memset(buf, 0, ISP_INFO_SIZE);
+@@ -145,8 +186,9 @@ static int isp_pick_preset(struct t7000_isp *isp, u8 *buf)
+ 	snprintf(st->sensor_name, sizeof(st->sensor_name), "%s",
+ 		 st->sensor_id == 0x237 ? "IMX237 rear" :
+ 		 st->sensor_id == 0x190 ? "IMX190 front" : "unknown");
+-
+-	for (p = 0; p < min_t(u32, st->npresets, ISP_MAX_PRESETS); p++) {
++	n = min_t(u32, st->npresets, ISP_MAX_PRESETS);
++	st->full_w = st->full_h = 0;
++	for (p = 0; p < n; p++) {
+ 		memset(buf, 0, ISP_CAMCFG_SIZE);
+ 		((struct isp_cmd_hdr *)buf)->opcode = CISP_CMD_CH_CAMERA_CONFIG_GET;
+ 		*(u32 *)(buf + 8) = st->ch;
+@@ -154,47 +196,60 @@ static int isp_pick_preset(struct t7000_isp *isp, u8 *buf)
+ 		ret = isp_ch_cmd(isp, "CAMERA_CONFIG_GET", buf, ISP_CAMCFG_SIZE, true);
+ 		if (ret)
+ 			return ret;
+-		ow = rd16(buf, 0x14);
+-		oh = rd16(buf, 0x16);
+-		dev_info(isp->dev, "ch %u preset %u: in %ux%u out %ux%u, +0x18 %04x %04x +0x1c %04x %04x\n",
+-			 st->ch, p, rd16(buf, 0x10), rd16(buf, 0x12), ow, oh, rd16(buf, 0x18),
+-			 rd16(buf, 0x1a), rd16(buf, 0x1c), rd16(buf, 0x1e));
+-		if (!ow || !oh || ow > 4096 || oh > 4096)
++		dev_dbg(isp->dev, "ch %u preset %u: in %ux%u out %ux%u, +0x18 %04x %04x +0x1c %04x %04x\n",
++			st->ch, p, rd16(buf, 0x10), rd16(buf, 0x12), rd16(buf, 0x14), rd16(buf, 0x16),
++			rd16(buf, 0x18), rd16(buf, 0x1a), rd16(buf, 0x1c), rd16(buf, 0x1e));
++		if (!rd16(buf, 0x14) || !rd16(buf, 0x16) || rd16(buf, 0x14) > 4096 || rd16(buf, 0x16) > 4096)
++			continue;
++		dim[p][0] = rd16(buf, 0x10);
++		dim[p][1] = rd16(buf, 0x12);
++		dim[p][2] = rd16(buf, 0x14);
++		dim[p][3] = rd16(buf, 0x16);
++		/*
++		 * IMX190 (front, 1.2 MP) preset 3 claims 2592x1936: CH_START takes it, but no
++		 * frame ever comes and the fw stops answering (CH_STOP times out; hw
++		 * 2026-10-21). Its real full resolution is 1376x968 (presets 0-2).
++		 */
++		if (st->sensor_id == 0x190 && (u32)dim[p][2] * dim[p][3] > SZ_2M) {
++			dim[p][2] = dim[p][3] = 0;
++			continue;
++		}
++		if ((u32)dim[p][2] * dim[p][3] > full_area) {	/* the full-resolution preset */
++			full_area = (u32)dim[p][2] * dim[p][3];
++			st->full_w = dim[p][2];
++			st->full_h = dim[p][3];
++		}
++	}
++	for (p = 0; p < n; p++) {
++		u32 area = (u32)dim[p][2] * dim[p][3];
++
++		if (!area)
+ 			continue;
+-		if (ow * oh < small_area) {	/* fallback when nothing is >= 640x480 */
++		if (area < small_area) {	/* fallback when nothing is >= 640x480 */
+ 			small = p;
+-			small_area = ow * oh;
+-			small_dim[0] = rd16(buf, 0x10);
+-			small_dim[1] = rd16(buf, 0x12);
+-			small_dim[2] = ow;
+-			small_dim[3] = oh;
++			small_area = area;
+ 		}
+-		if (isp_preset >= 0 ? p == isp_preset :
+-		    ow >= 640 && oh >= 480 && ow * oh < best_area) {
++		if (isp_preset_ok(st, p, dim[p][2], dim[p][3], best_area)) {
+ 			best = p;
+-			best_area = ow * oh;
+-			st->in_w = rd16(buf, 0x10);
+-			st->in_h = rd16(buf, 0x12);
+-			st->width = ow;
+-			st->height = oh;
++			best_area = area;
+ 		}
+ 	}
+-	if (best == U32_MAX && isp_preset < 0 && small != U32_MAX) {
++	if (best == U32_MAX && !(st->mode & ISP_START_PRESET) && (st->mode || isp_preset < 0))
+ 		best = small;
+-		st->in_w = small_dim[0];
+-		st->in_h = small_dim[1];
+-		st->width = small_dim[2];
+-		st->height = small_dim[3];
+-	}
+ 	if (best == U32_MAX) {
+-		dev_err(isp->dev, "ch %u: no usable preset (preset=%d)\n", st->ch, isp_preset);
++		dev_err(isp->dev, "ch %u: no usable preset (mode 0x%x, preset=%d)\n", st->ch, st->mode,
++			isp_preset);
+ 		return -EINVAL;
+ 	}
+ 	st->preset = best;
++	st->in_w = dim[best][0];
++	st->in_h = dim[best][1];
++	st->width = dim[best][2];
++	st->height = dim[best][3];
+ 	st->stride = ALIGN(st->width, 64);
+ 	st->bufsize = PAGE_ALIGN(st->stride * st->height * 3 / 2);
+-	dev_info(isp->dev, "ch %u: streaming preset %u: %ux%u NV12, stride %u, buffer 0x%x\n",
+-		 st->ch, best, st->width, st->height, st->stride, st->bufsize);
++	dev_info(isp->dev, "ch %u: streaming preset %u (mode 0x%x): %ux%u NV12, stride %u, buffer 0x%x\n",
++		 st->ch, best, st->mode, st->width, st->height, st->stride, st->bufsize);
+ 	return 0;
+ }
+ 
+@@ -246,6 +301,8 @@ static void isp_config_meta(struct t7000_isp *isp, u8 *buf)
+ 	st->meta_size = 0;
+ 	st->pool_id[ISP_POOL_META] = 1;		/* ch 0 ids seen on hw: META 1; fw: id = ch * n + index + 1 */
+ 	st->pool_id[ISP_POOL_RENDERED] = 2;
++	st->pool_id[ISP_POOL_RAW] = 4;
++	st->raw_size = 0;
+ 	if (isp_ch_cmd(isp, "BUFFER_POOL_CONFIG_GET", buf, ISP_POOLGET_SIZE, true))
+ 		return;
+ 	for (i = 0; i < 15; i++) {
+@@ -260,6 +317,10 @@ static void isp_config_meta(struct t7000_isp *isp, u8 *buf)
+ 			st->meta_size = rd32(buf, off + 8);
+ 		if (rd16(buf, off) <= ISP_POOL_RENDERED)	/* type 0 META, 1 RENDERED */
+ 			st->pool_id[rd16(buf, off)] = rd16(buf, off + 2);
++		if (rd16(buf, off) == ISP_FW_POOL_RAW && rd32(buf, off + 8) <= SZ_32M) {
++			st->pool_id[ISP_POOL_RAW] = rd16(buf, off + 2);
++			st->raw_size = rd32(buf, off + 8);
++		}
+ 	}
+ 	if (isp_pool_meta >= 0)
+ 		st->pool_id[ISP_POOL_META] = isp_pool_meta;
+@@ -280,6 +341,18 @@ static void isp_config_meta(struct t7000_isp *isp, u8 *buf)
+ 	*(u32 *)(buf + 0x10) = st->meta_size;
+ 	*(u32 *)(buf + 0x14) = st->meta_size;
+ 	isp_ch_cmd(isp, "BUFFER_POOL_CONFIG_SET(META)", buf, 0x9c, false);
++	if (!(st->mode & ISP_START_STILL) || !st->raw_size || !READ_ONCE(isp_raw_pool)) {
++		st->raw_size = 0;	/* binned presets stream without host RAW buffers */
++		return;
++	}
++	memset(buf, 0, 0x9c);
++	((struct isp_cmd_hdr *)buf)->opcode = CISP_CMD_CH_BUFFER_POOL_CONFIG_SET;
++	*(u32 *)(buf + 8) = st->ch;
++	*(u16 *)(buf + 0xc) = ISP_FW_POOL_RAW;
++	*(u16 *)(buf + 0xe) = ISP_MAX_RAW;
++	*(u32 *)(buf + 0x10) = st->raw_size;
++	*(u32 *)(buf + 0x14) = st->raw_size;
++	isp_ch_cmd(isp, "BUFFER_POOL_CONFIG_SET(RAW)", buf, 0x9c, false);
+ }
+ 
+ /*
+@@ -325,6 +398,17 @@ static int isp_alloc_bufs(struct t7000_isp *isp, u32 want)
+ 	}
+ 	st->nbufs = n;
+ 	st->bufsize = st->buf[0].surf->size;
++	st->nraw = 0;
++	for (i = 0; st->raw_size && i < ISP_MAX_RAW; i++) {
++		if (!st->raw[i].surf || st->raw[i].surf->size < st->raw_size)
++			st->raw[i].surf = isp_surf_alloc(isp, st->raw_size, 0x30574152 + (i << 24));
++		if (!st->raw[i].surf)
++			return -ENOMEM;
++		if (st->raw[i].state != BUF_FW)	/* (still held after a timed-out STOP) */
++			st->raw[i].state = BUF_FREE;
++	}
++	if (st->raw_size)
++		st->nraw = ISP_MAX_RAW;
+ 	return 0;
+ }
+ 
+@@ -337,8 +421,9 @@ struct isp_cmd_output_config {
+ static_assert(sizeof(struct isp_cmd_output_config) == 0x38);
+ 
+ /* ISP_IOC_START: camera 0 = rear = fw channel 0, 1 = front = channel 1 (kext row 0x2a). */
+-int isp_stream_start(struct t7000_isp *isp, u32 camera)
++int isp_stream_start(struct t7000_isp *isp, u32 arg)
+ {
++	u32 camera = arg & ISP_START_CAMERA_MASK, mode = arg & ~ISP_START_CAMERA_MASK;
+ 	struct isp_stream *st = &isp->st;
+ 	struct isp_cmd_output_config oc = { .h.opcode = CISP_CMD_CH_OUTPUT_CONFIG_SET };
+ 	u32 want;
+@@ -346,7 +431,10 @@ int isp_stream_start(struct t7000_isp *isp, u32 camera)
+ 	u8 *buf;
+ 	int ret;
+ 
+-	if (camera > 1)
++	if (camera > 1 || hweight32(mode & (ISP_START_PHOTO_VIEW | ISP_START_STILL | ISP_START_PRESET)) > 1 ||
++	    (mode & ~(ISP_START_PHOTO_VIEW | ISP_START_STILL | ISP_START_PRESET |
++		      0xffu << ISP_START_PRESET_SHIFT)) ||
++	    (!(mode & ISP_START_PRESET) && (mode >> ISP_START_PRESET_SHIFT)))
+ 		return -EINVAL;
+ 	if (st->on)
+ 		return -EBUSY;
+@@ -362,6 +450,7 @@ int isp_stream_start(struct t7000_isp *isp, u32 camera)
+ 	 * rear <-> front switch on the same fd reuses them (no new allocation).
+ 	 */
+ 	want = 0;
++	st->mode = mode & ISP_START_PRESET ? 0 : mode;	/* (an index is per camera) */
+ 	if (!st->nbufs) {
+ 		st->ch = !camera;
+ 		if (!isp_pick_preset(isp, buf))
+@@ -371,6 +460,7 @@ int isp_stream_start(struct t7000_isp *isp, u32 camera)
+ 				 !camera, camera);
+ 	}
+ 	st->ch = camera;
++	st->mode = mode;
+ 	ret = isp_pick_preset(isp, buf);
+ 	if (ret)
+ 		goto out;
+@@ -411,6 +501,15 @@ int isp_stream_start(struct t7000_isp *isp, u32 camera)
+ 		goto out;
+ 	isp_ch_simple(isp, "SIF_PIXEL_FORMAT_SET", CISP_CMD_CH_SIF_PIXEL_FORMAT_SET, st->ch, 0x14,
+ 		      3 | 1 << 8, 0, false);	/* u8 format 3, u8 type 1 (Asahi) */
++	{
++		int rl = READ_ONCE(isp_raw_local);
++		bool on = rl > 0 || (rl < 0 && (st->mode & ISP_START_STILL));
++
++		if (on || st->raw_local[st->ch]) {	/* (switched off again for the next preview) */
++			isp_ch_simple(isp, "LOCAL_RAW_BUFFER_MODE", 0x125, st->ch, 0x10, on, 0, false);
++			st->raw_local[st->ch] = on;
++		}
++	}
+ 	isp_extra_cfg(isp, st->ch);
+ 	isp_config_meta(isp, buf);
+ 	ret = isp_alloc_bufs(isp, want);
+@@ -442,9 +541,9 @@ int isp_stream_start(struct t7000_isp *isp, u32 camera)
+ 		isp_stream_stop(isp);
+ 		goto out;
+ 	}
+-	dev_info(isp->dev, "stream on: camera %u (%s 0x%04x), %ux%u, %u buffer(s)%s\n", camera,
+-		 st->sensor_name, st->sensor_id, st->width, st->height, st->nbufs,
+-		 st->meta_size ? " + meta" : "");
++	dev_info(isp->dev, "stream on: camera %u (%s 0x%04x), preset %u, %ux%u, %u buffer(s)%s, %u raw\n",
++		 camera, st->sensor_name, st->sensor_id, st->preset, st->width, st->height, st->nbufs,
++		 st->meta_size ? " + meta" : "", st->nraw);
+ out:
+ 	kfree(buf);
+ 	return ret;
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-stream.c b/drivers/media/platform/apple/isp-t7000/isp-stream.c
+index a249f13d6..61a0a6642 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-stream.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-stream.c
+@@ -57,8 +57,8 @@ static void isp_fill_entry(struct t7000_isp *isp, struct isp_bl_entry *e, u32 po
+ 	memset(e, 0, sizeof(*e));
+ 	e->pool = st->pool_id[pool];	/* fw pool id; the tag keeps our kind */
+ 	e->tag = ISP_TAG(pool, i);
+-	if (pool == ISP_POOL_META) {
+-		e->addr[0] = isp_rel(st->meta[i].surf->iova);
++	if (pool == ISP_POOL_META || pool == ISP_POOL_RAW) {
++		e->addr[0] = isp_rel((pool == ISP_POOL_RAW ? st->raw : st->meta)[i].surf->iova);
+ 		e->flags[0] = ISP_BUF_FILLED;
+ 		e->nplanes = 1;
+ 	} else {
+@@ -109,6 +109,11 @@ static int isp_h2t_post(struct t7000_isp *isp, u32 n, const u32 *pool, const u32
+ }
+ 
+ /* Hand every FREE frame/meta buffer back to the fw, one list per H2T slot. isp->lock held. */
++static struct isp_sbuf *isp_sbuf_of(struct isp_stream *st, u32 pool, u32 i)
++{
++	return pool == ISP_POOL_META ? &st->meta[i] : pool == ISP_POOL_RAW ? &st->raw[i] : &st->buf[i];
++}
++
+ void isp_stream_kick(struct t7000_isp *isp)
+ {
+ 	struct isp_stream *st = &isp->st;
+@@ -121,6 +126,12 @@ void isp_stream_kick(struct t7000_isp *isp)
+ 	for (round = 0; round < 4 && st->on && !st->stopping; round++) {
+ 		n = 0;
+ 		spin_lock(&st->frame_lock);
++		for (i = 0; i < st->nraw && n < ISP_BUFLIST_MAX; i++) {
++			if (st->raw[i].state == BUF_FREE) {
++				pool[n] = ISP_POOL_RAW;
++				idx[n++] = i;
++			}
++		}
+ 		for (i = 0; i < st->nbufs && n < ISP_BUFLIST_MAX; i++) {
+ 			/* meta only when this START configured a META pool (stale surfaces stay idle) */
+ 			if (st->meta_size && st->meta[i].surf && st->meta[i].state == BUF_FREE) {
+@@ -134,10 +145,7 @@ void isp_stream_kick(struct t7000_isp *isp)
+ 		}
+ 		/* claim them before posting: a T2H for them cannot come earlier than the post */
+ 		for (i = 0; i < n; i++) {
+-			if (pool[i] == ISP_POOL_META)
+-				st->meta[idx[i]].state = BUF_FW;
+-			else
+-				st->buf[idx[i]].state = BUF_FW;
++			isp_sbuf_of(st, pool[i], idx[i])->state = BUF_FW;
+ 		}
+ 		spin_unlock(&st->frame_lock);
+ 		if (!n)
+@@ -145,10 +153,7 @@ void isp_stream_kick(struct t7000_isp *isp)
+ 		if (isp_h2t_post(isp, n, pool, idx)) {
+ 			spin_lock(&st->frame_lock);	/* slot busy: give them back, retry later */
+ 			for (i = 0; i < n; i++) {
+-				if (pool[i] == ISP_POOL_META)
+-					st->meta[idx[i]].state = BUF_FREE;
+-				else
+-					st->buf[idx[i]].state = BUF_FREE;
++				isp_sbuf_of(st, pool[i], idx[i])->state = BUF_FREE;
+ 			}
+ 			spin_unlock(&st->frame_lock);
+ 			return;
+@@ -192,15 +197,15 @@ static void isp_t2h_entry(struct t7000_isp *isp, const struct isp_bl_entry *e, b
+ 	struct isp_sbuf *b;
+ 	bool filled;
+ 
+-	if ((e->tag >> 32) != ISP_TAG_MAGIC || i >= st->nbufs ||
+-	    (pool != ISP_POOL_META && pool != ISP_POOL_RENDERED) ||
++	if ((e->tag >> 32) != ISP_TAG_MAGIC || pool >= ISP_POOL_KINDS ||
++	    i >= (pool == ISP_POOL_RAW ? st->nraw : st->nbufs) ||
+ 	    (e->pool & 0x0fffffff) != st->pool_id[pool]) {
+ 		st->errors++;
+ 		dev_warn_ratelimited(isp->dev, "T2H: unknown buffer: pool 0x%x tag 0x%016llx addr 0x%08x\n",
+ 				     e->pool, e->tag, e->addr[0]);
+ 		return;
+ 	}
+-	b = pool == ISP_POOL_META ? &st->meta[i] : &st->buf[i];
++	b = isp_sbuf_of(st, pool, i);
+ 	filled = rendered || (e->flags[0] & ISP_BUF_FILLED);
+ 	if (READ_ONCE(isp_stream_dump))
+ 		dev_info(isp->dev, "T2H: pool %u idx %u planes %u addr %08x %08x flags %08x %08x\n",
+@@ -215,9 +220,9 @@ static void isp_t2h_entry(struct t7000_isp *isp, const struct isp_bl_entry *e, b
+ 	}
+ 	if (pool == ISP_POOL_RENDERED && !filled && !READ_ONCE(isp_keep_empty))
+ 		st->empty++;	/* CH_BUFFER_RETURN (word2 0x30000000): recycle, not a frame */
+-	if (pool == ISP_POOL_META || !st->on || st->stopping ||
++	if (pool != ISP_POOL_RENDERED || !st->on || st->stopping ||
+ 	    (!filled && !READ_ONCE(isp_keep_empty))) {
+-		b->state = BUF_FREE;	/* meta, empty, or a buffer handed back by CH_BUFFER_RETURN */
++		b->state = BUF_FREE;	/* meta/raw, empty, or a buffer handed back by CH_BUFFER_RETURN */
+ 		spin_unlock(&st->frame_lock);
+ 		return;
+ 	}
+diff --git a/drivers/media/platform/apple/isp-t7000/isp.h b/drivers/media/platform/apple/isp-t7000/isp.h
+index 0c8ea5fb9..3dfdcc17e 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp.h
++++ b/drivers/media/platform/apple/isp-t7000/isp.h
+@@ -146,6 +146,10 @@ enum { CHAN_CMD = 0, CHAN_REPLY = 1, CHAN_REPORT = 2 };
+ #define ISP_MAX_BUFS		8
+ #define ISP_POOL_META		0
+ #define ISP_POOL_RENDERED	1
++#define ISP_POOL_RAW		2	/* fw pool type 3: the RAW frame full-res presets need */
++#define ISP_POOL_KINDS		3
++#define ISP_FW_POOL_RAW		3
++#define ISP_MAX_RAW		2
+ #define ISP_BUFLIST_SLOT	0x200	/* one H2T list per BUF_H2T ring slot */
+ #define ISP_BUFLIST_MAX		8	/* entries per list (kext clamps T2H lists to 8) */
+ 
+@@ -163,13 +167,18 @@ struct isp_sbuf {
+ struct isp_stream {
+ 	bool on, stopping;
+ 	u32 ch, sensor_id, preset, npresets;
++	u32 mode;		/* ISP_START_* flags of the running / next START */
++	u32 full_w, full_h;	/* largest preset output of st->ch */
++	bool raw_local[2];	/* LOCAL_RAW_BUFFER_MODE sent as on, per channel */
+ 	u32 in_w, in_h, width, height, stride, bufsize, nbufs;
+ 	u32 meta_size;
+-	u32 pool_id[2];		/* fw pool id per ISP_POOL_* kind (BUF list +0x1c), from POOL_CONFIG_GET */
++	u32 pool_id[ISP_POOL_KINDS];		/* fw pool id per ISP_POOL_* kind (BUF list +0x1c), from POOL_CONFIG_GET */
+ 	u32 empty;		/* buffers returned without the 0x40000000 data flag */
+ 	char sensor_name[32];
+ 	struct isp_sbuf buf[ISP_MAX_BUFS];
+ 	struct isp_sbuf meta[ISP_MAX_BUFS];
++	struct isp_sbuf raw[ISP_MAX_RAW];
++	u32 raw_size, nraw;	/* RAW pool: size from POOL_CONFIG_GET; buffers posted this START */
+ 	struct isp_surf *lists;		/* ISP_BUFLIST_SLOT per BUF_H2T slot */
+ 	struct isp_surf *setf;		/* setfile copy for CH_SET_FILE_LOAD */
+ 	u32 seq;
+@@ -387,7 +396,7 @@ void isp_sensor_power_off(struct t7000_isp *isp);
+ 
+ /* isp-stream.c */
+ u32 isp_bt_handle(struct t7000_isp *isp, u32 w0, u32 w1, u32 w2);
+-int isp_stream_start(struct t7000_isp *isp, u32 camera);
++int isp_stream_start(struct t7000_isp *isp, u32 arg);
+ void isp_stream_stop(struct t7000_isp *isp);
+ void isp_stream_release(struct t7000_isp *isp, u32 index);
+ void isp_stream_kick(struct t7000_isp *isp);
+diff --git a/include/uapi/linux/apple-isp-t7000.h b/include/uapi/linux/apple-isp-t7000.h
+index 1744ef12a..d096a3a0b 100644
+--- a/include/uapi/linux/apple-isp-t7000.h
++++ b/include/uapi/linux/apple-isp-t7000.h
+@@ -49,7 +49,20 @@ struct isp_frame {
+ };
+ 
+ #define ISP_IOC_INFO		_IOR('I', 1, struct isp_info)
+-#define ISP_IOC_START		_IOW('I', 2, __u32)
++/*
++ * ISP_IOC_START argument: the camera in bits 7:0 (0 = rear, 1 = front) plus at most one
++ * preset-choice flag. 0 / 1 alone keep the old choice (smallest preset >= 640x480; the
++ * "preset" module parameter overrides it). Drivers before these flags reject them with
++ * EINVAL, so a caller can retry with the bare camera number.
++ */
++#define ISP_START_CAMERA_MASK	0xff
++#define ISP_START_PHOTO_VIEW	0x100	/* viewfinder for stills: smallest preset >= 640x480 with
++					 * the aspect ratio of the full-resolution one (4:3) */
++#define ISP_START_STILL		0x200	/* the sensor's full-resolution preset (largest output) */
++#define ISP_START_PRESET	0x400	/* exactly the preset in bits 23:16 */
++#define ISP_START_PRESET_SHIFT	16
++
++#define ISP_IOC_START		_IOW('I', 2, __u32)	/* *arg: camera | ISP_START_* */
+ #define ISP_IOC_STOP		_IO('I', 3)
+ #define ISP_IOC_RELEASE		_IOW('I', 4, __u32)
+ 

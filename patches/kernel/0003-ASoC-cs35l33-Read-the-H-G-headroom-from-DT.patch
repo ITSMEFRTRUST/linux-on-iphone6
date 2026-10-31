@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 17:44:07 +0000
+Subject: [PATCH 003/138] ASoC: cs35l33: Read the H/G headroom from DT
+
+cs35l33_set_hg_data() writes hg_config->hd_rm to HG_HEAD whenever the
+"cirrus,hg-algo" sub-node is present, but nothing ever sets hd_rm from
+the device tree. The headroom is therefore always forced to 0, replacing
+the chip default.
+
+Parse a "cirrus,hd-rm" property so boards can set it.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ Documentation/devicetree/bindings/sound/cs35l33.txt | 3 +++
+ sound/soc/codecs/cs35l33.c                          | 2 ++
+ 2 files changed, 5 insertions(+)
+
+diff --git a/Documentation/devicetree/bindings/sound/cs35l33.txt b/Documentation/devicetree/bindings/sound/cs35l33.txt
+index dc5a355d1..552717135 100644
+--- a/Documentation/devicetree/bindings/sound/cs35l33.txt
++++ b/Documentation/devicetree/bindings/sound/cs35l33.txt
+@@ -58,6 +58,9 @@ Optional properties for the "cirrus,hg-algo" sub-node:
+     allowing release condition tracking updates. The number of LRCLK periods
+     start at 3 to a maximum of 255.
+ 
++  - cirrus,hd-rm : Class H/G headroom, 0 to 0x7F. Defaults to 0 when the
++    sub-node is present.
++
+   - cirrus,ldo-thld : Configures the signal threshold at which the PWM output
+     stage enters LDO operation. Starts as a default value of 50mV for a value
+     of 1 and increases with a step size of 50mV to a maximum of 750mV (value of
+diff --git a/sound/soc/codecs/cs35l33.c b/sound/soc/codecs/cs35l33.c
+index e217da124..23ff3d240 100644
+--- a/sound/soc/codecs/cs35l33.c
++++ b/sound/soc/codecs/cs35l33.c
+@@ -936,6 +936,8 @@ static int cs35l33_get_hg_data(const struct device_node *np,
+ 		if (of_property_read_u32(hg, "cirrus,release-rate",
+ 				&val32) >= 0)
+ 			hg_config->release_rate = val32;
++		if (of_property_read_u32(hg, "cirrus,hd-rm", &val32) >= 0)
++			hg_config->hd_rm = val32;
+ 		if (of_property_read_u32(hg, "cirrus,ldo-thld", &val32) >= 0)
+ 			hg_config->ldo_thld = val32;
+ 		if (of_property_read_u32(hg, "cirrus,ldo-path-disable",

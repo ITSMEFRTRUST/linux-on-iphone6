@@ -1,0 +1,109 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 23:37:39 +0000
+Subject: [PATCH 119/138] media: apple: t7000 ISP: SHAREDMALLOC free = ack
+ only; free pages after the TLB flush
+
+Review B2: isp_surf_free() handed pages back to the allocator before the
+DART TLB invalidate, and SHAREDMALLOC frees ran it while the fw was live
+(Asahi: the fw keeps using surfaces after freeing them).
+
+- A fw free now only marks the surface sm_freed and acks; it stays mapped
+  until isp_surf_free_all() after power-off. Freed surfaces still count
+  towards max_shared_mb.
+- isp_surf_free() is two-pass: clear all PTEs -> flush -> dma_unmap +
+  __free_page (also covers the alloc-failure path).
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../media/platform/apple/isp-t7000/isp-dart.c | 10 ++++++++--
+ .../media/platform/apple/isp-t7000/isp-ipc.c  | 20 ++++++++++++-------
+ drivers/media/platform/apple/isp-t7000/isp.h  |  1 +
+ 3 files changed, 22 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-dart.c b/drivers/media/platform/apple/isp-t7000/isp-dart.c
+index 67b4da7fd..aaf7b34e0 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-dart.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-dart.c
+@@ -158,21 +158,27 @@ static void dart_unmap_page(struct t7000_isp *isp, u32 iova)
+ 		isp->l2[i1][i2] = 0;
+ }
+ 
++/*
++ * Two passes: clear every PTE and flush the DART TLB first, only then give the
++ * pages back, so the ISP can never reach a page the kernel already reuses.
++ * At runtime only the alloc-failure path gets here; fw frees are ack-only.
++ */
+ void isp_surf_free(struct t7000_isp *isp, struct isp_surf *s)
+ {
+ 	unsigned int i;
+ 
+ 	if (s->virt)
+ 		vunmap(s->virt);
++	for (i = 0; s->pages && i < s->npages; i++)
++		dart_unmap_page(isp, s->iova + i * PAGE_SIZE);
++	isp_dart_flush(isp);
+ 	for (i = 0; s->pages && s->dma && i < s->npages; i++) {
+ 		if (!s->pages[i])
+ 			continue;
+-		dart_unmap_page(isp, s->iova + i * PAGE_SIZE);
+ 		if (!dma_mapping_error(isp->dev, s->dma[i]))
+ 			dma_unmap_page(isp->dev, s->dma[i], PAGE_SIZE, DMA_BIDIRECTIONAL);
+ 		__free_page(s->pages[i]);
+ 	}
+-	isp_dart_flush(isp);
+ 	isp->shared_bytes -= s->size;
+ 	list_del(&s->list);
+ 	kfree(s->pages);
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-ipc.c b/drivers/media/platform/apple/isp-t7000/isp-ipc.c
+index 2a397bbe3..44e795a5d 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-ipc.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-ipc.c
+@@ -72,8 +72,8 @@ static void isp_terminal(struct t7000_isp *isp, u32 rel, u32 len)
+ 
+ /*
+  * SHAREDMALLOC request: word0 == 0 -> alloc (word1 size, min 0x1000, word2 4cc
+- * tag), reply word0 = fw-rel address | 1. word0 != 0 -> free that address,
+- * reply 1. Words 1/2 of the reply are 0 (kext 0x845ba18).
++ * tag), reply word0 = fw-rel address | 1. word0 != 0 -> free (ack only, see
++ * below), reply 1. Words 1/2 of the reply are 0 (kext 0x845ba18).
+  * A failed alloc replies 1 (= NULL) so the fw sees a failure, not a hang.
+  */
+ static u32 isp_sm_request(struct t7000_isp *isp, u32 w0, u32 size, u32 tag)
+@@ -99,13 +99,19 @@ static u32 isp_sm_request(struct t7000_isp *isp, u32 w0, u32 size, u32 tag)
+ 		return isp_rel(s->iova) | 1;
+ 	}
+ 	s = isp_surf_find(isp, isp_fw_iova + rel);
+-	if (!s || !s->sm || s->iova != isp_fw_iova + rel) {
+-		dev_warn(isp->dev, "SHAREDMALLOC: free of unknown fw-rel 0x%08x ignored\n", rel);
++	if (!s || !s->sm || s->sm_freed || s->iova != isp_fw_iova + rel) {
++		dev_warn(isp->dev, "SHAREDMALLOC: free of unknown/already freed fw-rel 0x%08x ignored\n",
++			 rel);
+ 		return 1;
+ 	}
+-	dev_info(isp->dev, "SHAREDMALLOC: free fw-rel 0x%08x (0x%x '%4.4s')\n", rel, s->size,
+-		 (char *)&s->tag);
+-	isp_surf_free(isp, s);
++	/*
++	 * Ack only. Asahi: the fw keeps using surfaces after freeing them, so
++	 * they stay mapped and are released by isp_surf_free_all() after the
++	 * ISP is powered off.
++	 */
++	s->sm_freed = true;
++	dev_info(isp->dev, "SHAREDMALLOC: free fw-rel 0x%08x (0x%x '%4.4s'): acked, kept mapped until teardown\n",
++		 rel, s->size, (char *)&s->tag);
+ 	return 1;
+ }
+ 
+diff --git a/drivers/media/platform/apple/isp-t7000/isp.h b/drivers/media/platform/apple/isp-t7000/isp.h
+index 38a6aa0fb..8eba0452e 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp.h
++++ b/drivers/media/platform/apple/isp-t7000/isp.h
+@@ -103,6 +103,7 @@ struct isp_surf {
+ 	u32 size;		/* multiple of PAGE_SIZE */
+ 	u32 tag;		/* 4cc, for logs */
+ 	bool sm;		/* allocated by a SHAREDMALLOC request */
++	bool sm_freed;		/* fw freed it: kept mapped until teardown */
+ 	unsigned int npages;
+ 	struct page **pages;
+ 	dma_addr_t *dma;

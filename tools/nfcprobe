@@ -1,0 +1,41 @@
+#!/bin/sh
+# nfcprobe - first light for the NFC controller (NXP PN548-class "stockholm" on UART3, re/NFC-HW.md §6).
+# Runs ON THE PHONE next to /tmp/mem + /tmp/i2c; needs a kernel with serial3 enabled (var/m1n1-nfc0.bin).
+# usage: sh /tmp/nfcprobe read | on | dl | off | nci [BAUD]
+#   read  read-only: pins 176-181/192, ps_uart3, PMU GPIO4 regs
+#   on    DWL=0, 500 us, VEN=0, 10 ms, VEN=1, 10 ms   (iOS PN548_HAL phTmlNfc_IoCtl, normal mode)
+#   dl    same with DWL=1 (firmware download mode - never send DL writes from here)
+#   off   VEN=0
+#   nci   on + CORE_RESET_CMD + CORE_INIT_CMD over /dev/ttySAC3, dump replies (/tmp/nfc.rx)
+# Pins are driven by MMIO read-modify-write (bits 3:0 = 0x2 out-low / 0x3 out-high) so they stay set after exit.
+P=0x20e300000; VEN=177; DWL=192; T=/dev/ttySAC3
+reg() { printf %x $((P + 4 * $1)); }
+rd() { /tmp/mem r $(reg $1) 1 | cut -d' ' -f2; }
+pin() { v=$(( 0x$(rd $1) )); /tmp/mem w $(reg $1) $(printf %x $(((v & ~0xf) | 0x2 | $2))) >/dev/null; }
+seq_on() {
+	pin $DWL $1; usleep 500
+	pin $VEN 0; usleep 10000
+	pin $VEN 1; usleep 10000
+}
+case "$1" in
+read)
+	for p in 176 177 178 179 180 181 192; do echo "pin $p = $(rd $p)"; done
+	echo "ps_uart3 = $(/tmp/mem r 20e0201b8 1 | cut -d' ' -f2)"
+	/tmp/i2c 0 74 R 0408 R 0063 R 0053 R 0073
+	ls -l $T 2>&1; dmesg | grep -i -E 'ttySAC3|a0cc000' ;;
+on) seq_on 0; echo "VEN=$(rd $VEN) DWL=$(rd $DWL)  PMU 0063=$(/tmp/i2c 0 74 R 0063)" ;;
+dl) seq_on 1; echo "VEN=$(rd $VEN) DWL=$(rd $DWL)" ;;
+off) pin $VEN 0; echo "VEN=$(rd $VEN)" ;;
+nci)
+	[ -e $T ] || { echo "no $T - wrong kernel/dtb"; exit 1; }
+	stty -F $T ${2:-115200} raw -echo crtscts || exit 1
+	seq_on 0
+	: > /tmp/nfc.rx; cat $T > /tmp/nfc.rx & c=$!
+	usleep 100000
+	printf '\040\000\001\001' > $T; usleep 300000     # CORE_RESET_CMD (reset config) -> 40 00 03 00 ..
+	printf '\040\001\000' > $T; usleep 300000         # CORE_INIT_CMD -> 40 01 .. (fw version at the end)
+	kill $c
+	echo "rx $(wc -c < /tmp/nfc.rx) bytes:"; hexdump -C /tmp/nfc.rx
+	echo "PMU 0063=$(/tmp/i2c 0 74 R 0063)  uart: $(cat /proc/tty/driver/samsung 2>/dev/null | grep '^3:')" ;;
+*) sed -n 3,9p "$0"; exit 1 ;;
+esac

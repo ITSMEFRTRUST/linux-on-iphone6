@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 17:46:59 +0000
+Subject: [PATCH 048/138] arm64: dts: apple: t7000: Give the apcie DART its DMA
+ window
+
+The PCIe complex only forwards DMA to 0x80000000..0xbfffefff to
+dart-apcie1, offset from 0x80000000: with the default full 32-bit
+aperture the first IOVA (0xbfffe000) faulted as 'NO PMD FOR IOVA at
+0x3fffe000'. Describe the window with a 5-cell specifier so the DART
+driver masks the base out of the page table index, like on the A7.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ arch/arm64/boot/dts/apple/t7000.dtsi | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/apple/t7000.dtsi b/arch/arm64/boot/dts/apple/t7000.dtsi
+index 7258425eb..f2784ec9e 100644
+--- a/arch/arm64/boot/dts/apple/t7000.dtsi
++++ b/arch/arm64/boot/dts/apple/t7000.dtsi
+@@ -487,8 +487,13 @@ pcie: pcie@610000000 {
+ 			/* The doorbell is hardwired at 0xbffff000 */
+ 			msi-ranges = <&aic AIC_IRQ 224 IRQ_TYPE_EDGE_RISING 32>;
+ 
+-			/* Only port 1 has a DART; port 0 is the unused NVMe port */
+-			iommu-map = <0x100 &dart_apcie1 0 1>;
++			/*
++			 * Only port 1 has a DART; port 0 is the unused NVMe port.
++			 * The DART only sees DMA to 0x80000000..0xbfffefff, offset
++			 * from 0x80000000 (iOS uses the same window); the doorbell
++			 * page above it is not translated.
++			 */
++			iommu-map = <0x100 &dart_apcie1 0 0x0 0x80000000 0x0 0x3ffff000 1>;
+ 			iommu-map-mask = <0xff00>;
+ 
+ 			bus-range = <0 8>;
+@@ -524,7 +529,7 @@ port01: pci@1,0 {
+ 		dart_apcie1: iommu@602002000 {
+ 			compatible = "apple,t7000-dart", "apple,s5l8960x-dart";
+ 			reg = <0x6 0x02002000 0x0 0x2000>;
+-			#iommu-cells = <1>;
++			#iommu-cells = <5>;
+ 			interrupt-parent = <&aic>;
+ 			interrupts = <AIC_IRQ 216 IRQ_TYPE_LEVEL_HIGH>;
+ 			power-domains = <&ps_pcie_ref>;

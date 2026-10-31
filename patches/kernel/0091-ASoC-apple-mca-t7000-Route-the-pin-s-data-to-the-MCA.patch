@@ -1,0 +1,152 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 22:57:14 +0000
+Subject: [PATCH 091/138] ASoC: apple: mca-t7000: Route the pin's data to the
+ MCA for capture
+
+Capture returned all-zero samples: the i2s-switch word of the MCA (AUDn)
+was left at its reset value 0x00181818, so the RX serdes sampled no
+input. Point AUDn [12:8] at the MCA's pin (PINn = n + 8, 0x00180a18 for
+MCA2 on pin 2) while a capture stream is prepared, and restore the idle
+word on hw_free. Verified by hand on the iPhone 6: with that word the
+amp's VMON/IMON slots come back.
+
+An 8-slot capture also fills the 204-byte RX shim in ~265 us, so the
+500 us refill timer overflowed it, and the dropped words rotated the
+channels. Drain at half-full instead: derive the timer period from the
+RX FIFO size and the capture frame size (133 us for 8 slots, unchanged
+500 us for 1-2 channels), clamp it to >= 50 us, and re-arm the timer
+when a stream starts next to a running one so the first tick already
+uses the shorter period.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ sound/soc/apple/mca-t7000.c | 52 ++++++++++++++++++++++++++++++++-----
+ 1 file changed, 45 insertions(+), 7 deletions(-)
+
+diff --git a/sound/soc/apple/mca-t7000.c b/sound/soc/apple/mca-t7000.c
+index a7056718b..0652994fd 100644
+--- a/sound/soc/apple/mca-t7000.c
++++ b/sound/soc/apple/mca-t7000.c
+@@ -106,6 +106,14 @@
+ #define WRAP_SWITCH_PIN(n)	(0x3000 + 4 * (n))
+ #define WRAP_SWITCH_AUD(n)	(0x3000 + 4 * ((n) + 5))
+ #define WRAP_SWITCH_PINCTL(n)	(0x303c + 4 * (n))
++/*
++ * Switch words name the node feeding each field (AUDn = n, PINn = n + 8,
++ * 0x18 = none). AUDn [12:8] is the data AUDn samples: without PINn there,
++ * the MCA's RX serdes sees nothing (all-zero capture).
++ */
++#define  SWITCH_IDLE		0x00181818
++#define  SWITCH_NODE_PIN(n)	((n) + 8)
++#define  SWITCH_AUD_RX(pin)	(0x00180018 | SWITCH_NODE_PIN(pin) << 8)
+ 
+ /* second shim wrapper page (0x20a100000) */
+ #define SHIM1_CFG		0x004
+@@ -144,7 +152,10 @@ MODULE_PARM_DESC(rx_ctl, "MCA RX control word while capturing, enable bit clear
+ 
+ static unsigned int refill_us = 500;
+ module_param(refill_us, uint, 0644);
+-MODULE_PARM_DESC(refill_us, "FIFO refill period in microseconds");
++MODULE_PARM_DESC(refill_us, "longest FIFO refill period in microseconds (capture may poll faster)");
++
++/* below this the hrtimer would eat the CPU */
++#define MCA_MIN_PERIOD_US	50
+ 
+ struct mca_dir {
+ 	struct snd_pcm_substream *substream;
+@@ -173,6 +184,7 @@ struct mca_t7000 {
+ 	struct hrtimer timer;
+ 	struct mca_dir tx, rx;
+ 	unsigned int users;		/* prepared streams, BIT(stream) */
++	unsigned int rx_period_us;	/* drain period that keeps the RX shim from overflowing */
+ 	struct mca_mclk mclk[MCA_NUM_MCLK];
+ };
+ 
+@@ -186,6 +198,20 @@ static inline u32 shim_filled(struct mca_t7000 *mca)
+ 	return FIELD_GET(COUNT_FILLED, readl_relaxed(mca->base + SHIM_RX + SHIM_COUNT));
+ }
+ 
++/*
++ * The timer serves both directions. TX is mono (96 bytes/ms), so the default
++ * period is plenty; an 8-slot capture fills the 204-byte RX shim in ~265 us,
++ * and an overflow drops words, which rotates the channels for good.
++ */
++static ktime_t mca_t7000_period(struct mca_t7000 *mca)
++{
++	unsigned int us = READ_ONCE(refill_us);
++
++	if (READ_ONCE(mca->rx.running))
++		us = min(us, mca->rx_period_us);
++	return us_to_ktime(max(us, MCA_MIN_PERIOD_US));
++}
++
+ static unsigned int mca_t7000_period_step(struct mca_dir *d, unsigned int moved)
+ {
+ 	struct snd_pcm_runtime *runtime = d->substream->runtime;
+@@ -275,7 +301,7 @@ static enum hrtimer_restart mca_t7000_timer(struct hrtimer *timer)
+ 	if (!READ_ONCE(mca->tx.running) && !READ_ONCE(mca->rx.running))
+ 		return HRTIMER_NORESTART;
+ 
+-	hrtimer_forward_now(timer, us_to_ktime(refill_us));
++	hrtimer_forward_now(timer, mca_t7000_period(mca));
+ 	return HRTIMER_RESTART;
+ }
+ 
+@@ -348,7 +374,7 @@ static void mca_t7000_hw_init(struct mca_t7000 *mca)
+ 	writel(FRAME_CFG_8X16 | FRAME_CFG_MASTER, mca->base + MCA_FRAME_CFG);
+ 
+ 	/* route MCAn's data out to its I2S pins; the pins clock from the MCA */
+-	writel(0x00181818, mca->wrap + WRAP_SWITCH_AUD(mca->index));
++	writel(SWITCH_IDLE, mca->wrap + WRAP_SWITCH_AUD(mca->index));
+ 	writel(0x00180000 | (mca->index << 8) | mca->index,
+ 	       mca->wrap + WRAP_SWITCH_PIN(mca->pin));
+ 	writel(0x11, mca->wrap + WRAP_SWITCH_PINCTL(mca->pin));
+@@ -441,6 +467,12 @@ static int mca_t7000_dai_prepare(struct snd_pcm_substream *substream,
+ 		ch = substream->runtime->channels;
+ 		writel(GENMASK(rx_slot_base + ch - 1, rx_slot_base),
+ 		       mca->base + MCA_RX_MASK);
++		/* the pin's data into this MCA, or RX samples nothing */
++		writel(SWITCH_AUD_RX(mca->pin),
++		       mca->wrap + WRAP_SWITCH_AUD(mca->index));
++		/* drain at half full: ch * 2 bytes arrive per frame */
++		mca->rx_period_us = rx_fifo_bytes / 2 * USEC_PER_SEC /
++				    (MCA_RATE * frames_to_bytes(substream->runtime, 1));
+ 	}
+ 	return 0;
+ }
+@@ -451,6 +483,8 @@ static int mca_t7000_dai_hw_free(struct snd_pcm_substream *substream,
+ 	struct mca_t7000 *mca = snd_soc_dai_get_drvdata(dai);
+ 
+ 	mca->users &= ~BIT(substream->stream);
++	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE)
++		writel(SWITCH_IDLE, mca->wrap + WRAP_SWITCH_AUD(mca->index));
+ 	if (!mca->users)
+ 		writel(FRAME_CFG_8X16 | FRAME_CFG_MASTER,
+ 		       mca->base + MCA_FRAME_CFG);
+@@ -522,7 +556,7 @@ static void mca_t7000_timer_sync(struct mca_t7000 *mca)
+ {
+ 	hrtimer_cancel(&mca->timer);
+ 	if (READ_ONCE(mca->tx.running) || READ_ONCE(mca->rx.running))
+-		hrtimer_start(&mca->timer, us_to_ktime(refill_us),
++		hrtimer_start(&mca->timer, mca_t7000_period(mca),
+ 			      HRTIMER_MODE_REL_HARD);
+ }
+ 
+@@ -614,9 +648,13 @@ static int mca_t7000_pcm_trigger(struct snd_soc_component *component,
+ 			writel(rx_ctl | RX_CTL_EN, mca->base + MCA_RX_CTL);
+ 		}
+ 		WRITE_ONCE(d->running, true);
+-		if (!READ_ONCE(other->running))
+-			hrtimer_start(&mca->timer, us_to_ktime(refill_us),
+-				      HRTIMER_MODE_REL_HARD);
++		/*
++		 * (Re)arm even when the other direction runs: a capture
++		 * starting next to playback needs the shorter period from
++		 * the first tick on.
++		 */
++		hrtimer_start(&mca->timer, mca_t7000_period(mca),
++			      HRTIMER_MODE_REL_HARD);
+ 		return 0;
+ 	case SNDRV_PCM_TRIGGER_STOP:
+ 	case SNDRV_PCM_TRIGGER_SUSPEND:

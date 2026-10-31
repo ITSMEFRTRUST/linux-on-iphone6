@@ -1,0 +1,440 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 01:08:46 +0000
+Subject: [PATCH 075/138] drm: adp: t7000: Time the layer switch by the VBI,
+ detect a stalled pipe
+
+On hw, 50 debugfs power off/on cycles while Orchard was page flipping
+ended in three underruns and a stalled pipe: frame counter frozen,
+IRQ_STATUS RdErr (bit 11), no more VBI, VFTG still running. After that
+every DPMS off blocked for ~20 s on flip_done/commit timeouts.
+
+The layer switch was a direct LAYER_CTL write at an arbitrary point of
+the frame, and the debugfs path did it unlocked, racing the BASE/STRIDE
+writes of in-flight flips.
+
+- LAYER_CTL is now written from the VBI interrupt only: the caller arms
+  the value, takes a vblank reference and waits (100 ms max) for the
+  handler to write it, then one more frame. Without a usable vblank the
+  layer is left on (off path) or written directly as a last resort
+  (on path). The CRTC paths now switch the layer while vblank is on:
+  before drm_crtc_vblank_off() on disable, after drm_crtc_vblank_on()
+  on enable.
+- debugfs "power" takes all modeset locks, waits until the CRTC's last
+  commit is done with the hardware and has sent its event, and refuses
+  (-EBUSY) while the CRTC is off.
+- A VBI watchdog runs while vblank is enabled. With no VBI for 300 ms it
+  reports the stall with the pipe registers once, masks the block,
+  disables the line and switches to the existing 60 Hz hrtimer vblank,
+  so flips, vblank waits and DPMS keep completing. iOS treats RdErr,
+  PFAlign, PFOver and underrun as fatal and panics; there is no
+  in-place recovery to copy, so the screen still needs a reboot.
+- debugfs "power" shows the VBI count and the stall state.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/gpu/drm/adp/adp-t7000.c | 252 +++++++++++++++++++++++++++++---
+ 1 file changed, 230 insertions(+), 22 deletions(-)
+
+diff --git a/drivers/gpu/drm/adp/adp-t7000.c b/drivers/gpu/drm/adp/adp-t7000.c
+index 4139c1cd4..68f44e8a1 100644
+--- a/drivers/gpu/drm/adp/adp-t7000.c
++++ b/drivers/gpu/drm/adp/adp-t7000.c
+@@ -41,6 +41,8 @@
+ #include <linux/of_reserved_mem.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_domain.h>
++#include <linux/wait.h>
++#include <linux/workqueue.h>
+ 
+ #include <drm/drm_atomic.h>
+ #include <drm/drm_atomic_helper.h>
+@@ -56,6 +58,7 @@
+ #include <drm/drm_gem_framebuffer_helper.h>
+ #include <drm/drm_ioctl.h>
+ #include <drm/drm_managed.h>
++#include <drm/drm_modeset_lock.h>
+ #include <drm/drm_modeset_helper_vtables.h>
+ #include <drm/drm_print.h>
+ #include <drm/drm_probe_helper.h>
+@@ -129,11 +132,18 @@
+ #define PANEL_SLEEP_MS		120
+ 
+ /*
+- * A direct ADP register write latches at the next frame start (verified for pipe 0 BASE on hw);
+- * two frames at 60 Hz is the wait before relying on a LAYER_CTL change. iOS instead polls the
+- * IRQ status for packet-done/-missed with 1 ms sleeps (@0xfffffff0088ee778).
++ * LAYER_CTL is only ever written from the VBI interrupt (adpt_layer_ctl_sync()): a direct write at an
++ * arbitrary point of the frame, racing page flips, ended in underruns and a stalled pipe (RdErr) on hw.
++ * iOS sends it through the param FIFO, which applies it at a frame boundary; its packet encoding is
++ * untested here, so the write is timed by the VBI instead. One more frame (ADPT_LATCH_MS) covers a
++ * shadowed register latching at the following frame start.
+  */
+-#define ADPT_LATCH_MS		34
++#define ADPT_LATCH_MS		20
++#define ADPT_LAYER_TIMEOUT_MS	100
++
++/* stall watchdog: vblank enabled but no VBI for ADPT_WD_MISSES periods = the pipe stopped */
++#define ADPT_WD_PERIOD_MS	100
++#define ADPT_WD_MISSES		3
+ 
+ #define DART_TCR		0x0c
+ #define DART_TTBR(sid, i)	(0x40 + 0x10 * (sid) + 4 * (i))
+@@ -228,6 +238,19 @@ struct adpt {
+ 	bool scanout_off;	/* we cleared the layer: only then is layer_ctl written back */
+ 	u32 layer_ctl;		/* ADP_LAYER_CTL before scanout off */
+ 	u32 irq_en_off;		/* non-VBI ADP_IRQ_EN bits masked by scanout off */
++
++	/* LAYER_CTL write armed for the next VBI (under irq_lock) */
++	bool layer_armed;
++	u32 layer_req;
++	wait_queue_head_t layer_wq;
++
++	/* VBI watchdog */
++	struct delayed_work vbl_wd;
++	unsigned int vbi_count;	/* real VBIs seen by the IRQ handler */
++	unsigned int wd_last;
++	unsigned int wd_misses;
++	bool vbl_on;		/* DRM vblank enabled */
++	bool stalled;		/* the watchdog gave up on the pipe */
+ };
+ 
+ #define to_adpt(x) container_of(x, struct adpt, drm)
+@@ -456,6 +479,22 @@ static irqreturn_t adpt_irq(int irq, void *arg)
+ 	if (!test_noack)
+ 		writel(st, adp->adp + ADP_IRQ_STATUS);	/* W1C, as iOS does */
+ 
++	if (st & ADP_IRQ_VBI) {
++		bool done = false;
++
++		/* first thing in the blanking: the armed LAYER_CTL write, if any */
++		spin_lock(&adp->irq_lock);
++		if (adp->layer_armed) {
++			writel(adp->layer_req, adp->adp + ADP_LAYER_CTL);
++			adp->layer_armed = false;
++			done = true;
++		}
++		spin_unlock(&adp->irq_lock);
++		if (done)
++			wake_up(&adp->layer_wq);
++		WRITE_ONCE(adp->vbi_count, adp->vbi_count + 1);
++	}
++
+ 	if (st & ADP_IRQ_ERRORS)
+ 		drm_err_ratelimited(&adp->drm, "ADP error status %08x%s%s%s%s%s\n", st,
+ 				    st & ADP_IRQ_UNDERRUN ? " underrun" : "",
+@@ -468,6 +507,62 @@ static irqreturn_t adpt_irq(int irq, void *arg)
+ 	return IRQ_HANDLED;
+ }
+ 
++/*
++ * The pipe stopped: vblank is enabled but no VBI came for ADPT_WD_MISSES * ADPT_WD_PERIOD_MS. Seen on
++ * hw after racing LAYER_CTL writes: frame counter frozen, IRQ_STATUS RdErr (bit 11), VFTG still
++ * "running". iOS has no recovery either: RdErr, PFAlign, PFOver and (unless disabled by boot-arg)
++ * underrun are "fatal error" in AppleH7DisplayPipe's interrupt filter (@0xfffffff0088e8b04, mask 0xa42)
++ * and it panics (@0xfffffff0088e8e8c), i.e. the pipe only comes back through a full re-init. Here: say
++ * so once, and switch to the storm guard's fallback (line off, 60 Hz hrtimer vblank) so flips, vblank
++ * waits and DPMS keep completing instead of blocking for seconds. The screen needs a reboot.
++ */
++static void adpt_pipe_stalled(struct adpt *adp)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&adp->irq_lock, flags);
++	if (adp->irq_dead) {
++		spin_unlock_irqrestore(&adp->irq_lock, flags);
++		return;
++	}
++	adp->irq_dead = true;
++	adp->stalled = true;
++	adp->layer_armed = false;
++	writel(0, adp->adp + ADP_IRQ_EN);
++	spin_unlock_irqrestore(&adp->irq_lock, flags);
++	wake_up(&adp->layer_wq);
++
++	disable_irq(adp->irq);
++	hrtimer_start(&adp->vbl_timer, adp->vbl_period, HRTIMER_MODE_REL_HARD);
++	drm_err(&adp->drm,
++		"display pipe stalled: no vblank for %u ms (IRQ_STATUS %08x, frame %04x, VFTG %08x, LAYER_CTL %08x); timer vblank from now on, reboot to get the screen back\n",
++		ADPT_WD_MISSES * ADPT_WD_PERIOD_MS, readl(adp->adp + ADP_IRQ_STATUS),
++		readl(adp->adp + ADP_FRAME_COUNT) & 0xffff, readl(adp->adbe + ADBE_VFTG_CTL),
++		readl(adp->adp + ADP_LAYER_CTL));
++}
++
++static void adpt_vbl_wd(struct work_struct *work)
++{
++	struct adpt *adp = container_of(to_delayed_work(work), struct adpt, vbl_wd);
++	unsigned int n = READ_ONCE(adp->vbi_count);
++
++	if (!READ_ONCE(adp->vbl_on) || READ_ONCE(adp->irq_dead))
++		return;
++	if (n != adp->wd_last) {
++		adp->wd_last = n;
++		adp->wd_misses = 0;
++	} else if (++adp->wd_misses >= ADPT_WD_MISSES) {
++		adpt_pipe_stalled(adp);
++		return;
++	}
++	schedule_delayed_work(&adp->vbl_wd, msecs_to_jiffies(ADPT_WD_PERIOD_MS));
++}
++
++static void adpt_vbl_wd_cancel(void *arg)
++{
++	cancel_delayed_work_sync(&((struct adpt *)arg)->vbl_wd);
++}
++
+ /* ---------------------------------------------------------------- panel: DCS over the DSI host */
+ 
+ /* one DCS short write without parameter, on virtual channel 0 */
+@@ -545,10 +640,48 @@ static void adpt_panel_wake_locked(struct adpt *adp)
+  * known, so VFTG, the DSI link (no ULPS on n61 either) and the power domains stay on.
+  * Called with panel_lock held and inside drm_dev_enter().
+  */
++/*
++ * Write LAYER_CTL from the next VBI interrupt and wait for it (plus one frame). Needs DRM vblank to be
++ * usable (CRTC on); fails without touching the register when it is not, when the line is gone (storm
++ * guard / stall) or when no VBI comes within ADPT_LAYER_TIMEOUT_MS.
++ */
++static int adpt_layer_ctl_sync(struct adpt *adp, u32 val)
++{
++	unsigned long flags;
++	bool armed;
++	int ret;
++
++	if (READ_ONCE(adp->irq_dead))
++		return -EIO;
++	ret = drm_crtc_vblank_get(&adp->crtc);
++	if (ret)
++		return ret;
++	spin_lock_irqsave(&adp->irq_lock, flags);
++	adp->layer_req = val;
++	adp->layer_armed = true;
++	spin_unlock_irqrestore(&adp->irq_lock, flags);
++
++	wait_event_timeout(adp->layer_wq, !READ_ONCE(adp->layer_armed),
++			   msecs_to_jiffies(ADPT_LAYER_TIMEOUT_MS));
++
++	spin_lock_irqsave(&adp->irq_lock, flags);
++	armed = adp->layer_armed;	/* still armed = never written */
++	adp->layer_armed = false;
++	spin_unlock_irqrestore(&adp->irq_lock, flags);
++	drm_crtc_vblank_put(&adp->crtc);
++	if (armed || READ_ONCE(adp->stalled))
++		return -ETIMEDOUT;
++	if (fifo_sync)
++		adpt_fifo_kick(adp);
++	msleep(ADPT_LATCH_MS);
++	return 0;
++}
++
+ static void adpt_scanout_off_locked(struct adpt *adp)
+ {
+ 	unsigned long flags;
+ 	u32 ctl;
++	int ret;
+ 
+ 	if (adp->scanout_off)
+ 		return;
+@@ -559,30 +692,38 @@ static void adpt_scanout_off_locked(struct adpt *adp)
+ 	spin_unlock_irqrestore(&adp->irq_lock, flags);
+ 
+ 	ctl = readl(adp->adp + ADP_LAYER_CTL);
++	ret = adpt_layer_ctl_sync(adp, ctl & ADP_LAYER_CTL_KEEP);
++	if (ret) {
++		/* layer untouched: unmask again and leave the pipe scanning */
++		adpt_irq_en(adp, adp->irq_en_off, 0);
++		drm_warn(&adp->drm, "scanout off skipped: no vblank to time the layer write (%d)\n", ret);
++		return;
++	}
+ 	adp->layer_ctl = ctl;
+-	writel(ctl & ADP_LAYER_CTL_KEEP, adp->adp + ADP_LAYER_CTL);
+-	if (fifo_sync)
+-		adpt_fifo_kick(adp);
+ 	adp->scanout_off = true;
+-	msleep(ADPT_LATCH_MS);
+ 	drm_dbg_driver(&adp->drm, "scanout off: LAYER_CTL %08x -> %08x, IRQ_EN masked %08x\n", ctl,
+ 		       readl(adp->adp + ADP_LAYER_CTL), adp->irq_en_off);
+ }
+ 
+ static void adpt_scanout_on_locked(struct adpt *adp)
+ {
++	int ret;
++
+ 	if (!adp->scanout_off)
+ 		return;
+ 
+-	writel(adp->layer_ctl, adp->adp + ADP_LAYER_CTL);
+-	if (fifo_sync)
+-		adpt_fifo_kick(adp);
++	/* the first frame the panel shows after wake has the layer */
++	ret = adpt_layer_ctl_sync(adp, adp->layer_ctl);
++	if (ret) {
++		/* no VBI (pipe stalled, or no vblank yet): write it anyway, nothing else can bring it back */
++		drm_warn(&adp->drm, "scanout on without vblank (%d): direct LAYER_CTL write\n", ret);
++		writel(adp->layer_ctl, adp->adp + ADP_LAYER_CTL);
++	}
+ 	/* drop what latched while masked (W1C, as iOS), then unmask what was enabled before */
+ 	if (!test_noack)
+ 		writel(readl(adp->adp + ADP_IRQ_STATUS) & adp->irq_en_off, adp->adp + ADP_IRQ_STATUS);
+ 	adpt_irq_en(adp, adp->irq_en_off, 0);
+ 	adp->scanout_off = false;
+-	msleep(ADPT_LATCH_MS);	/* the first frame the panel shows after wake has the layer */
+ }
+ 
+ /*
+@@ -677,9 +818,11 @@ static int adpt_power_show(struct seq_file *m, void *unused)
+ 	int idx;
+ 
+ 	mutex_lock(&adp->panel_lock);
+-	seq_printf(m, "scanout %s, panel %s%s; deep_off=%d panel_sleep=%d\n", adp->scanout_off ? "off" : "on",
+-		   adp->panel_asleep ? "asleep" : "awake", adp->dsi ? "" : " (no DSI)", READ_ONCE(deep_off),
+-		   READ_ONCE(panel_sleep));
++	seq_printf(m, "scanout %s, panel %s%s%s; deep_off=%d panel_sleep=%d; vbi %u\n",
++		   adp->scanout_off ? "off" : "on", adp->panel_asleep ? "asleep" : "awake",
++		   adp->dsi ? "" : " (no DSI)",
++		   adp->stalled ? "; PIPE STALLED (timer vblank)" : adp->irq_dead ? "; IRQ off (timer vblank)" : "",
++		   READ_ONCE(deep_off), READ_ONCE(panel_sleep), READ_ONCE(adp->vbi_count));
+ 	if (drm_dev_enter(&adp->drm, &idx)) {
+ 		seq_printf(m, "LAYER_CTL %08x (saved %08x) IRQ_EN %08x (masked %08x) IRQ_STATUS %08x frame %04x VFTG %08x\n",
+ 			   readl(adp->adp + ADP_LAYER_CTL), adp->layer_ctl, readl(adp->adp + ADP_IRQ_EN),
+@@ -696,20 +839,67 @@ static int adpt_power_open(struct inode *inode, struct file *file)
+ 	return single_open(file, adpt_power_show, inode->i_private);
+ }
+ 
++/* the CRTC's newest commit has written its registers and sent its event (caller holds the modeset locks) */
++static int adpt_wait_commit_idle(struct adpt *adp)
++{
++	struct drm_crtc *crtc = &adp->crtc;
++	struct drm_crtc_commit *commit;
++	int ret = 0;
++
++	spin_lock(&crtc->commit_lock);
++	commit = list_first_entry_or_null(&crtc->commit_list, struct drm_crtc_commit, commit_entry);
++	if (commit)
++		drm_crtc_commit_get(commit);
++	spin_unlock(&crtc->commit_lock);
++	if (!commit)
++		return 0;
++	if (!wait_for_completion_timeout(&commit->hw_done, HZ) ||
++	    !wait_for_completion_timeout(&commit->flip_done, HZ))
++		ret = -ETIMEDOUT;
++	drm_crtc_commit_put(commit);
++	return ret;
++}
++
++/*
++ * Same exclusion as an atomic commit: all modeset locks (no new commit or flip can start), then wait
++ * until the last one is done with the hardware, so no BASE/STRIDE write races the layer change. Only
++ * while the CRTC is on: with it off the pipe belongs to the DPMS path.
++ */
++static int adpt_power_set(struct adpt *adp, bool off)
++{
++	struct drm_device *drm = &adp->drm;
++	struct drm_modeset_acquire_ctx ctx;
++	int ret;
++
++	DRM_MODESET_LOCK_ALL_BEGIN(drm, ctx, 0, ret);
++	if (!adp->crtc.state->active) {
++		ret = -EBUSY;
++	} else {
++		ret = adpt_wait_commit_idle(adp);
++		if (!ret && off)
++			adpt_display_off(adp, true, true);
++		else if (!ret)
++			adpt_display_on(adp, true);
++	}
++	DRM_MODESET_LOCK_ALL_END(drm, ctx, ret);
++	return ret;
++}
++
+ static ssize_t adpt_power_write(struct file *file, const char __user *ubuf, size_t len, loff_t *ppos)
+ {
+ 	struct adpt *adp = ((struct seq_file *)file->private_data)->private;
+ 	char buf[8] = {};
++	int ret;
+ 
+ 	if (copy_from_user(buf, ubuf, min(len, sizeof(buf) - 1)))
+ 		return -EFAULT;
+ 	if (sysfs_streq(buf, "off"))
+-		adpt_display_off(adp, true, true);
++		ret = adpt_power_set(adp, true);
+ 	else if (sysfs_streq(buf, "on"))
+-		adpt_display_on(adp, true);
++		ret = adpt_power_set(adp, false);
+ 	else
+ 		return -EINVAL;
+-	return len;
++	return ret ?: len;
+ }
+ 
+ static const struct file_operations adpt_power_fops = {
+@@ -806,8 +996,8 @@ static enum drm_mode_status adpt_crtc_mode_valid(struct drm_crtc *crtc, const st
+ 
+ static void adpt_crtc_atomic_enable(struct drm_crtc *crtc, struct drm_atomic_commit *state)
+ {
++	drm_crtc_vblank_on(crtc);			/* first: the layer write is timed by the VBI */
+ 	adpt_display_on(to_adpt(crtc->dev), true);	/* no-op unless this driver turned it off */
+-	drm_crtc_vblank_on(crtc);
+ }
+ 
+ static void adpt_crtc_atomic_disable(struct drm_crtc *crtc, struct drm_atomic_commit *state)
+@@ -824,9 +1014,12 @@ static void adpt_crtc_atomic_disable(struct drm_crtc *crtc, struct drm_atomic_co
+ 	}
+ 	spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
+ 
+-	/* timings keep running: see adpt_scanout_off_locked() for why VFTG is not stopped */
++	/*
++	 * Only with panel_sleep=1 or deep_off=1. Before vblank off: the layer write is timed by the VBI.
++	 * Timings keep running: see adpt_scanout_off_locked() for why VFTG is not stopped.
++	 */
++	adpt_display_off(adp, false, false);
+ 	drm_crtc_vblank_off(crtc);
+-	adpt_display_off(adp, false, false);	/* only with panel_sleep=1 or deep_off=1 */
+ }
+ 
+ static void adpt_crtc_atomic_flush(struct drm_crtc *crtc, struct drm_atomic_commit *state)
+@@ -862,6 +1055,12 @@ static int adpt_crtc_enable_vblank(struct drm_crtc *crtc)
+ 
+ 	writel(ADP_IRQ_VBI, adp->adp + ADP_IRQ_STATUS);
+ 	adpt_irq_en(adp, ADP_IRQ_VBI, 0);
++	if (!READ_ONCE(adp->irq_dead)) {
++		adp->wd_last = READ_ONCE(adp->vbi_count);
++		adp->wd_misses = 0;
++		WRITE_ONCE(adp->vbl_on, true);
++		mod_delayed_work(system_wq, &adp->vbl_wd, msecs_to_jiffies(ADPT_WD_PERIOD_MS));
++	}
+ 	return 0;
+ }
+ 
+@@ -869,6 +1068,7 @@ static void adpt_crtc_disable_vblank(struct drm_crtc *crtc)
+ {
+ 	struct adpt *adp = to_adpt(crtc->dev);
+ 
++	WRITE_ONCE(adp->vbl_on, false);	/* the watchdog stops by itself */
+ 	adpt_irq_en(adp, 0, ADP_IRQ_VBI);
+ }
+ 
+@@ -1286,6 +1486,12 @@ static int adpt_probe(struct platform_device *pdev)
+ 	hrtimer_setup(&adp->vbl_timer, adpt_vbl_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_HARD);
+ 	/* devm runs in reverse: free_irq first, then this, so the timer can't be restarted after it */
+ 	ret = devm_add_action_or_reset(dev, adpt_vbl_timer_cancel, adp);
++	if (ret)
++		return ret;
++	init_waitqueue_head(&adp->layer_wq);
++	INIT_DELAYED_WORK(&adp->vbl_wd, adpt_vbl_wd);
++	/* before the timer cancel above runs: the watchdog may start the timer */
++	ret = devm_add_action_or_reset(dev, adpt_vbl_wd_cancel, adp);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -1326,7 +1532,9 @@ static void adpt_remove(struct platform_device *pdev)
+ 	adpt_display_on(adp, true);
+ 	drm_dev_unplug(&adp->drm);
+ 	drm_atomic_helper_shutdown(&adp->drm);
+-	hrtimer_cancel(&adp->vbl_timer);	/* no-op unless the storm guard started it */
++	WRITE_ONCE(adp->vbl_on, false);
++	cancel_delayed_work_sync(&adp->vbl_wd);
++	hrtimer_cancel(&adp->vbl_timer);	/* no-op unless the storm guard or the watchdog started it */
+ 	/* back to iBoot's register state; the image there is whatever was last drawn into vram+0 */
+ 	writel(adp->boot.stride, adp->adp + PIPE(0) + PIPE_STRIDE);
+ 	writel(adp->boot.base, adp->adp + PIPE(0) + PIPE_BASE);

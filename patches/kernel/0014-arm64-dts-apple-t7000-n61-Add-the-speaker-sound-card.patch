@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 22:56:12 +0000
+Subject: [PATCH 014/138] arm64: dts: apple: t7000-n61: Add the speaker sound
+ card
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ arch/arm64/boot/dts/apple/t7000-n61.dts | 34 ++++++++++++++++++++-----
+ 1 file changed, 28 insertions(+), 6 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/apple/t7000-n61.dts b/arch/arm64/boot/dts/apple/t7000-n61.dts
+index b27cef4ef..e6fc3b4be 100644
+--- a/arch/arm64/boot/dts/apple/t7000-n61.dts
++++ b/arch/arm64/boot/dts/apple/t7000-n61.dts
+@@ -13,6 +13,28 @@
+ / {
+ 	compatible = "apple,n61", "apple,t7000", "apple,arm-platform";
+ 	model = "Apple iPhone 6";
++
++	sound {
++		compatible = "simple-audio-card";
++		simple-audio-card,name = "iPhone 6";
++		simple-audio-card,format = "dsp_a";
++		simple-audio-card,bitclock-master = <&speaker_cpu>;
++		simple-audio-card,frame-master = <&speaker_cpu>;
++
++		speaker_cpu: simple-audio-card,cpu {
++			sound-dai = <&mca2>;
++		};
++
++		simple-audio-card,codec {
++			sound-dai = <&speaker_amp>;
++			/* MCLK pad = 24 MHz nclk / 2 */
++			system-clock-frequency = <12000000>;
++		};
++	};
++};
++
++&mca2 {
++	status = "okay";
+ };
+ 
+ &i2c1 {
+@@ -28,11 +50,6 @@ haptics@5a {
+ 		vib-overdrive-mv = <3320>;
+ 	};
+ 
+-	/*
+-	 * Values from the "speaker-config" property of the iOS device tree.
+-	 * The IRQ (GPIO 47) is left out until its polarity is known; VA/VP
+-	 * come from the PMU and are not described yet.
+-	 */
+ 	charger@75 {
+ 		compatible = "ti,sn2400";
+ 		reg = <0x75>;
+@@ -40,7 +57,12 @@ charger@75 {
+ 		constant-charge-current-max-microamp = <1000000>;
+ 	};
+ 
+-	speaker-amp@40 {
++	/*
++	 * Values from the "speaker-config" property of the iOS device tree.
++	 * The IRQ (GPIO 47) is left out until its polarity is known; VA/VP
++	 * come from the PMU and are not described yet.
++	 */
++	speaker_amp: speaker-amp@40 {
+ 		compatible = "cirrus,cs35l19";
+ 		reg = <0x40>;
+ 		reset-gpios = <&pinctrl 49 GPIO_ACTIVE_HIGH>;

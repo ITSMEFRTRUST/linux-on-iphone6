@@ -1,0 +1,427 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 22:05:29 +0000
+Subject: [PATCH 011/138] ASoC: dt-bindings: cirrus,cs35l33: Convert to DT
+ schema
+
+Convert the CS35L33/CS35L19 speaker amplifier binding to DT schema.
+The cs35l19-only properties are restricted to that compatible, the
+H/G algorithm sub-node is described via $defs, and the example is
+fixed (missing semicolon, bogus ldo-path-disable value, boost-ipk
+in uA).
+
+Assisted-by: Claude:claude-sonnet-5-5
+---
+ .../bindings/sound/cirrus,cs35l33.yaml        | 258 ++++++++++++++++++
+ .../devicetree/bindings/sound/cs35l33.txt     | 137 ----------
+ 2 files changed, 258 insertions(+), 137 deletions(-)
+ create mode 100644 Documentation/devicetree/bindings/sound/cirrus,cs35l33.yaml
+ delete mode 100644 Documentation/devicetree/bindings/sound/cs35l33.txt
+
+diff --git a/Documentation/devicetree/bindings/sound/cirrus,cs35l33.yaml b/Documentation/devicetree/bindings/sound/cirrus,cs35l33.yaml
+new file mode 100644
+index 000000000..0c9988e28
+--- /dev/null
++++ b/Documentation/devicetree/bindings/sound/cirrus,cs35l33.yaml
+@@ -0,0 +1,258 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/sound/cirrus,cs35l33.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Cirrus Logic CS35L33 / CS35L19 Speaker Amplifier
++
++maintainers:
++  - David Rhodes <david.rhodes@cirrus.com>
++  - patches@opensource.cirrus.com
++
++description:
++  CS35L33 and CS35L19 are boosted mono Class D amplifiers with an internal
++  Class H/G algorithm that controls the amplifier supplies.
++
++allOf:
++  - $ref: dai-common.yaml#
++  - if:
++      properties:
++        compatible:
++          contains:
++            const: cirrus,cs35l33
++    then:
++      properties:
++        cirrus,boost-slew-step: false
++        cirrus,boost-coeffs: false
++        cirrus,trim: false
++
++properties:
++  compatible:
++    enum:
++      - cirrus,cs35l33
++      - cirrus,cs35l19
++
++  reg:
++    maxItems: 1
++
++  '#sound-dai-cells':
++    const: 0
++
++  VA-supply:
++    description: Voltage regulator of the analog internal section
++
++  VP-supply:
++    description: Voltage regulator of the boost converter
++
++  reset-gpios:
++    maxItems: 1
++
++  interrupts:
++    maxItems: 1
++
++  cirrus,boost-ctl:
++    description:
++      Booster voltage used to supply the amplifier. If the value is 0, then
++      VBST = VP. If greater than 0, the boost voltage will be 3300mV with a
++      value of 1 and will increase at a step size of 100mV until a maximum of
++      8000mV.
++    $ref: /schemas/types.yaml#/definitions/uint32
++    minimum: 0
++    maximum: 0x30
++
++  cirrus,ramp-rate:
++    description:
++      On power up, it affects the time from when the power up sequence begins
++      to the time the audio reaches a full-scale output. On power down, it
++      affects the time from when the power-down sequence begins to when the
++      amplifier disables the PWM outputs. If this property is not set then
++      soft ramping will be disabled and ramp time would be 20ms. If this
++      property is set to 0,1,2,3 then ramp times would be 40ms, 60ms, 100ms,
++      175ms respectively for 48KHz sample rate.
++    $ref: /schemas/types.yaml#/definitions/uint32
++    minimum: 0
++    maximum: 3
++
++  cirrus,boost-ipk:
++    description:
++      The maximum current allowed for the boost converter, in uA. The range
++      starts at 1850000uA and goes to a maximum of 3600000uA with a step size
++      of 15625uA.
++    $ref: /schemas/types.yaml#/definitions/uint32
++    minimum: 1850000
++    maximum: 3600000
++    default: 2500000
++
++  cirrus,imon-adc-scale:
++    description:
++      Configures the scaling of data bits from the IMON ADC data word. This
++      property can be set as a value of 0 for bits 15 down to 0, 6 for 21 down
++      to 6, 7 for 22 down to 7, 8 for 23 down to 8.
++    $ref: /schemas/types.yaml#/definitions/uint32
++    enum: [0, 6, 7, 8]
++
++  cirrus,boost-slew-step:
++    description: Boost converter VBST slew step. CS35L19 only.
++    $ref: /schemas/types.yaml#/definitions/uint32
++    minimum: 0
++    maximum: 3
++
++  cirrus,boost-coeffs:
++    description:
++      Four bytes for the boost loop coefficient registers 0x3A to 0x3D.
++      CS35L19 only.
++    $ref: /schemas/types.yaml#/definitions/uint8-array
++    minItems: 4
++    maxItems: 4
++
++  cirrus,trim:
++    description:
++      Three bytes of board specific trim, written to the registers 0x46, 0x54
++      and 0x66. CS35L19 only.
++    $ref: /schemas/types.yaml#/definitions/uint8-array
++    minItems: 3
++    maxItems: 3
++
++  cirrus,hg-algo:
++    description:
++      Sub-node enabling the internal Class H/G algorithm that controls the
++      amplifier supplies.
++    $ref: '#/$defs/hg-algo'
++
++required:
++  - compatible
++  - reg
++  - VA-supply
++  - VP-supply
++
++unevaluatedProperties: false
++
++$defs:
++  hg-algo:
++    type: object
++    additionalProperties: false
++
++    properties:
++      cirrus,mem-depth:
++        description:
++          Memory depth for the Class H/G algorithm measured in LRCLK cycles.
++          If this property is set to 0, 1, 2, or 3 then the memory depths will
++          be 1, 4, 8, 16 LRCLK cycles. The default is 16 LRCLK cycles.
++        $ref: /schemas/types.yaml#/definitions/uint32
++        minimum: 0
++        maximum: 3
++
++      cirrus,release-rate:
++        description:
++          The number of consecutive LRCLK periods before allowing release
++          condition tracking updates.
++        $ref: /schemas/types.yaml#/definitions/uint32
++        minimum: 3
++        maximum: 255
++
++      cirrus,hd-rm:
++        description:
++          Class H/G headroom. Defaults to 0 when the sub-node is present.
++        $ref: /schemas/types.yaml#/definitions/uint32
++        minimum: 0
++        maximum: 0x7f
++
++      cirrus,ldo-thld:
++        description:
++          Configures the signal threshold at which the PWM output stage enters
++          LDO operation. Starts as a default value of 50mV for a value of 1
++          and increases with a step size of 50mV to a maximum of 750mV (value
++          of 0xF).
++        $ref: /schemas/types.yaml#/definitions/uint32
++        minimum: 1
++        maximum: 0xf
++
++      cirrus,ldo-path-disable:
++        description:
++          1 = the H/G algorithm uses the max detection path, 0 = the LDO
++          detection path is used.
++        $ref: /schemas/types.yaml#/definitions/uint32
++        enum: [0, 1]
++
++      cirrus,ldo-entry-delay:
++        description:
++          The LDO entry delay before the H/G algorithm switches to the LDO
++          voltage. This property can be set to values from 0 to 7 for delays
++          of 5ms, 10ms, 50ms, 100ms, 200ms, 500ms, 1000ms. The default is
++          100ms.
++        $ref: /schemas/types.yaml#/definitions/uint32
++        minimum: 0
++        maximum: 7
++
++      cirrus,vp-hg-auto:
++        description: When set, class H/G VPhg automatic updating is enabled.
++        type: boolean
++
++      cirrus,vp-hg:
++        description:
++          Class H/G algorithm VPhg. Controls the H/G algorithm's reference to
++          the VP voltage for when to start generating a boosted VBST. The
++          reference voltage starts at 3000mV with a value of 0x3 and is
++          increased by 100mV per step to a maximum of 5500mV.
++        $ref: /schemas/types.yaml#/definitions/uint32
++        minimum: 0x3
++        maximum: 0x1c
++
++      cirrus,vp-hg-rate:
++        description:
++          The rate (number of LRCLK periods) at which the VPhg is allowed to
++          increase to a higher voltage when using VPhg automatic tracking.
++          Values 0 to 3 select rates of 128 periods, 2048 periods, 32768
++          periods and 524288 periods. The default is 32768 periods.
++        $ref: /schemas/types.yaml#/definitions/uint32
++        minimum: 0
++        maximum: 3
++
++      cirrus,vp-hg-va:
++        description:
++          VA calculation reference for automatic VPhg tracking using VPMON.
++          This property can be set to values from 0 to 6, starting at 1800mV
++          with a step size of 50mV. Default is 1800mV.
++        $ref: /schemas/types.yaml#/definitions/uint32
++        minimum: 0
++        maximum: 6
++
++examples:
++  - |
++    #include <dt-bindings/gpio/gpio.h>
++    #include <dt-bindings/interrupt-controller/irq.h>
++
++    i2c {
++        #address-cells = <1>;
++        #size-cells = <0>;
++
++        amplifier@40 {
++            compatible = "cirrus,cs35l33";
++            reg = <0x40>;
++
++            VA-supply = <&ldo5_reg>;
++            VP-supply = <&ldo5_reg>;
++
++            interrupt-parent = <&gpio8>;
++            interrupts = <3 IRQ_TYPE_LEVEL_LOW>;
++
++            reset-gpios = <&cs47l91 34 GPIO_ACTIVE_HIGH>;
++
++            cirrus,ramp-rate = <0x0>;
++            cirrus,boost-ctl = <0x30>;      /* VBST = 8000mV */
++            cirrus,boost-ipk = <3600000>;   /* 3600mA */
++            cirrus,imon-adc-scale = <0>;    /* Bits 15 down to 0 */
++
++            cirrus,hg-algo {
++                cirrus,mem-depth = <0x3>;
++                cirrus,release-rate = <0x3>;
++                cirrus,ldo-thld = <0x1>;
++                cirrus,ldo-entry-delay = <0x4>;
++                cirrus,vp-hg-auto;
++                cirrus,vp-hg = <0xf>;
++                cirrus,vp-hg-rate = <0x2>;
++                cirrus,vp-hg-va = <0x0>;
++            };
++        };
++    };
+diff --git a/Documentation/devicetree/bindings/sound/cs35l33.txt b/Documentation/devicetree/bindings/sound/cs35l33.txt
+deleted file mode 100644
+index b8c34f457..000000000
+--- a/Documentation/devicetree/bindings/sound/cs35l33.txt
++++ /dev/null
+@@ -1,137 +0,0 @@
+-CS35L33 / CS35L19 Speaker Amplifier
+-
+-Required properties:
+-
+-  - compatible : "cirrus,cs35l33" or "cirrus,cs35l19"
+-
+-  - reg : the I2C address of the device for I2C
+-
+-  - VA-supply, VP-supply : power supplies for the device,
+-    as covered in
+-    Documentation/devicetree/bindings/regulator/regulator.txt.
+-
+-Optional properties:
+-
+-  - reset-gpios : gpio used to reset the amplifier
+-
+- -  interrupts : IRQ line info CS35L33.
+-    (See Documentation/devicetree/bindings/interrupt-controller/interrupts.txt
+-    for further information relating to interrupt properties)
+-
+-  - cirrus,boost-ctl : Booster voltage use to supply the amp. If the value is
+-    0, then VBST = VP. If greater than 0, the boost voltage will be 3300mV with
+-    a value of 1 and will increase at a step size of 100mV until a maximum of
+-    8000mV.
+-
+-  - cirrus,ramp-rate : On power up, it affects the time from when the power
+-    up sequence begins to the time the audio reaches a full-scale output.
+-    On power down, it affects the time from when the power-down sequence
+-    begins to when the amplifier disables the PWM outputs. If this property
+-    is not set then soft ramping will be disabled and ramp time would be
+-    20ms. If this property is set to 0,1,2,3 then ramp times would be 40ms,
+-    60ms,100ms,175ms respectively for 48KHz sample rate.
+-
+-  - cirrus,boost-ipk : The maximum current allowed for the boost converter.
+-    The range starts at 1850000uA and goes to a maximum of 3600000uA
+-    with a step size of 15625uA. The default is 2500000uA.
+-
+-  - cirrus,imon-adc-scale : Configures the scaling of data bits from the IMON
+-    ADC data word. This property can be set as a value of 0 for bits 15 down
+-    to 0, 6 for 21 down to 6, 7, for 22 down to 7, 8 for 23 down to 8.
+-
+-Optional properties, "cirrus,cs35l19" only:
+-
+-  - cirrus,boost-slew-step : Boost converter VBST slew step, 0 to 3.
+-
+-  - cirrus,boost-coeffs : Four bytes for the boost loop coefficient
+-    registers 0x3A to 0x3D.
+-
+-  - cirrus,trim : Three bytes of board specific trim, written to the
+-    registers 0x46, 0x54 and 0x66.
+-
+-
+-Optional H/G Algorithm sub-node:
+-
+-The cs35l33 node can have a single "cirrus,hg-algo" sub-node that will enable
+-the internal H/G Algorithm.
+-
+-  - cirrus,hg-algo : Sub-node for internal Class H/G algorithm that
+-    controls the amplifier supplies.
+-
+-Optional properties for the "cirrus,hg-algo" sub-node:
+-
+-  - cirrus,mem-depth : Memory depth for the Class H/G algorithm measured in
+-    LRCLK cycles. If this property is set to 0, 1, 2, or 3 then the memory
+-    depths will be 1, 4, 8, 16 LRCLK cycles.  The default is 16 LRCLK cycles.
+-
+-    cirrus,release-rate : The number of consecutive LRCLK periods before
+-    allowing release condition tracking updates. The number of LRCLK periods
+-    start at 3 to a maximum of 255.
+-
+-  - cirrus,hd-rm : Class H/G headroom, 0 to 0x7F. Defaults to 0 when the
+-    sub-node is present.
+-
+-  - cirrus,ldo-thld : Configures the signal threshold at which the PWM output
+-    stage enters LDO operation. Starts as a default value of 50mV for a value
+-    of 1 and increases with a step size of 50mV to a maximum of 750mV (value of
+-    0xF).
+-
+-  - cirrus,ldo-path-disable : This is a boolean property. If present, the H/G
+-    algorithm uses the max detection path.  If not present, the LDO
+-    detection path is used.
+-
+-  - cirrus,ldo-entry-delay : The LDO entry delay in milliseconds before the H/G
+-    algorithm switches to the LDO voltage.  This property can be set to values
+-    from 0 to 7 for delays of 5ms, 10ms, 50ms, 100ms, 200ms, 500ms, 1000ms.
+-    The default is 100ms.
+-
+-  - cirrus,vp-hg-auto : This is a boolean property.  When set, class H/G VPhg
+-    automatic updating is enabled.
+-
+-  - cirrus,vp-hg :  Class H/G algorithm VPhg.  Controls the H/G algorithm's
+-    reference to the VP voltage for when to start generating a boosted VBST.
+-    The reference voltage starts at 3000mV with a value of 0x3 and is increased
+-    by 100mV per step to a maximum of 5500mV.
+-
+-  - cirrus,vp-hg-rate : The rate (number of LRCLK periods) at which the VPhg is
+-    allowed to increase to a higher voltage when using VPhg automatic
+-    tracking. This property can be set to values from 0 to 3 with rates of 128
+-    periods, 2048 periods, 32768 periods, and 524288 periods.
+-    The default is 32768 periods.
+-
+-  - cirrus,vp-hg-va : VA calculation reference for automatic VPhg tracking
+-    using VPMON. This property can be set to values from 0 to 6 starting at
+-    1800mV with a step size of 50mV up to a maximum value of 1750mV.
+-    Default is 1800mV.
+-
+-Example:
+-
+-cs35l33: cs35l33@40 {
+-	compatible = "cirrus,cs35l33";
+-	reg = <0x40>;
+-
+-	VA-supply = <&ldo5_reg>;
+-	VP-supply = <&ldo5_reg>;
+-
+-	interrupt-parent = <&gpio8>;
+-	interrupts = <3 IRQ_TYPE_LEVEL_LOW>;
+-
+-	reset-gpios = <&cs47l91 34 0>;
+-
+-	cirrus,ramp-rate = <0x0>;
+-	cirrus,boost-ctl = <0x30>;  /* VBST = 8000mV */
+-	cirrus,boost-ipk = <0xE0>; /* 3600mA */
+-	cirrus,imon-adc-scale = <0> /* Bits 15 down to 0 */
+-
+-	cirrus,hg-algo {
+-		cirrus,mem-depth = <0x3>;
+-		cirrus,release-rate = <0x3>;
+-		cirrus,ldo-thld = <0x1>;
+-		cirrus,ldo-path-disable = <0x0>;
+-		cirrus,ldo-entry-delay=<0x4>;
+-		cirrus,vp-hg-auto;
+-		cirrus,vp-hg=<0xF>;
+-		cirrus,vp-hg-rate=<0x2>;
+-		cirrus,vp-hg-va=<0x0>;
+-	};
+-};

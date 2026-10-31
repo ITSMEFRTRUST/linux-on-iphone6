@@ -1,0 +1,6 @@
+#!/bin/bash
+# autoboot - started by udev when an iPhone shows up in DFU (05ac:1227). Logs to var/autoboot.log.
+cd "$(dirname "$(readlink -f "$0")")/.."
+[ -e var/no-autoboot ] && { echo "$(date) skipped (var/no-autoboot)" >> var/autoboot.log; exit 0; }
+{ echo "=== $(date) DFU seen, booting Linux"; bin/audioboot; echo "=== exit $?"; } >> var/autoboot.log 2>&1
+notify-send -a iPhone "iPhone 6" "$(tail -1 var/autoboot.log | grep -q 'exit 0' && echo 'Linux is up' || echo 'Linux boot failed - see var/autoboot.log')" 2>/dev/null || true

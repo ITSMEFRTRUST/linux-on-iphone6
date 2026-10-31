@@ -1,0 +1,761 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 21:01:30 +0000
+Subject: [PATCH 086/138] ASoC: apple: mca-t7000: Add PIO capture, a codec DAI
+ and MCLK pad clocks
+
+Capture works like playback: the RX shim at +0x1800 fills from the MCA
+RX FIFO, its COUNT register holds the filled bytes and the samples are
+read from the 8-word port at +0x3000, by the same hrtimer. Capture takes
+1-8 consecutive slots from rx_slot_base (default 4).
+
+DAI 0 stays the playback-only speaker DAI. DAI 1 has playback and
+capture for the headset codec on the same bus; both playback DAIs feed
+the one TX slot, so the second playback open gets -EBUSY. The MCA reset
+in hw_init now only runs when no other stream is prepared.
+
+With #clock-cells the node also registers the MCLK pads of MCA0-4
+(nclk / 2 = 12 MHz) as gate clocks.
+
+The RX control word as clock master is a guess (0x20a, by analogy with
+TX 0x208 vs the iOS slave value 0x108); the speaker path keeps writing
+the iOS values.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ sound/soc/apple/mca-t7000.c | 464 +++++++++++++++++++++++++++++-------
+ 1 file changed, 378 insertions(+), 86 deletions(-)
+
+diff --git a/sound/soc/apple/mca-t7000.c b/sound/soc/apple/mca-t7000.c
+index c6710f11b..a7056718b 100644
+--- a/sound/soc/apple/mca-t7000.c
++++ b/sound/soc/apple/mca-t7000.c
+@@ -1,20 +1,30 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /*
+- * Apple A8 (t7000) MCA "version 1" I2S/TDM controller, playback only.
++ * Apple A8 (t7000) MCA "version 1" I2S/TDM controller, PIO playback and capture.
+  *
+  * On these SoCs iOS hands audio to the SmartIO (SIO) coprocessor, whose
+  * firmware memcpys PCM into a small SRAM FIFO (the "shim") that hardware
+  * then drains into the MCA. There is no DMA engine in the path, so this
+  * driver does what the SIO firmware does from the AP: an hrtimer tops up
+- * the shim FIFO from the ALSA ring buffer. The SIO CPU is never started.
++ * the TX shim FIFO from the ALSA ring buffer, and drains the RX shim FIFO
++ * into the capture ring buffer. The SIO CPU is never started.
+  *
+  * Only what has been seen working on the iPhone 6 speaker path is
+- * supported: MCA as clock master, 48 kHz, 16-bit, one channel in slot 0
+- * of an 8 x 16-bit frame.
++ * supported: MCA as clock master, 48 kHz, 16-bit, one playback channel in
++ * slot 0 of an 8 x 16-bit frame. Capture takes 1..8 consecutive slots
++ * starting at rx_slot_base.
++ *
++ * DAI 0 is the speaker link, DAI 1 the headset codec link. Both share the
++ * one TX slot, so only one playback stream can run at a time.
++ *
++ * The node can also provide the MCLK pads of all MCAs (wrapper +0x2000 +
++ * 4n, nclk / 2 = 12 MHz) as clocks, for codecs that need MCLK from a pad
++ * whose MCA is otherwise unused.
+  */
+ 
+ #include <linux/bitfield.h>
+ #include <linux/clk.h>
++#include <linux/clk-provider.h>
+ #include <linux/hrtimer.h>
+ #include <linux/io.h>
+ #include <linux/iopoll.h>
+@@ -52,8 +62,11 @@
+ #define  IRQ_STATUS_ALL		0xb0003000
+ #define MCA_CMD			0x44
+ #define  CMD_TX_FLUSH		BIT(8)
++#define  CMD_RX_FLUSH		BIT(9)
+ #define MCA_RESET		0x48
+ #define  RESET_GO		BIT(0)
++#define  RX_CTL_EN		BIT(0)
++#define  RX_CTL_IDLE		0x10a	/* what iOS and the speaker path use */
+ 
+ /* TX shim, 0x1000 above the MCA core; its FIFO write port at 0x2000 */
+ #define SHIM_TX			0x1000
+@@ -68,12 +81,17 @@
+ #define  COUNT_FREE		GENMASK(8, 0)
+ #define SHIM_TX_PORT		0x2000
+ #define SHIM_PORT_WORDS		8
++/* RX shim, 0x1800 above the MCA core; its FIFO read port at 0x3000 */
++#define SHIM_RX			0x1800
++#define  COUNT_FILLED		GENMASK(8, 0)
++#define SHIM_RX_PORT		0x3000
+ 
+ /* audio wrapper page (0x20a000000) */
+ #define WRAP_FLUSH		0x0000
+ #define WRAP_DATA_MASK_TX	0x1000
+ #define WRAP_DATA_MASK_RX	0x1004
+ #define WRAP_SHIM_OFF_TX	0x1008
++#define WRAP_SHIM_OFF_RX	0x100c
+ #define WRAP_SHIM_ON_TX		0x1010
+ #define WRAP_SHIM_ON_RX		0x1014
+ #define WRAP_UNAVAIL_MASK_TX	0x1040
+@@ -83,6 +101,8 @@
+ #define WRAP_MCLK_CTL(n)	(0x2000 + 4 * (n))
+ #define  MCLK_CTL_PIN_EN	BIT(6)
+ #define  MCLK_CTL_NCLK_DIV2	0x18
++#define MCA_NUM_MCLK		5
++#define MCA_MCLK_PAD_RATE	12000000
+ #define WRAP_SWITCH_PIN(n)	(0x3000 + 4 * (n))
+ #define WRAP_SWITCH_AUD(n)	(0x3000 + 4 * ((n) + 5))
+ #define WRAP_SWITCH_PINCTL(n)	(0x303c + 4 * (n))
+@@ -106,10 +126,41 @@ static unsigned int fifo_bytes = 0xcc;
+ module_param(fifo_bytes, uint, 0444);
+ MODULE_PARM_DESC(fifo_bytes, "shim FIFO size in bytes (multiple of 4, <= 0x1fc)");
+ 
++static unsigned int rx_fifo_bytes = 0xcc;
++module_param(rx_fifo_bytes, uint, 0444);
++MODULE_PARM_DESC(rx_fifo_bytes, "RX shim FIFO size in bytes (multiple of 4, <= 0x1fc)");
++
++static unsigned int rx_slot_base = 4;
++module_param(rx_slot_base, uint, 0644);
++MODULE_PARM_DESC(rx_slot_base, "first TDM slot captured (capture channel 1)");
++
++/*
++ * RX control: iOS uses 0x10a as a slave; as a master the TX control needs
++ * [16:8] one higher (0x208), so the same is assumed for RX.
++ */
++static unsigned int rx_ctl = 0x20a;
++module_param(rx_ctl, uint, 0644);
++MODULE_PARM_DESC(rx_ctl, "MCA RX control word while capturing, enable bit clear (iOS slave value 0x10a)");
++
+ static unsigned int refill_us = 500;
+ module_param(refill_us, uint, 0644);
+ MODULE_PARM_DESC(refill_us, "FIFO refill period in microseconds");
+ 
++struct mca_dir {
++	struct snd_pcm_substream *substream;
++	bool running;
++	unsigned int word;		/* next shim port slot */
++	unsigned int pos;		/* byte offset into the ring buffer */
++	unsigned int period_left;	/* bytes until the next period */
++	unsigned int xruns;
++};
++
++struct mca_mclk {
++	struct clk_hw hw;
++	struct mca_t7000 *mca;
++	unsigned int pad;
++};
++
+ struct mca_t7000 {
+ 	struct device *dev;
+ 	void __iomem *base;
+@@ -119,13 +170,10 @@ struct mca_t7000 {
+ 	unsigned int index;
+ 	unsigned int pin;
+ 
+-	struct snd_pcm_substream *substream;
+ 	struct hrtimer timer;
+-	bool running;
+-	unsigned int word;		/* next shim port slot */
+-	unsigned int pos;		/* byte offset into the ring buffer */
+-	unsigned int period_left;	/* bytes until the next period */
+-	unsigned int underruns;
++	struct mca_dir tx, rx;
++	unsigned int users;		/* prepared streams, BIT(stream) */
++	struct mca_mclk mclk[MCA_NUM_MCLK];
+ };
+ 
+ static inline u32 shim_free(struct mca_t7000 *mca)
+@@ -133,22 +181,66 @@ static inline u32 shim_free(struct mca_t7000 *mca)
+ 	return FIELD_GET(COUNT_FREE, readl_relaxed(mca->base + SHIM_TX + SHIM_COUNT));
+ }
+ 
++static inline u32 shim_filled(struct mca_t7000 *mca)
++{
++	return FIELD_GET(COUNT_FILLED, readl_relaxed(mca->base + SHIM_RX + SHIM_COUNT));
++}
++
++static unsigned int mca_t7000_period_step(struct mca_dir *d, unsigned int moved)
++{
++	struct snd_pcm_runtime *runtime = d->substream->runtime;
++	unsigned int period_bytes = frames_to_bytes(runtime, runtime->period_size);
++	unsigned int elapsed = 0;
++
++	while (moved >= d->period_left) {
++		moved -= d->period_left;
++		d->period_left = period_bytes;
++		elapsed++;
++	}
++	d->period_left -= moved;
++	return elapsed;
++}
++
+ /* Copy up to the shim's free space from the ring buffer. Returns bytes moved. */
+ static unsigned int mca_t7000_fill(struct mca_t7000 *mca)
+ {
+-	struct snd_pcm_runtime *runtime = mca->substream->runtime;
++	struct mca_dir *d = &mca->tx;
++	struct snd_pcm_runtime *runtime = d->substream->runtime;
+ 	unsigned int buf_bytes = frames_to_bytes(runtime, runtime->buffer_size);
+ 	unsigned int free = shim_free(mca) & ~3;
+ 	unsigned int done = 0;
+ 	u8 *area = runtime->dma_area;
+ 
+ 	while (done < free) {
+-		writel_relaxed(*(u32 *)(area + mca->pos),
+-			       mca->base + SHIM_TX_PORT + 4 * mca->word);
+-		mca->word = (mca->word + 1) % SHIM_PORT_WORDS;
+-		mca->pos += 4;
+-		if (mca->pos >= buf_bytes)
+-			mca->pos = 0;
++		writel_relaxed(*(u32 *)(area + d->pos),
++			       mca->base + SHIM_TX_PORT + 4 * d->word);
++		d->word = (d->word + 1) % SHIM_PORT_WORDS;
++		d->pos += 4;
++		if (d->pos >= buf_bytes)
++			d->pos = 0;
++		done += 4;
++	}
++
++	return done;
++}
++
++/* Copy what the RX shim holds into the capture ring buffer. Returns bytes moved. */
++static unsigned int mca_t7000_drain(struct mca_t7000 *mca)
++{
++	struct mca_dir *d = &mca->rx;
++	struct snd_pcm_runtime *runtime = d->substream->runtime;
++	unsigned int buf_bytes = frames_to_bytes(runtime, runtime->buffer_size);
++	unsigned int filled = min(shim_filled(mca), rx_fifo_bytes) & ~3;
++	unsigned int done = 0;
++	u8 *area = runtime->dma_area;
++
++	while (done < filled) {
++		*(u32 *)(area + d->pos) =
++			readl_relaxed(mca->base + SHIM_RX_PORT + 4 * d->word);
++		d->word = (d->word + 1) % SHIM_PORT_WORDS;
++		d->pos += 4;
++		if (d->pos >= buf_bytes)
++			d->pos = 0;
+ 		done += 4;
+ 	}
+ 
+@@ -158,29 +250,29 @@ static unsigned int mca_t7000_fill(struct mca_t7000 *mca)
+ static enum hrtimer_restart mca_t7000_timer(struct hrtimer *timer)
+ {
+ 	struct mca_t7000 *mca = container_of(timer, struct mca_t7000, timer);
+-	unsigned int period_bytes, moved;
+-	bool elapsed = false;
++	bool tx = READ_ONCE(mca->tx.running), rx = READ_ONCE(mca->rx.running);
++	unsigned int tx_elapsed = 0, rx_elapsed = 0;
+ 
+-	if (!READ_ONCE(mca->running))
++	if (!tx && !rx)
+ 		return HRTIMER_NORESTART;
+ 
+-	if (shim_free(mca) >= fifo_bytes)
+-		mca->underruns++;
+-
+-	period_bytes = frames_to_bytes(mca->substream->runtime,
+-				       mca->substream->runtime->period_size);
+-	moved = mca_t7000_fill(mca);
+-	while (moved >= mca->period_left) {
+-		moved -= mca->period_left;
+-		mca->period_left = period_bytes;
+-		elapsed = true;
++	if (tx) {
++		if (shim_free(mca) >= fifo_bytes)
++			mca->tx.xruns++;
++		tx_elapsed = mca_t7000_period_step(&mca->tx, mca_t7000_fill(mca));
++	}
++	if (rx) {
++		if (shim_filled(mca) >= rx_fifo_bytes)
++			mca->rx.xruns++;
++		rx_elapsed = mca_t7000_period_step(&mca->rx, mca_t7000_drain(mca));
+ 	}
+-	mca->period_left -= moved;
+ 
+-	if (elapsed)
+-		snd_pcm_period_elapsed(mca->substream);
++	if (tx_elapsed)
++		snd_pcm_period_elapsed(mca->tx.substream);
++	if (rx_elapsed)
++		snd_pcm_period_elapsed(mca->rx.substream);
+ 
+-	if (!READ_ONCE(mca->running))
++	if (!READ_ONCE(mca->tx.running) && !READ_ONCE(mca->rx.running))
+ 		return HRTIMER_NORESTART;
+ 
+ 	hrtimer_forward_now(timer, us_to_ktime(refill_us));
+@@ -191,6 +283,7 @@ static void mca_t7000_hw_init(struct mca_t7000 *mca)
+ {
+ 	unsigned int shim = BIT(MCA_SHIM_INDEX(mca->index));
+ 	void __iomem *tx = mca->base + SHIM_TX;
++	void __iomem *rx = mca->base + SHIM_RX;
+ 	u32 val;
+ 
+ 	/* MCLK pad = nclk / 2 = 12 MHz for the amp, pad driven */
+@@ -229,6 +322,18 @@ static void mca_t7000_hw_init(struct mca_t7000 *mca)
+ 	writel(0, tx + SHIM_TIMEOUT);
+ 	writel(1, tx + SHIM_ENABLE);
+ 
++	/* the RX shim, from the separate RX SRAM pool (offset 0) */
++	writel(shim, mca->wrap + WRAP_SHIM_OFF_RX);
++	writel(0, rx + SHIM_LINK);
++	writel(0, rx + SHIM_ENABLE);
++	readl(mca->wrap + WRAP_FLUSH);
++	readl(mca->wrap + WRAP_FLUSH);
++	writel(XFER_16BIT, rx + SHIM_XFER);
++	writel((rx_fifo_bytes / 4) << 16, rx + SHIM_WINDOW);
++	writel(1, rx + SHIM_TRIGGER);
++	writel(0, rx + SHIM_TIMEOUT);
++	writel(1, rx + SHIM_ENABLE);
++
+ 	/* 16-bit slots, 8 per frame, TX slot 0, clock master */
+ 	writel(0x1010, mca->base + MCA_FIFO_PAD);
+ 	writel(0x00170018, mca->base + MCA_TX_FIFO);
+@@ -237,7 +342,7 @@ static void mca_t7000_hw_init(struct mca_t7000 *mca)
+ 	writel(1, mca->base + MCA_TX_MASK);
+ 	writel(0xf, mca->base + MCA_RX_MASK);
+ 	writel(0x208, mca->base + MCA_TX_CTL);
+-	writel(0x10a, mca->base + MCA_RX_CTL);
++	writel(RX_CTL_IDLE, mca->base + MCA_RX_CTL);
+ 	writel(1, mca->base + MCA_IRQ_EN);
+ 	writel(IRQ_STATUS_ALL, mca->base + MCA_IRQ_STATUS);
+ 	writel(FRAME_CFG_8X16 | FRAME_CFG_MASTER, mca->base + MCA_FRAME_CFG);
+@@ -249,7 +354,7 @@ static void mca_t7000_hw_init(struct mca_t7000 *mca)
+ 	writel(0x11, mca->wrap + WRAP_SWITCH_PINCTL(mca->pin));
+ }
+ 
+-static void mca_t7000_hw_stop(struct mca_t7000 *mca)
++static void mca_t7000_hw_stop_tx(struct mca_t7000 *mca)
+ {
+ 	unsigned int shim = BIT(MCA_SHIM_INDEX(mca->index));
+ 	u32 val;
+@@ -263,6 +368,19 @@ static void mca_t7000_hw_stop(struct mca_t7000 *mca)
+ 				  !(val & CMD_TX_FLUSH), 1, 1000);
+ }
+ 
++static void mca_t7000_hw_stop_rx(struct mca_t7000 *mca)
++{
++	unsigned int shim = BIT(MCA_SHIM_INDEX(mca->index));
++	u32 val;
++
++	writel_relaxed(RX_CTL_IDLE, mca->base + MCA_RX_CTL);
++	writel_relaxed(0, mca->base + SHIM_RX + SHIM_LINK);
++	writel_relaxed(shim, mca->wrap + WRAP_SHIM_OFF_RX);
++	writel(CMD_RX_FLUSH, mca->base + MCA_CMD);
++	readl_poll_timeout_atomic(mca->base + MCA_CMD, val,
++				  !(val & CMD_RX_FLUSH), 1, 1000);
++}
++
+ static int mca_t7000_dai_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
+ {
+ 	/* the only tested frame: DSP A, MCA provides BCLK and FSYNC */
+@@ -281,9 +399,15 @@ static int mca_t7000_dai_hw_params(struct snd_pcm_substream *substream,
+ 	struct mca_t7000 *mca = snd_soc_dai_get_drvdata(dai);
+ 	int ret;
+ 
+-	if (params_rate(params) != MCA_RATE || params_channels(params) != 1 ||
++	if (params_rate(params) != MCA_RATE ||
+ 	    params_format(params) != SNDRV_PCM_FORMAT_S16_LE)
+ 		return -EINVAL;
++	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK &&
++	    params_channels(params) != 1)
++		return -EINVAL;
++	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE &&
++	    rx_slot_base + params_channels(params) > 8)
++		return -EINVAL;
+ 
+ 	ret = clk_set_rate(mca->clk, MCA_MCLK_RATE);
+ 	if (ret)
+@@ -296,16 +420,28 @@ static int mca_t7000_dai_prepare(struct snd_pcm_substream *substream,
+ 				 struct snd_soc_dai *dai)
+ {
+ 	struct mca_t7000 *mca = snd_soc_dai_get_drvdata(dai);
++	unsigned int ch;
++
++	/* the reset in hw_init would kill a stream already running */
++	if (!(mca->users & ~BIT(substream->stream))) {
++		mca_t7000_hw_init(mca);
++
++		/*
++		 * Start BCLK/FSYNC now, before DAPM powers the amp up: the
++		 * CS35L19 latches ADSPCLK_ERR if it powers up without a serial
++		 * clock. TX stays disabled until trigger; the shim link starts
++		 * fine late.
++		 */
++		writel(FRAME_CFG_8X16 | FRAME_CFG_RUN | FRAME_CFG_MASTER,
++		       mca->base + MCA_FRAME_CFG);
++	}
++	mca->users |= BIT(substream->stream);
+ 
+-	mca_t7000_hw_init(mca);
+-
+-	/*
+-	 * Start BCLK/FSYNC now, before DAPM powers the amp up: the CS35L19
+-	 * latches ADSPCLK_ERR if it powers up without a serial clock. TX
+-	 * stays disabled until trigger; the shim link starts fine late.
+-	 */
+-	writel(FRAME_CFG_8X16 | FRAME_CFG_RUN | FRAME_CFG_MASTER,
+-	       mca->base + MCA_FRAME_CFG);
++	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE) {
++		ch = substream->runtime->channels;
++		writel(GENMASK(rx_slot_base + ch - 1, rx_slot_base),
++		       mca->base + MCA_RX_MASK);
++	}
+ 	return 0;
+ }
+ 
+@@ -314,7 +450,10 @@ static int mca_t7000_dai_hw_free(struct snd_pcm_substream *substream,
+ {
+ 	struct mca_t7000 *mca = snd_soc_dai_get_drvdata(dai);
+ 
+-	writel(FRAME_CFG_8X16 | FRAME_CFG_MASTER, mca->base + MCA_FRAME_CFG);
++	mca->users &= ~BIT(substream->stream);
++	if (!mca->users)
++		writel(FRAME_CFG_8X16 | FRAME_CFG_MASTER,
++		       mca->base + MCA_FRAME_CFG);
+ 	return 0;
+ }
+ 
+@@ -325,16 +464,38 @@ static const struct snd_soc_dai_ops mca_t7000_dai_ops = {
+ 	.hw_free = mca_t7000_dai_hw_free,
+ };
+ 
+-static struct snd_soc_dai_driver mca_t7000_dai = {
+-	.name = "mca-t7000",
+-	.playback = {
+-		.stream_name = "Playback",
+-		.channels_min = 1,
+-		.channels_max = 1,
+-		.rates = SNDRV_PCM_RATE_48000,
+-		.formats = SNDRV_PCM_FMTBIT_S16_LE,
++static struct snd_soc_dai_driver mca_t7000_dais[] = {
++	{
++		.name = "mca-t7000",
++		.id = 0,
++		.playback = {
++			.stream_name = "Playback",
++			.channels_min = 1,
++			.channels_max = 1,
++			.rates = SNDRV_PCM_RATE_48000,
++			.formats = SNDRV_PCM_FMTBIT_S16_LE,
++		},
++		.ops = &mca_t7000_dai_ops,
++	},
++	{
++		.name = "mca-t7000-codec",
++		.id = 1,
++		.playback = {
++			.stream_name = "Codec Playback",
++			.channels_min = 1,
++			.channels_max = 1,
++			.rates = SNDRV_PCM_RATE_48000,
++			.formats = SNDRV_PCM_FMTBIT_S16_LE,
++		},
++		.capture = {
++			.stream_name = "Codec Capture",
++			.channels_min = 1,
++			.channels_max = 8,
++			.rates = SNDRV_PCM_RATE_48000,
++			.formats = SNDRV_PCM_FMTBIT_S16_LE,
++		},
++		.ops = &mca_t7000_dai_ops,
+ 	},
+-	.ops = &mca_t7000_dai_ops,
+ };
+ 
+ static const struct snd_pcm_hardware mca_t7000_pcm_hw = {
+@@ -345,7 +506,7 @@ static const struct snd_pcm_hardware mca_t7000_pcm_hw = {
+ 	.rate_min = MCA_RATE,
+ 	.rate_max = MCA_RATE,
+ 	.channels_min = 1,
+-	.channels_max = 1,
++	.channels_max = 8,
+ 	.buffer_bytes_max = SZ_128K,
+ 	.period_bytes_min = 1024,	/* > the largest shim FIFO, see trigger */
+ 	.period_bytes_max = SZ_32K,
+@@ -353,12 +514,30 @@ static const struct snd_pcm_hardware mca_t7000_pcm_hw = {
+ 	.periods_max = 64,
+ };
+ 
++/*
++ * Wait for a running timer callback to finish, so that it no longer looks at
++ * a stopped stream, and keep it going for the other direction.
++ */
++static void mca_t7000_timer_sync(struct mca_t7000 *mca)
++{
++	hrtimer_cancel(&mca->timer);
++	if (READ_ONCE(mca->tx.running) || READ_ONCE(mca->rx.running))
++		hrtimer_start(&mca->timer, us_to_ktime(refill_us),
++			      HRTIMER_MODE_REL_HARD);
++}
++
+ static int mca_t7000_pcm_open(struct snd_soc_component *component,
+ 			      struct snd_pcm_substream *substream)
+ {
+ 	struct mca_t7000 *mca = snd_soc_component_get_drvdata(component);
++	struct mca_dir *d = substream->stream == SNDRV_PCM_STREAM_PLAYBACK ?
++			    &mca->tx : &mca->rx;
+ 	int ret;
+ 
++	/* one TX slot, one RX shim: one stream per direction */
++	if (d->substream)
++		return -EBUSY;
++
+ 	ret = snd_soc_set_runtime_hwparams(substream, &mca_t7000_pcm_hw);
+ 	if (ret)
+ 		return ret;
+@@ -373,7 +552,7 @@ static int mca_t7000_pcm_open(struct snd_soc_component *component,
+ 	if (ret)
+ 		return ret;
+ 
+-	mca->substream = substream;
++	d->substream = substream;
+ 	return 0;
+ }
+ 
+@@ -382,8 +561,11 @@ static int mca_t7000_pcm_close(struct snd_soc_component *component,
+ {
+ 	struct mca_t7000 *mca = snd_soc_component_get_drvdata(component);
+ 
+-	hrtimer_cancel(&mca->timer);
+-	mca->substream = NULL;
++	struct mca_dir *d = substream->stream == SNDRV_PCM_STREAM_PLAYBACK ?
++			    &mca->tx : &mca->rx;
++
++	mca_t7000_timer_sync(mca);
++	d->substream = NULL;
+ 	return 0;
+ }
+ 
+@@ -392,10 +574,12 @@ static int mca_t7000_pcm_prepare(struct snd_soc_component *component,
+ {
+ 	struct mca_t7000 *mca = snd_soc_component_get_drvdata(component);
+ 	struct snd_pcm_runtime *runtime = substream->runtime;
++	struct mca_dir *d = substream->stream == SNDRV_PCM_STREAM_PLAYBACK ?
++			    &mca->tx : &mca->rx;
+ 
+-	mca->pos = 0;
+-	mca->period_left = frames_to_bytes(runtime, runtime->period_size);
+-	mca->underruns = 0;
++	d->pos = 0;
++	d->period_left = frames_to_bytes(runtime, runtime->period_size);
++	d->xruns = 0;
+ 	return 0;
+ }
+ 
+@@ -404,33 +588,50 @@ static int mca_t7000_pcm_trigger(struct snd_soc_component *component,
+ {
+ 	struct mca_t7000 *mca = snd_soc_component_get_drvdata(component);
+ 	unsigned int shim = BIT(MCA_SHIM_INDEX(mca->index));
+-	void __iomem *tx = mca->base + SHIM_TX;
++	bool playback = substream->stream == SNDRV_PCM_STREAM_PLAYBACK;
++	struct mca_dir *d = playback ? &mca->tx : &mca->rx;
++	struct mca_dir *other = playback ? &mca->rx : &mca->tx;
+ 
+ 	switch (cmd) {
+ 	case SNDRV_PCM_TRIGGER_START:
+ 	case SNDRV_PCM_TRIGGER_RESUME:
+ 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+-		/* prefill, the SIO fw start writes, then enable TX (clock runs) */
+-		mca->word = 0;
+-		mca->period_left -= mca_t7000_fill(mca);
+-		writel_relaxed(fifo_bytes - 0x20, tx + SHIM_TRIGGER);
+-		writel_relaxed(shim, mca->wrap + WRAP_SHIM_ON_TX);
+-		writel_relaxed(shim, mca->wrap + WRAP_SHIM_ON_RX);
+-		writel_relaxed(1, tx + SHIM_LINK);
+-		writel(0x208 | TX_CTL_EN, mca->base + MCA_TX_CTL);
+-		WRITE_ONCE(mca->running, true);
+-		hrtimer_start(&mca->timer, us_to_ktime(refill_us),
+-			      HRTIMER_MODE_REL_HARD);
++		d->word = 0;
++		if (playback) {
++			/* prefill, the SIO fw start writes, then enable TX */
++			mca->tx.period_left -= mca_t7000_fill(mca);
++			writel_relaxed(fifo_bytes - 0x20,
++				       mca->base + SHIM_TX + SHIM_TRIGGER);
++			writel_relaxed(shim, mca->wrap + WRAP_SHIM_ON_TX);
++			writel_relaxed(shim, mca->wrap + WRAP_SHIM_ON_RX);
++			writel_relaxed(1, mca->base + SHIM_TX + SHIM_LINK);
++			writel(0x208 | TX_CTL_EN, mca->base + MCA_TX_CTL);
++		} else {
++			/* the SIO fw RX start: TRIGGER = 1, shim on, then RX */
++			writel_relaxed(1, mca->base + SHIM_RX + SHIM_TRIGGER);
++			writel_relaxed(shim, mca->wrap + WRAP_SHIM_ON_RX);
++			writel_relaxed(1, mca->base + SHIM_RX + SHIM_LINK);
++			writel(rx_ctl | RX_CTL_EN, mca->base + MCA_RX_CTL);
++		}
++		WRITE_ONCE(d->running, true);
++		if (!READ_ONCE(other->running))
++			hrtimer_start(&mca->timer, us_to_ktime(refill_us),
++				      HRTIMER_MODE_REL_HARD);
+ 		return 0;
+ 	case SNDRV_PCM_TRIGGER_STOP:
+ 	case SNDRV_PCM_TRIGGER_SUSPEND:
+ 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+ 		/* may run inside our own timer callback: never wait for it */
+-		WRITE_ONCE(mca->running, false);
+-		hrtimer_try_to_cancel(&mca->timer);
+-		mca_t7000_hw_stop(mca);
+-		if (mca->underruns)
+-			dev_dbg(mca->dev, "%u shim underruns\n", mca->underruns);
++		WRITE_ONCE(d->running, false);
++		if (!READ_ONCE(other->running))
++			hrtimer_try_to_cancel(&mca->timer);
++		if (playback)
++			mca_t7000_hw_stop_tx(mca);
++		else
++			mca_t7000_hw_stop_rx(mca);
++		if (d->xruns)
++			dev_dbg(mca->dev, "%u shim %s\n", d->xruns,
++				playback ? "underruns" : "overruns");
+ 		return 0;
+ 	default:
+ 		return -EINVAL;
+@@ -442,7 +643,7 @@ static int mca_t7000_pcm_sync_stop(struct snd_soc_component *component,
+ {
+ 	struct mca_t7000 *mca = snd_soc_component_get_drvdata(component);
+ 
+-	hrtimer_cancel(&mca->timer);
++	mca_t7000_timer_sync(mca);
+ 	return 0;
+ }
+ 
+@@ -450,8 +651,10 @@ static snd_pcm_uframes_t mca_t7000_pcm_pointer(struct snd_soc_component *compone
+ 					       struct snd_pcm_substream *substream)
+ {
+ 	struct mca_t7000 *mca = snd_soc_component_get_drvdata(component);
++	struct mca_dir *d = substream->stream == SNDRV_PCM_STREAM_PLAYBACK ?
++			    &mca->tx : &mca->rx;
+ 
+-	return bytes_to_frames(substream->runtime, READ_ONCE(mca->pos));
++	return bytes_to_frames(substream->runtime, READ_ONCE(d->pos));
+ }
+ 
+ static int mca_t7000_pcm_new(struct snd_soc_component *component,
+@@ -474,6 +677,88 @@ static const struct snd_soc_component_driver mca_t7000_component = {
+ 	.legacy_dai_naming = 1,
+ };
+ 
++/* MCLK pads: wrapper +0x2000 + 4n, nclk / 2 = 12 MHz, pad output enabled */
++static struct mca_mclk *to_mca_mclk(struct clk_hw *hw)
++{
++	return container_of(hw, struct mca_mclk, hw);
++}
++
++static int mca_t7000_mclk_enable(struct clk_hw *hw)
++{
++	struct mca_mclk *m = to_mca_mclk(hw);
++
++	writel(MCLK_CTL_PIN_EN | MCLK_CTL_NCLK_DIV2,
++	       m->mca->wrap + WRAP_MCLK_CTL(m->pad));
++	return 0;
++}
++
++static void mca_t7000_mclk_disable(struct clk_hw *hw)
++{
++	struct mca_mclk *m = to_mca_mclk(hw);
++
++	/* our own pad also feeds the speaker amp; hw_init owns it */
++	if (m->pad != m->mca->index)
++		writel(0, m->mca->wrap + WRAP_MCLK_CTL(m->pad));
++}
++
++static int mca_t7000_mclk_is_enabled(struct clk_hw *hw)
++{
++	struct mca_mclk *m = to_mca_mclk(hw);
++
++	return !!(readl(m->mca->wrap + WRAP_MCLK_CTL(m->pad)) & MCLK_CTL_PIN_EN);
++}
++
++static unsigned long mca_t7000_mclk_recalc_rate(struct clk_hw *hw,
++						unsigned long parent_rate)
++{
++	return MCA_MCLK_PAD_RATE;
++}
++
++static const struct clk_ops mca_t7000_mclk_ops = {
++	.enable = mca_t7000_mclk_enable,
++	.disable = mca_t7000_mclk_disable,
++	.is_enabled = mca_t7000_mclk_is_enabled,
++	.recalc_rate = mca_t7000_mclk_recalc_rate,
++};
++
++static struct clk_hw *mca_t7000_mclk_get(struct of_phandle_args *spec, void *data)
++{
++	struct mca_t7000 *mca = data;
++
++	if (spec->args_count != 1 || spec->args[0] >= MCA_NUM_MCLK)
++		return ERR_PTR(-EINVAL);
++	return &mca->mclk[spec->args[0]].hw;
++}
++
++static int mca_t7000_register_mclks(struct mca_t7000 *mca)
++{
++	struct device *dev = mca->dev;
++	struct clk_init_data init = {
++		.ops = &mca_t7000_mclk_ops,
++		/* iBoot may leave a pad running; never gate it behind our back */
++		.flags = CLK_IGNORE_UNUSED,
++	};
++	unsigned int i;
++	int ret;
++
++	if (!of_property_present(dev->of_node, "#clock-cells"))
++		return 0;
++
++	for (i = 0; i < MCA_NUM_MCLK; i++) {
++		init.name = devm_kasprintf(dev, GFP_KERNEL, "mca%u-mclk", i);
++		if (!init.name)
++			return -ENOMEM;
++		mca->mclk[i].mca = mca;
++		mca->mclk[i].pad = i;
++		mca->mclk[i].hw.init = &init;
++		ret = devm_clk_hw_register(dev, &mca->mclk[i].hw);
++		if (ret)
++			return ret;
++	}
++
++	return devm_of_clk_add_hw_provider(dev, mca_t7000_mclk_get, mca);
++}
++
+ static int mca_t7000_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -483,6 +768,8 @@ static int mca_t7000_probe(struct platform_device *pdev)
+ 
+ 	if (fifo_bytes < 0x40 || fifo_bytes > 0x1fc || fifo_bytes % 4)
+ 		return dev_err_probe(dev, -EINVAL, "bad fifo_bytes %#x\n", fifo_bytes);
++	if (rx_fifo_bytes < 0x20 || rx_fifo_bytes > 0x1fc || rx_fifo_bytes % 4)
++		return dev_err_probe(dev, -EINVAL, "bad rx_fifo_bytes %#x\n", rx_fifo_bytes);
+ 
+ 	mca = devm_kzalloc(dev, sizeof(*mca), GFP_KERNEL);
+ 	if (!mca)
+@@ -518,13 +805,18 @@ static int mca_t7000_probe(struct platform_device *pdev)
+ 		      HRTIMER_MODE_REL_HARD);
+ 	platform_set_drvdata(pdev, mca);
+ 
++	ret = mca_t7000_register_mclks(mca);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to register the MCLK pads\n");
++
+ 	ret = devm_snd_soc_register_component(dev, &mca_t7000_component,
+-					      &mca_t7000_dai, 1);
++					      mca_t7000_dais,
++					      ARRAY_SIZE(mca_t7000_dais));
+ 	if (ret)
+ 		return dev_err_probe(dev, ret, "failed to register component\n");
+ 
+-	dev_info(dev, "MCA%u, shim FIFO %u bytes, PIO refill every %u us\n",
+-		 mca->index, fifo_bytes, refill_us);
++	dev_info(dev, "MCA%u, shim FIFO %u/%u bytes, PIO every %u us, capture from slot %u\n",
++		 mca->index, fifo_bytes, rx_fifo_bytes, refill_us, rx_slot_base);
+ 	return 0;
+ }
+ 
+@@ -543,5 +835,5 @@ static struct platform_driver mca_t7000_driver = {
+ };
+ module_platform_driver(mca_t7000_driver);
+ 
+-MODULE_DESCRIPTION("Apple A8 MCA (v1) ASoC driver, PIO playback");
++MODULE_DESCRIPTION("Apple A8 MCA (v1) ASoC driver, PIO playback and capture");
+ MODULE_LICENSE("Dual MIT/GPL");

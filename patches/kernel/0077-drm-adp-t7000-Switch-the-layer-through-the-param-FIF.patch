@@ -1,0 +1,383 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 02:29:36 +0000
+Subject: [PATCH 077/138] drm: adp: t7000: Switch the layer through the param
+ FIFO
+
+On hw the layer-off write made from the VBI interrupt killed the pipe at
+once (RdErr, frame counter frozen) with no flip in flight: on n61 the
+ADP VBI fires at line 541 of 1334 (ADBE0 0x24 = 0x1021d), mid-scan, so
+the write was not in the blanking at all.
+
+iOS never writes LAYER_CTL directly while the pipe runs. Its blank frame
+(and every swap) goes through the ADP param FIFO, which applies a packet
+at a frame boundary and raises IRQ_STATUS bit 10. Do the same, with the
+packet format of ADPParamFIFODriver::programFIFO: header
+0x80000000 | sync << 30 | words << 16 | tag, then (count << 16) | offset
+and the value for a run of ADP registers. Send it only when the FIFO is
+idle (level 0x1040 == 0, ParmSt != 2; 1-2 ms sleeps, 100 ms max), enable
+the packet-done bit for the wait (100 ms) and record the ADBE0 frame/line
+register at send and completion time.
+
+A layer-off packet that is not reported leaves the scanout on. A
+layer-on packet that is not reported leaves the driver in the off state
+(screen black, the next CRTC on or debugfs "power on" retries) instead
+of falling back to a direct write. Without the IRQ the register is read
+back once more, and a late-landing off packet is caught on the next on.
+
+debugfs "power" also takes "nop" (header-only packet) and "same"
+(LAYER_CTL = its current value), to check the packet path on hw before
+anything visible changes.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/gpu/drm/adp/adp-t7000.c | 222 +++++++++++++++++++++++---------
+ 1 file changed, 164 insertions(+), 58 deletions(-)
+
+diff --git a/drivers/gpu/drm/adp/adp-t7000.c b/drivers/gpu/drm/adp/adp-t7000.c
+index bdbff09cf..477802a9a 100644
+--- a/drivers/gpu/drm/adp/adp-t7000.c
++++ b/drivers/gpu/drm/adp/adp-t7000.c
+@@ -92,7 +92,18 @@
+ #define ADP_FIFO_LEVEL		0x1040
+ #define ADP_FIFO_LEVEL_MASK	GENMASK(12, 0)
+ #define ADP_FIFO		0x10c0
+-#define ADP_FIFO_SYNC		0xc0000000
++/*
++ * Param FIFO packet (ADPParamFIFODriver::programFIFO @0xfffffff0088e774c): a header, then per run of
++ * ADP registers (count << 16) | offset followed by count values. Registers of other blocks use a
++ * 3-word entry 0x40020000, address, value (not used here). The header's word count excludes itself.
++ */
++#define ADP_FIFO_HDR		BIT(31)
++#define ADP_FIFO_HDR_SYNC	BIT(30)		/* apply at the next frame boundary (iOS's normal swap) */
++#define ADP_FIFO_HDR_WORDS	GENMASK(28, 16)
++#define ADP_FIFO_HDR_TAG	GENMASK(15, 0)
++#define ADP_FIFO_SYNC		(ADP_FIFO_HDR | ADP_FIFO_HDR_SYNC)
++#define ADP_FIFO_RUN_COUNT	GENMASK(28, 16)
++#define ADP_FIFO_RUN_REG	GENMASK(15, 0)
+ 
+ /* generic pipe p (layer) at 0x4000 + 0x2000 * p */
+ #define PIPE(p)			(0x4000 + 0x2000 * (p))
+@@ -133,14 +144,15 @@
+ #define PANEL_SLEEP_MS		120
+ 
+ /*
+- * LAYER_CTL is only ever written from the VBI interrupt (adpt_layer_ctl_sync()): a direct write at an
+- * arbitrary point of the frame, racing page flips, ended in underruns and a stalled pipe (RdErr) on hw.
+- * iOS sends it through the param FIFO, which applies it at a frame boundary; its packet encoding is
+- * untested here, so the write is timed by the VBI instead. One more frame (ADPT_LATCH_MS) covers a
+- * shadowed register latching at the following frame start.
++ * LAYER_CTL is only written through the param FIFO (adpt_layer_ctl_set()), like iOS: the packet is
++ * applied at a frame boundary and signalled by IRQ_STATUS bit 10. On hw a direct write killed the pipe
++ * (RdErr, frame counter frozen) both at random points (racing flips) and from the VBI interrupt, which
++ * on n61 fires at line 541 of 1334, mid-scan (ADBE0 0x24 = 0x1021d). ADPT_LATCH_MS: one more frame
++ * after the packet before anything relies on it.
+  */
+ #define ADPT_LATCH_MS		20
+-#define ADPT_LAYER_TIMEOUT_MS	100
++#define ADPT_FIFO_IDLE_MS	100	/* iOS waits up to 1000 x 1 ms (@0xfffffff0089085bc) */
++#define ADPT_PKT_TIMEOUT_MS	100	/* six frames */
+ 
+ /* stall watchdog: vblank enabled but no VBI for ADPT_WD_MISSES periods = the pipe stopped */
+ #define ADPT_WD_PERIOD_MS	100
+@@ -240,11 +252,14 @@ struct adpt {
+ 	u32 layer_ctl;		/* ADP_LAYER_CTL before scanout off */
+ 	u32 irq_en_off;		/* non-VBI ADP_IRQ_EN bits masked by scanout off */
+ 
+-	/* LAYER_CTL write armed for the next VBI (under irq_lock) */
+-	bool layer_armed;
+-	bool layer_done;	/* the IRQ wrote layer_req */
+-	u32 layer_req;
+-	u32 layer_line;		/* ADBE0 0x1c (frame << 16 | line) when it did */
++	/* param FIFO packet in flight (pkt_wait/pkt_done under irq_lock) and what the last one did */
++	bool pkt_wait;
++	bool pkt_done;		/* IRQ_STATUS bit 10 came while pkt_wait */
++	u32 pkt_send_line;	/* ADBE0 0x1c (frame << 16 | line) when the packet was written */
++	u32 pkt_done_line;	/* ... when the packet-done IRQ came */
++	u32 pkt_hdr;
++	int pkt_ret;
++	unsigned int pkt_ms;
+ 	wait_queue_head_t layer_wq;
+ 
+ 	/* VBI watchdog (work on system_freezable_wq: frozen across suspend with the IRQs) */
+@@ -495,23 +510,22 @@ static irqreturn_t adpt_irq(int irq, void *arg)
+ 	if (!test_noack)
+ 		writel(st, adp->adp + ADP_IRQ_STATUS);	/* W1C, as iOS does */
+ 
+-	if (st & ADP_IRQ_VBI) {
++	if (st & ADP_IRQ_PKT_DONE) {
+ 		bool done = false;
+ 
+-		/* first thing in the blanking: the armed LAYER_CTL write, if any */
+ 		spin_lock(&adp->irq_lock);
+-		if (adp->layer_armed) {
+-			writel(adp->layer_req, adp->adp + ADP_LAYER_CTL);
+-			adp->layer_line = readl(adp->adbe + ADBE_LINE);
+-			adp->layer_armed = false;
+-			adp->layer_done = true;
++		if (adp->pkt_wait) {
++			adp->pkt_done_line = readl(adp->adbe + ADBE_LINE);
++			adp->pkt_wait = false;
++			adp->pkt_done = true;
+ 			done = true;
+ 		}
+ 		spin_unlock(&adp->irq_lock);
+ 		if (done)
+ 			wake_up(&adp->layer_wq);
+-		WRITE_ONCE(adp->vbi_count, adp->vbi_count + 1);
+ 	}
++	if (st & ADP_IRQ_VBI)
++		WRITE_ONCE(adp->vbi_count, adp->vbi_count + 1);
+ 
+ 	if (st & ADP_IRQ_ERRORS)
+ 		drm_err_ratelimited(&adp->drm, "ADP error status %08x%s%s%s%s%s\n", st,
+@@ -546,7 +560,7 @@ static void adpt_pipe_stalled(struct adpt *adp, bool test)
+ 	}
+ 	adp->irq_dead = true;
+ 	adp->stalled = true;
+-	adp->layer_armed = false;
++	adp->pkt_wait = false;
+ 	adp->irq_en_stall = readl(adp->adp + ADP_IRQ_EN);
+ 	writel(0, adp->adp + ADP_IRQ_EN);
+ 	spin_unlock_irqrestore(&adp->irq_lock, flags);
+@@ -653,41 +667,90 @@ static void adpt_panel_wake_locked(struct adpt *adp)
+ 		drm_err(&adp->drm, "panel did not take the wake-up commands\n");
+ }
+ 
++/* iOS's idle test (ADPParamFIFODriver @0xfffffff0088e7670): level 0x1040[12:0] == 0, ParmSt != 2 (and <= 5) */
++static bool adpt_fifo_idle(struct adpt *adp)
++{
++	u32 ps = FIELD_GET(ADP_PARAM_STATE_PARMST, readl(adp->adp + ADP_PARAM_STATE));
++
++	return !(readl(adp->adp + ADP_FIFO_LEVEL) & ADP_FIFO_LEVEL_MASK) && ps != 2 && ps <= 5;
++}
++
+ /*
+- * Write LAYER_CTL from the next VBI interrupt and wait for it (plus one frame). Needs DRM vblank to be
+- * usable (CRTC on); fails without touching the register when it is not, when the line is gone (storm
+- * guard / stall) or when no VBI comes within ADPT_LAYER_TIMEOUT_MS.
++ * Send one param-FIFO packet of @n words (runs of ADP registers, see ADP_FIFO_RUN_*) with the sync
++ * flag, as iOS's programFifoPacket_gated (@0xfffffff0088ead14 -> 0xfffffff0088e774c) does, and wait for
++ * the packet-done interrupt. Waits for the FIFO to be idle first (1 ms sleeps, never a spin). Caller
++ * holds panel_lock (one packet at a time). Needs the IRQ line: with the line off (storm guard / stall)
++ * nothing could report the packet, and a stalled pipe takes none.
+  */
+-static int adpt_layer_ctl_sync(struct adpt *adp, u32 val)
++static int adpt_fifo_packet(struct adpt *adp, const u32 *words, unsigned int n)
+ {
++	ktime_t t0 = ktime_get();
+ 	unsigned long flags;
+-	bool done;
+-	int ret;
++	bool en_had, done;
++	unsigned int i;
+ 
+ 	if (READ_ONCE(adp->irq_dead))
+ 		return -EIO;
+-	ret = drm_crtc_vblank_get(&adp->crtc);
+-	if (ret)
+-		return ret;
++	while (!adpt_fifo_idle(adp)) {
++		if (ktime_ms_delta(ktime_get(), t0) > ADPT_FIFO_IDLE_MS) {
++			drm_err(&adp->drm, "param FIFO not idle (state %08x level %08x): packet not sent\n",
++				readl(adp->adp + ADP_PARAM_STATE), readl(adp->adp + ADP_FIFO_LEVEL));
++			return -EBUSY;
++		}
++		usleep_range(1000, 2000);
++	}
++
+ 	spin_lock_irqsave(&adp->irq_lock, flags);
+-	adp->layer_req = val;
+-	adp->layer_done = false;
+-	adp->layer_armed = true;
++	en_had = readl(adp->adp + ADP_IRQ_EN) & ADP_IRQ_PKT_DONE;
++	writel(ADP_IRQ_PKT_DONE, adp->adp + ADP_IRQ_STATUS);	/* a stale bit would complete us at once */
++	writel(readl(adp->adp + ADP_IRQ_EN) | ADP_IRQ_PKT_DONE, adp->adp + ADP_IRQ_EN);
++	adp->pkt_done = false;
++	adp->pkt_wait = true;
++	adp->pkt_hdr = ADP_FIFO_SYNC | FIELD_PREP(ADP_FIFO_HDR_WORDS, n) |
++		       FIELD_PREP(ADP_FIFO_HDR_TAG, ++adp->tag ?: ++adp->tag);
++	adp->pkt_send_line = readl(adp->adbe + ADBE_LINE);
++	writel(adp->pkt_hdr, adp->adp + ADP_FIFO);
++	for (i = 0; i < n; i++)
++		writel(words[i], adp->adp + ADP_FIFO);
+ 	spin_unlock_irqrestore(&adp->irq_lock, flags);
++	t0 = ktime_get();
+ 
+-	wait_event_timeout(adp->layer_wq, !READ_ONCE(adp->layer_armed),
+-			   msecs_to_jiffies(ADPT_LAYER_TIMEOUT_MS));
++	wait_event_timeout(adp->layer_wq, !READ_ONCE(adp->pkt_wait), msecs_to_jiffies(ADPT_PKT_TIMEOUT_MS));
+ 
+ 	spin_lock_irqsave(&adp->irq_lock, flags);
+-	done = adp->layer_done;		/* only the IRQ sets it, right after the write */
+-	adp->layer_armed = false;
++	done = adp->pkt_done;
++	adp->pkt_wait = false;
++	if (!en_had && !adp->irq_dead)
++		writel(readl(adp->adp + ADP_IRQ_EN) & ~ADP_IRQ_PKT_DONE, adp->adp + ADP_IRQ_EN);
+ 	spin_unlock_irqrestore(&adp->irq_lock, flags);
+-	drm_crtc_vblank_put(&adp->crtc);
+-	if (!done)
+-		return -ETIMEDOUT;
+-	drm_dbg_driver(&adp->drm, "LAYER_CTL %08x written at ADBE line %08x\n", val, adp->layer_line);
+-	if (fifo_sync)
+-		adpt_fifo_kick(adp);
++	adp->pkt_ms = ktime_ms_delta(ktime_get(), t0);
++	adp->pkt_ret = done ? 0 : -ETIMEDOUT;
++	return adp->pkt_ret;
++}
++
++/*
++ * LAYER_CTL = @val through the param FIFO (applied at a frame boundary), then one more frame. Without
++ * a packet-done IRQ the register is read back after another 100 ms: if it holds @val the packet did
++ * land (the IRQ is what's missing), otherwise it did not (or not yet); either way the caller's state
++ * follows the hardware. Never a direct write: that is what kills the pipe.
++ */
++static int adpt_layer_ctl_set(struct adpt *adp, u32 val)
++{
++	const u32 pkt[] = { FIELD_PREP(ADP_FIFO_RUN_COUNT, 1) | ADP_LAYER_CTL, val };
++	int ret;
++
++	ret = adpt_fifo_packet(adp, pkt, ARRAY_SIZE(pkt));
++	if (ret == -ETIMEDOUT) {
++		msleep(ADPT_PKT_TIMEOUT_MS);
++		if (readl(adp->adp + ADP_LAYER_CTL) == val) {
++			drm_warn(&adp->drm, "LAYER_CTL packet: no packet-done IRQ, but it reads back %08x\n", val);
++			ret = 0;
++		}
++	}
++	if (ret)
++		return ret;
++	drm_dbg_driver(&adp->drm, "LAYER_CTL %08x: packet sent at %08x, done at %08x (ADBE f<<16|line)\n",
++		       val, adp->pkt_send_line, adp->pkt_done_line);
+ 	msleep(ADPT_LATCH_MS);
+ 	return 0;
+ }
+@@ -725,14 +788,14 @@ static void adpt_scanout_off_locked(struct adpt *adp)
+ 	spin_unlock_irqrestore(&adp->irq_lock, flags);
+ 
+ 	ctl = readl(adp->adp + ADP_LAYER_CTL);
+-	ret = adpt_layer_ctl_sync(adp, ctl & ADP_LAYER_CTL_KEEP);
++	adp->layer_ctl = ctl;	/* also for a late-landing packet, see adpt_scanout_on_locked() */
++	ret = adpt_layer_ctl_set(adp, ctl & ADP_LAYER_CTL_KEEP);
+ 	if (ret) {
+ 		/* layer untouched: unmask again and leave the pipe scanning */
+ 		adpt_irq_en(adp, adp->irq_en_off, 0);
+-		drm_warn(&adp->drm, "scanout off skipped: no vblank to time the layer write (%d)\n", ret);
++		drm_warn(&adp->drm, "scanout off skipped: layer packet not applied (%d)\n", ret);
+ 		return;
+ 	}
+-	adp->layer_ctl = ctl;
+ 	adp->scanout_off = true;
+ 	drm_dbg_driver(&adp->drm, "scanout off: LAYER_CTL %08x -> %08x, IRQ_EN masked %08x\n", ctl,
+ 		       readl(adp->adp + ADP_LAYER_CTL), adp->irq_en_off);
+@@ -740,17 +803,27 @@ static void adpt_scanout_off_locked(struct adpt *adp)
+ 
+ static void adpt_scanout_on_locked(struct adpt *adp)
+ {
++	u32 off = adp->layer_ctl & ADP_LAYER_CTL_KEEP;
+ 	int ret;
+ 
+-	if (!adp->scanout_off)
+-		return;
++	if (!adp->scanout_off) {
++		/* an off packet that timed out but landed later: the layer is off although we gave up */
++		if (!adp->layer_ctl || adp->layer_ctl == off || readl(adp->adp + ADP_LAYER_CTL) != off)
++			return;
++		drm_warn(&adp->drm, "late layer-off packet found (LAYER_CTL %08x): turning the layer back on\n", off);
++		adp->irq_en_off = 0;
++		adp->scanout_off = true;
++	}
+ 
+ 	/* the first frame the panel shows after wake has the layer */
+-	ret = adpt_layer_ctl_sync(adp, adp->layer_ctl);
++	ret = adpt_layer_ctl_set(adp, adp->layer_ctl);
+ 	if (ret) {
+-		/* no VBI (pipe stalled, or no vblank yet): write it anyway, nothing else can bring it back */
+-		drm_warn(&adp->drm, "scanout on without vblank (%d): direct LAYER_CTL write\n", ret);
+-		writel(adp->layer_ctl, adp->adp + ADP_LAYER_CTL);
++		/*
++		 * Still off (a direct write is what kills the pipe): stay in the off state, so the next
++		 * CRTC on or debugfs "power on" tries again. The screen is black meanwhile.
++		 */
++		drm_err(&adp->drm, "scanout on failed: layer packet not applied (%d), screen stays black\n", ret);
++		return;
+ 	}
+ 	/* drop what latched while masked (W1C, as iOS), then unmask what was enabled before */
+ 	if (!test_noack)
+@@ -856,7 +929,8 @@ static int adpt_power_show(struct seq_file *m, void *unused)
+ 		   adp->dsi ? "" : " (no DSI)",
+ 		   adp->stalled ? "; PIPE STALLED (timer vblank)" : adp->irq_dead ? "; IRQ off (timer vblank)" : "",
+ 		   READ_ONCE(deep_off), READ_ONCE(panel_sleep), READ_ONCE(adp->vbi_count));
+-	seq_printf(m, "last LAYER_CTL write at ADBE 0x1c = %08x (f<<16|line)\n", adp->layer_line);
++	seq_printf(m, "last packet %08x: %d after %u ms, sent at ADBE %08x, done at %08x (f<<16|line)\n",
++		   adp->pkt_hdr, adp->pkt_ret, adp->pkt_ms, adp->pkt_send_line, adp->pkt_done_line);
+ 	if (drm_dev_enter(&adp->drm, &idx)) {
+ 		seq_printf(m, "LAYER_CTL %08x (saved %08x) IRQ_EN %08x (masked %08x) IRQ_STATUS %08x frame %04x VFTG %08x\n",
+ 			   readl(adp->adp + ADP_LAYER_CTL), adp->layer_ctl, readl(adp->adp + ADP_IRQ_EN),
+@@ -899,7 +973,33 @@ static int adpt_wait_commit_idle(struct adpt *adp)
+  * until the last one is done with the hardware, so no BASE/STRIDE write races the layer change. Only
+  * while the CRTC is on: with it off the pipe belongs to the DPMS path.
+  */
+-static int adpt_power_set(struct adpt *adp, bool off)
++enum adpt_dbg_op { ADPT_OP_OFF, ADPT_OP_ON, ADPT_OP_FIFO_NOP, ADPT_OP_FIFO_SAME };
++
++/* debugfs "fifo" tests: a header-only packet, or LAYER_CTL = its current value (no visible change) */
++static int adpt_fifo_test(struct adpt *adp, bool same)
++{
++	int idx, ret = -ENODEV;
++
++	mutex_lock(&adp->panel_lock);
++	if (drm_dev_enter(&adp->drm, &idx)) {
++		if (same) {
++			u32 pkt[] = { FIELD_PREP(ADP_FIFO_RUN_COUNT, 1) | ADP_LAYER_CTL,
++				      readl(adp->adp + ADP_LAYER_CTL) };
++
++			ret = adpt_fifo_packet(adp, pkt, ARRAY_SIZE(pkt));
++		} else {
++			ret = adpt_fifo_packet(adp, NULL, 0);
++		}
++		drm_info(&adp->drm, "fifo test %s: %d after %u ms, header %08x, sent at %08x, done at %08x, LAYER_CTL %08x, IRQ_STATUS %08x\n",
++			 same ? "same" : "nop", ret, adp->pkt_ms, adp->pkt_hdr, adp->pkt_send_line,
++			 adp->pkt_done_line, readl(adp->adp + ADP_LAYER_CTL), readl(adp->adp + ADP_IRQ_STATUS));
++		drm_dev_exit(idx);
++	}
++	mutex_unlock(&adp->panel_lock);
++	return ret;
++}
++
++static int adpt_power_set(struct adpt *adp, enum adpt_dbg_op op)
+ {
+ 	struct drm_device *drm = &adp->drm;
+ 	struct drm_modeset_acquire_ctx ctx;
+@@ -910,10 +1010,12 @@ static int adpt_power_set(struct adpt *adp, bool off)
+ 		ret = -EBUSY;
+ 	} else {
+ 		ret = adpt_wait_commit_idle(adp);
+-		if (!ret && off)
++		if (!ret && op == ADPT_OP_OFF)
+ 			adpt_display_off(adp, true, true);
+-		else if (!ret)
++		else if (!ret && op == ADPT_OP_ON)
+ 			adpt_display_on(adp, true);
++		else if (!ret)
++			ret = adpt_fifo_test(adp, op == ADPT_OP_FIFO_SAME);
+ 	}
+ 	DRM_MODESET_LOCK_ALL_END(drm, ctx, ret);
+ 	return ret;
+@@ -928,9 +1030,13 @@ static ssize_t adpt_power_write(struct file *file, const char __user *ubuf, size
+ 	if (copy_from_user(buf, ubuf, min(len, sizeof(buf) - 1)))
+ 		return -EFAULT;
+ 	if (sysfs_streq(buf, "off"))
+-		ret = adpt_power_set(adp, true);
++		ret = adpt_power_set(adp, ADPT_OP_OFF);
+ 	else if (sysfs_streq(buf, "on"))
+-		ret = adpt_power_set(adp, false);
++		ret = adpt_power_set(adp, ADPT_OP_ON);
++	else if (sysfs_streq(buf, "nop"))		/* param FIFO test: header-only packet */
++		ret = adpt_power_set(adp, ADPT_OP_FIFO_NOP);
++	else if (sysfs_streq(buf, "same"))		/* param FIFO test: LAYER_CTL = its value */
++		ret = adpt_power_set(adp, ADPT_OP_FIFO_SAME);
+ 	else
+ 		return -EINVAL;
+ 	return ret ?: len;

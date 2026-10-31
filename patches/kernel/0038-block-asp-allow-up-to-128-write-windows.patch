@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 16:40:57 +0000
+Subject: [PATCH 038/138] block: asp: allow up to 128 write windows
+
+APFS free space is fragmented: a 4 GiB preallocated file came out as 66
+extents.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/block/asp.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/block/asp.c b/drivers/block/asp.c
+index c4e08be14..9fe221374 100644
+--- a/drivers/block/asp.c
++++ b/drivers/block/asp.c
+@@ -263,7 +263,7 @@ MODULE_PARM_DESC(allow_write, "Unlock writes to the user area (default: read-onl
+  * (byte offsets on the whole user-area disk), e.g. the extents of a file iOS
+  * preallocated for Linux. No windows = every write is rejected.
+  */
+-#define ASP_MAX_WRITE_WINDOWS	8
++#define ASP_MAX_WRITE_WINDOWS	128
+ static unsigned long long write_start[ASP_MAX_WRITE_WINDOWS];
+ static unsigned long long write_len[ASP_MAX_WRITE_WINDOWS];
+ static int nr_write_start, nr_write_len;

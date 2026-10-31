@@ -1,0 +1,266 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 21:28:39 +0000
+Subject: [PATCH 090/138] arm64: dts: apple: t7000-n61: Expose UART8 and the M8
+ motion coprocessor rails
+
+Add UART8 (serial8, pins 58/59 function 1, ps_uart8) and enable it on n61, add the
+PMIC LDOs that feed the M8 "Oscar" (ldo4 PP3V0_IMU, ldo16 PP1V2_OSCAR, ldo18
+PP1V8_OSCAR) as regulator-output consumers and name PMU GPIO 5 OSCAR_RESET_L, so
+userspace can power-cycle and boot the M8 during bring-up. The new rails are
+read-only unless apple_pmic_regulator.oscar_rails=1. Needs
+CONFIG_REGULATOR_USERSPACE_CONSUMER=y.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../regulator/apple,adi-pmic-ldo.yaml         |  3 +
+ arch/arm64/boot/dts/apple/t7000-common.dtsi   |  1 +
+ arch/arm64/boot/dts/apple/t7000-n61.dts       | 58 ++++++++++++++++++
+ arch/arm64/boot/dts/apple/t7000.dtsi          | 20 ++++++
+ drivers/regulator/apple-pmic-regulator.c      | 61 ++++++++++++++++++-
+ 5 files changed, 141 insertions(+), 2 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/regulator/apple,adi-pmic-ldo.yaml b/Documentation/devicetree/bindings/regulator/apple,adi-pmic-ldo.yaml
+index d316ec55a..da9f68b0e 100644
+--- a/Documentation/devicetree/bindings/regulator/apple,adi-pmic-ldo.yaml
++++ b/Documentation/devicetree/bindings/regulator/apple,adi-pmic-ldo.yaml
+@@ -16,7 +16,10 @@ description:
+ properties:
+   compatible:
+     enum:
++      - apple,adi-pmic-ldo4
+       - apple,adi-pmic-ldo15
++      - apple,adi-pmic-ldo16
++      - apple,adi-pmic-ldo18
+ 
+   reg:
+     maxItems: 1
+diff --git a/arch/arm64/boot/dts/apple/t7000-common.dtsi b/arch/arm64/boot/dts/apple/t7000-common.dtsi
+index 91a5c6e0b..5425065ce 100644
+--- a/arch/arm64/boot/dts/apple/t7000-common.dtsi
++++ b/arch/arm64/boot/dts/apple/t7000-common.dtsi
+@@ -20,6 +20,7 @@ aliases {
+ 		serial1 = &serial1;
+ 		serial3 = &serial3;
+ 		serial6 = &serial6;
++		serial8 = &serial8;
+ 	};
+ 
+ 	chosen {
+diff --git a/arch/arm64/boot/dts/apple/t7000-n61.dts b/arch/arm64/boot/dts/apple/t7000-n61.dts
+index d353a4d5e..9a4bd80e0 100644
+--- a/arch/arm64/boot/dts/apple/t7000-n61.dts
++++ b/arch/arm64/boot/dts/apple/t7000-n61.dts
+@@ -308,3 +308,61 @@ bluetooth {
+ 		device-wakeup-gpios = <&pinctrl 50 GPIO_ACTIVE_HIGH>;
+ 	};
+ };
++
++/*
++ * ADT /arm-io/uart8/oscar: the M8 motion coprocessor. Phase 1 of its
++ * bring-up only exposes the UART, the rails and the reset line to userspace
++ * (tools/oscar/oscartest); the rails are read-only unless
++ * apple_pmic_regulator.oscar_rails=1.
++ */
++&i2c0 {
++	pmic@74 {
++		/* ADT function-sensor_power: PP3V0_IMU */
++		pmic_ldo4: ldo4@82 {
++			compatible = "apple,adi-pmic-ldo4";
++			reg = <0x82 0x1>;
++			regulator-name = "PP3V0_IMU";
++		};
++
++		/* ADT function-oscar_power1: PP1V2_OSCAR (VddCore) */
++		pmic_ldo16: ldo16@85 {
++			compatible = "apple,adi-pmic-ldo16";
++			reg = <0x85 0x1>;
++			regulator-name = "PP1V2_OSCAR";
++		};
++
++		/* ADT function-oscar_power2: PP1V8_OSCAR (VddIO) */
++		pmic_ldo18: ldo18@85 {
++			compatible = "apple,adi-pmic-ldo18";
++			reg = <0x85 0x1>;
++			regulator-name = "PP1V8_OSCAR";
++		};
++	};
++};
++
++&pmic_gpio {
++	/* ADT oscar function-reset: PMU GPIO 5, active low */
++	gpio-line-names = "", "", "", "", "", "OSCAR_RESET_L",
++			  "", "", "BT_REG_ON", "", "WL_REG_ON";
++};
++
++&serial8 {
++	status = "okay";
++};
++
++/ {
++	oscar-vdd-core {
++		compatible = "regulator-output";
++		vout-supply = <&pmic_ldo16>;
++	};
++
++	oscar-vddio {
++		compatible = "regulator-output";
++		vout-supply = <&pmic_ldo18>;
++	};
++
++	oscar-vdd-imu {
++		compatible = "regulator-output";
++		vout-supply = <&pmic_ldo4>;
++	};
++};
+diff --git a/arch/arm64/boot/dts/apple/t7000.dtsi b/arch/arm64/boot/dts/apple/t7000.dtsi
+index 079feadb3..5bdc4f28c 100644
+--- a/arch/arm64/boot/dts/apple/t7000.dtsi
++++ b/arch/arm64/boot/dts/apple/t7000.dtsi
+@@ -265,6 +265,21 @@ serial6: serial@20a0d8000 {
+ 			status = "disabled";
+ 		};
+ 
++		serial8: serial@20a0e0000 {
++			compatible = "apple,s5l-uart";
++			reg = <0x2 0x0a0e0000 0x0 0x4000>;
++			reg-io-width = <4>;
++			interrupt-parent = <&aic>;
++			interrupts = <AIC_IRQ 166 IRQ_TYPE_LEVEL_HIGH>;
++			/* Use the bootloader-enabled clocks for now. */
++			clocks = <&clkref>, <&clkref>;
++			clock-names = "uart", "clk_uart_baud0";
++			pinctrl-0 = <&uart8_pins>;
++			pinctrl-names = "default";
++			power-domains = <&ps_uart8>;
++			status = "disabled";
++		};
++
+ 		mca2: i2s@20a0a8000 {
+ 			compatible = "apple,t7000-mca";
+ 			reg = <0x2 0x0a0a8000 0x0 0x4000>,
+@@ -488,6 +503,11 @@ uart5_pins: uart5-pins {
+ 				pinmux = <APPLE_PINMUX(57, 1)>;
+ 			};
+ 
++			uart8_pins: uart8-pins {
++				pinmux = <APPLE_PINMUX(58, 1)>,
++					 <APPLE_PINMUX(59, 1)>;
++			};
++
+ 			i2c1_pins: i2c1-pins {
+ 				pinmux = <APPLE_PINMUX(139, 1)>,
+ 					 <APPLE_PINMUX(138, 1)>;
+diff --git a/drivers/regulator/apple-pmic-regulator.c b/drivers/regulator/apple-pmic-regulator.c
+index 97e9cdd78..88e2066d4 100644
+--- a/drivers/regulator/apple-pmic-regulator.c
++++ b/drivers/regulator/apple-pmic-regulator.c
+@@ -9,9 +9,14 @@
+  *
+  * Only the enable bit is touched and no voltage is programmed: the rails keep
+  * the voltage the bootloader set up.
++ *
++ * The rails of the M8 motion coprocessor ("Oscar") are read-only unless
++ * oscar_rails is set: they are only switched during its bring-up, by
++ * userspace through regulator-output consumers.
+  */
+ 
+ #include <linux/bits.h>
++#include <linux/moduleparam.h>
+ #include <linux/err.h>
+ #include <linux/device.h>
+ #include <linux/mod_devicetable.h>
+@@ -22,9 +27,14 @@
+ #include <linux/regulator/driver.h>
+ #include <linux/slab.h>
+ 
++static bool oscar_rails;
++module_param(oscar_rails, bool, 0644);
++MODULE_PARM_DESC(oscar_rails, "Allow switching the motion coprocessor rails");
++
+ struct apple_pmic_ldo_data {
+ 	const char *name;
+ 	unsigned int enable_mask;
++	bool gated;
+ };
+ 
+ static const struct regulator_ops apple_pmic_ldo_ops = {
+@@ -33,6 +43,28 @@ static const struct regulator_ops apple_pmic_ldo_ops = {
+ 	.is_enabled = regulator_is_enabled_regmap,
+ };
+ 
++static int apple_pmic_ldo_gated_enable(struct regulator_dev *rdev)
++{
++	if (!oscar_rails)
++		return -EPERM;
++
++	return regulator_enable_regmap(rdev);
++}
++
++static int apple_pmic_ldo_gated_disable(struct regulator_dev *rdev)
++{
++	if (!oscar_rails)
++		return -EPERM;
++
++	return regulator_disable_regmap(rdev);
++}
++
++static const struct regulator_ops apple_pmic_ldo_gated_ops = {
++	.enable = apple_pmic_ldo_gated_enable,
++	.disable = apple_pmic_ldo_gated_disable,
++	.is_enabled = regulator_is_enabled_regmap,
++};
++
+ static int apple_pmic_regulator_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -57,7 +89,7 @@ static int apple_pmic_regulator_probe(struct platform_device *pdev)
+ 	desc->of_match = data->name;
+ 	desc->type = REGULATOR_VOLTAGE;
+ 	desc->owner = THIS_MODULE;
+-	desc->ops = &apple_pmic_ldo_ops;
++	desc->ops = data->gated ? &apple_pmic_ldo_gated_ops : &apple_pmic_ldo_ops;
+ 	desc->enable_reg = reg;
+ 	desc->enable_mask = data->enable_mask;
+ 
+@@ -74,14 +106,39 @@ static int apple_pmic_regulator_probe(struct platform_device *pdev)
+ 	return 0;
+ }
+ 
+-/* D2186: register 0x0085 holds the enables of ldo14..ldo18 in bits 0..4 */
++/*
++ * D2186 enable bits, from the iOS PMU rail table: register 0x0082 holds
++ * ldo4 in bit 4, register 0x0085 ldo14..ldo16 in bits 0..2 and ldo17/ldo18
++ * in bits 4/5.
++ */
++static const struct apple_pmic_ldo_data adi_pmic_ldo4 = {
++	.name = "ldo4",
++	.enable_mask = BIT(4),
++	.gated = true,
++};
++
+ static const struct apple_pmic_ldo_data adi_pmic_ldo15 = {
+ 	.name = "ldo15",
+ 	.enable_mask = BIT(1),
+ };
+ 
++static const struct apple_pmic_ldo_data adi_pmic_ldo16 = {
++	.name = "ldo16",
++	.enable_mask = BIT(2),
++	.gated = true,
++};
++
++static const struct apple_pmic_ldo_data adi_pmic_ldo18 = {
++	.name = "ldo18",
++	.enable_mask = BIT(5),
++	.gated = true,
++};
++
+ static const struct of_device_id apple_pmic_regulator_of_match[] = {
++	{ .compatible = "apple,adi-pmic-ldo4", .data = &adi_pmic_ldo4 },
+ 	{ .compatible = "apple,adi-pmic-ldo15", .data = &adi_pmic_ldo15 },
++	{ .compatible = "apple,adi-pmic-ldo16", .data = &adi_pmic_ldo16 },
++	{ .compatible = "apple,adi-pmic-ldo18", .data = &adi_pmic_ldo18 },
+ 	{ }
+ };
+ MODULE_DEVICE_TABLE(of, apple_pmic_regulator_of_match);

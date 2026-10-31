@@ -1,0 +1,240 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 23:19:25 +0000
+Subject: [PATCH 117/138] media: apple: t7000 ISP: stages 8-9 (PRINT_ENABLE,
+ START, CONFIG_GET, BUILDINFO) + graceful shutdown
+
+Piece 4 of the IPC code, completing stages 7-9:
+- stage 8: PRINT_ENABLE (opcode 4, 0xc bytes, enable = 1), then START
+  (opcode 0, 8 bytes); both need status 0.
+- stage 9: CONFIG_GET (opcode 3, 0x1c bytes) logged raw; BUILDINFO
+  (opcode 6) where status 2 = not implemented is expected; the build
+  string is taken from the fw header (+0x1060 / +0x1080).
+- isp_fw_shutdown (kext ISP_deInit): STOP, gpio0 = 0xf7fbdff9, POWER_DOWN
+  (0x10) without waiting, then <= 1 s for gpio0 == 0x8042006, 10 ms, and
+  the existing CPU stop + power-off path. Skipped once IO timed out.
+- SHAREDMALLOC replies zero words 1/2 like the kext (0x845ba18); a size
+  below 0x1000 becomes 0x1000.
+- isp-boot.c: include linux/mm.h for PAGE_ALIGN (W=1 build fix).
+
+Builds as an external module (LLVM=1 W=1) without warnings, vermagic
+7.3.0-rc1-gf689d352d4a8. Untested on hardware.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../media/platform/apple/isp-t7000/isp-boot.c |   1 +
+ .../media/platform/apple/isp-t7000/isp-ipc.c  | 163 +++++++++++++++++-
+ 2 files changed, 160 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-boot.c b/drivers/media/platform/apple/isp-t7000/isp-boot.c
+index 10e76448a..ad69da93e 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-boot.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-boot.c
+@@ -6,6 +6,7 @@
+ #include <linux/delay.h>
+ #include <linux/firmware.h>
+ #include <linux/jiffies.h>
++#include <linux/mm.h>
+ #include <linux/platform_device.h>
+ #include <linux/sizes.h>
+ #include <linux/string.h>
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-ipc.c b/drivers/media/platform/apple/isp-t7000/isp-ipc.c
+index 9661b97ed..3fe43a964 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-ipc.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-ipc.c
+@@ -8,7 +8,7 @@
+  *    address (bit0 = 0), doorbell 1 << src. Done when the fw sets bit0 again.
+  *  - type 1 (fw request needing a reply, SHAREDMALLOC / IO_T2H): present when
+  *    bit0 == 0; the host replies in the same slot, word0 = value | 1 (words 1/2
+- *    echoed), then the doorbell.
++ *    echoed for IO_T2H, zeroed for SHAREDMALLOC), then the doorbell.
+  *  - type 2 (fw report, TERMINAL): present when bit0 == 0; consume with
+  *    word0 = 1, no doorbell.
+  * All addresses are fw-relative (IOVA - fw IOVA). Nothing here is verified on hw.
+@@ -71,8 +71,9 @@ static void isp_terminal(struct t7000_isp *isp, u32 rel, u32 len)
+ }
+ 
+ /*
+- * SHAREDMALLOC request: word0 == 0 -> alloc (word1 size, word2 4cc tag),
+- * reply word0 = fw-rel address | 1. word0 != 0 -> free that address, reply 1.
++ * SHAREDMALLOC request: word0 == 0 -> alloc (word1 size, min 0x1000, word2 4cc
++ * tag), reply word0 = fw-rel address | 1. word0 != 0 -> free that address,
++ * reply 1. Words 1/2 of the reply are 0 (kext 0x845ba18).
+  * A failed alloc replies 1 (= NULL) so the fw sees a failure, not a hang.
+  */
+ static u32 isp_sm_request(struct t7000_isp *isp, u32 w0, u32 size, u32 tag)
+@@ -81,7 +82,7 @@ static u32 isp_sm_request(struct t7000_isp *isp, u32 w0, u32 size, u32 tag)
+ 	struct isp_surf *s;
+ 
+ 	if (!rel) {
+-		if (!size || size > ISP_SM_MAX) {
++		if (size > ISP_SM_MAX) {
+ 			dev_err(isp->dev, "SHAREDMALLOC: implausible size 0x%x '%4.4s', replying NULL\n",
+ 				size, (char *)&tag);
+ 			return 1;
+@@ -141,7 +142,10 @@ static int isp_drain(struct t7000_isp *isp, struct isp_chan *c)
+ 			WRITE_ONCE(m[0], 1);	/* consume, no doorbell */
+ 		} else {
+ 			if (c == isp->sm) {
++				/* kext processSharedMallocRequest: b138(ch, value, 0, 0) */
+ 				reply = isp_sm_request(isp, w0, w1, w2);
++				WRITE_ONCE(m[1], 0);
++				WRITE_ONCE(m[2], 0);
+ 			} else {
+ 				if (c == isp->tm)
+ 					isp_terminal(isp, w0 & ~3U, w1);
+@@ -462,3 +466,154 @@ void isp_ipc_stop(struct t7000_isp *isp)
+ 			dev_info(isp->dev, "ring '%s': %lu message(s)\n", isp->chans[i].name,
+ 				 isp->chans[i].msgs);
+ }
++
++/* CISP packet header: opcode u16 at +4, status u16 at +6 (A8 kext ISP_deInit) */
++struct isp_cmd_hdr {
++	u32 unk0;
++	u16 opcode;
++	u16 status;
++} __packed;
++
++struct isp_cmd_print_enable {
++	struct isp_cmd_hdr h;
++	u32 enable;
++} __packed;
++
++struct isp_cmd_config_get {
++	struct isp_cmd_hdr h;
++	u32 w[5];	/* Asahi: timestamp_freq, num_channels, unk_10/14/18 */
++} __packed;
++
++static_assert(sizeof(struct isp_cmd_hdr) == 8);
++static_assert(sizeof(struct isp_cmd_print_enable) == 0xc);
++static_assert(sizeof(struct isp_cmd_config_get) == 0x1c);
++
++/* Send a fixed-size command and wait; a non-zero status is logged and returned. */
++static int isp_cmd_simple(struct t7000_isp *isp, const char *name, void *pkt,
++			  u32 insize, u32 outsize, u16 *status)
++{
++	u16 st = 0xffff;
++	int ret = isp_cmd_send(isp, pkt, insize, outsize, true, &st);
++
++	if (ret) {
++		dev_err(isp->dev, "%s: send failed (%d)\n", name, ret);
++		return ret;
++	}
++	if (status)
++		*status = st;
++	if (st)
++		dev_warn(isp->dev, "%s: fw status 0x%04x\n", name, st);
++	else
++		dev_info(isp->dev, "%s: ok\n", name);
++	return 0;
++}
++
++/* Stage 8: PRINT_ENABLE(1) then START. Both must come back with status 0. */
++int isp_stage_start(struct t7000_isp *isp)
++{
++	struct isp_cmd_print_enable pe = {
++		.h.opcode = CISP_CMD_PRINT_ENABLE,
++		.enable = 1,
++	};
++	struct isp_cmd_hdr start = { .opcode = CISP_CMD_START };
++	u16 st;
++	int ret;
++
++	ret = isp_cmd_simple(isp, "PRINT_ENABLE", &pe, sizeof(pe), sizeof(pe), &st);
++	if (ret)
++		return ret;
++	if (st)
++		return -EIO;
++	ret = isp_cmd_simple(isp, "START", &start, sizeof(start), sizeof(start), &st);
++	if (ret)
++		return ret;
++	if (st)
++		return -EIO;
++	isp->started = true;
++	return 0;
++}
++
++/* Stage 9: CONFIG_GET (verified in the fw) and BUILDINFO (likely unimplemented). */
++int isp_stage_query(struct t7000_isp *isp)
++{
++	struct isp_cmd_config_get cfg = { .h.opcode = CISP_CMD_CONFIG_GET };
++	union {
++		struct isp_cmd_hdr h;
++		u8 raw[0x80];
++	} bi = { .h.opcode = CISP_CMD_BUILDINFO };
++	const char *hdr = (const char *)isp->fw->virt;
++	u16 st;
++	int ret;
++
++	ret = isp_cmd_simple(isp, "CONFIG_GET", &cfg, sizeof(cfg), sizeof(cfg), &st);
++	if (ret)
++		return ret;
++	dev_info(isp->dev, "CONFIG_GET: %08x %08x %08x %08x %08x (Asahi: timestamp_freq %u, num_channels %u)\n",
++		 cfg.w[0], cfg.w[1], cfg.w[2], cfg.w[3], cfg.w[4], cfg.w[0], cfg.w[1]);
++	if (st)
++		return -EIO;
++
++	ret = isp_cmd_simple(isp, "BUILDINFO", &bi, sizeof(bi.h), sizeof(bi), &st);
++	if (ret)
++		return ret;
++	if (st == 2)
++		dev_info(isp->dev, "BUILDINFO: status 2 = not implemented by this fw (expected: not in the A8 dispatcher)\n");
++	else if (!st)
++		dev_info(isp->dev, "BUILDINFO: %*ph\n", 0x40, bi.raw);
++	dev_info(isp->dev, "fw build (header +0x1060/+0x1080): '%.12s' '%.16s'\n",
++		 hdr + 0x1060, hdr + 0x1080);
++	return 0;
++}
++
++/*
++ * Graceful stop (kext ISP_deInit): STOP, gpio0 = 0xf7fbdff9, POWER_DOWN without
++ * waiting for its reply, then <= 1 s for the fw to write 0x8042006 to gpio0.
++ * The caller then halts the CPU (isp_cpu_stop) and powers off. isp->lock held,
++ * IRQ + worker already stopped, so the rings are serviced here.
++ */
++void isp_fw_shutdown(struct t7000_isp *isp)
++{
++	struct isp_cmd_hdr h = { .opcode = CISP_CMD_STOP };
++	unsigned long start, end;
++	u32 v;
++	int ret;
++
++	if (!isp->io || isp->io_dead) {
++		dev_warn(isp->dev, "graceful shutdown skipped: the fw is not answering IO\n");
++		goto out;
++	}
++	ret = isp_cmd_simple(isp, "STOP", &h, sizeof(h), sizeof(h), NULL);
++	if (ret) {
++		dev_err(isp->dev, "STOP failed (%d): skipping POWER_DOWN, hard stop follows\n", ret);
++		goto out;
++	}
++	isp->started = false;
++	isp_wr(isp, ISP_GPIO(0), ISP_MAGIC_ARGS);
++	h = (struct isp_cmd_hdr){ .opcode = CISP_CMD_POWER_DOWN };
++	ret = isp_cmd_send(isp, &h, sizeof(h), sizeof(h), false, NULL);
++	if (ret) {
++		dev_err(isp->dev, "POWER_DOWN send failed (%d), hard stop follows\n", ret);
++		goto out;
++	}
++	start = jiffies;
++	end = start + msecs_to_jiffies(1000);
++	for (;;) {
++		v = isp_rd(isp, ISP_GPIO(0));
++		if (v == ISP_MAGIC_WAKE) {
++			dev_info(isp->dev, "POWER_DOWN acknowledged (gpio0 0x8042006) after %u ms\n",
++				 jiffies_to_msecs(jiffies - start));
++			break;
++		}
++		isp_service(isp);
++		if (time_after(jiffies, end)) {
++			dev_err(isp->dev, "TIMEOUT (1 s) waiting for gpio0 == 0x8042006 after POWER_DOWN, gpio0 0x%08x\n",
++				v);
++			isp_log_window(isp, "on power-down timeout");
++			break;
++		}
++		usleep_range(1000, 2000);
++	}
++	msleep(10);	/* kext: 10 ms before the CPU stop */
++out:
++	isp->fw_up = false;
++}

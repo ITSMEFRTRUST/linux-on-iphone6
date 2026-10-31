@@ -1,0 +1,142 @@
+#!/bin/sh
+# tsup - Tailscale control on the phone. Installed as /usr/sbin/tsup (bin/mkblob); the binaries are NOT in the blob:
+# they live on the persistent flash in /data/tailscale (tailscale + tailscaled from the official static arm64 tarball,
+# state in /data/tailscale/state). Same style as wifiup.
+#   tsup on      remove the off flag, start tailscaled, "tailscale up" with the fixed settings below. Not logged in yet ->
+#                the login URL lands in /tmp/tailscale/login-url (and "tsup status" / "tsup url" print it).
+#   tsup off     touch the off flag, "tailscale down", stop tailscaled (SIGTERM, so it restores /etc/resolv.conf).
+#   tsup boot    what rd/etc/hl-rd.d/46-tailscale.sh calls: "on" unless the off flag exists (or no binaries).
+#   tsup status  one line: "tailscale <on|off>: <connected ip=100.x|needs-login url=...|starting|stopped|not-installed>"
+#   tsup url     the pending login URL (empty when none)
+#   tsup watch   what the 46 hook runs in the background: every 30 s, if tailscaled is dead but /etc/resolv.conf still
+#                points at MagicDNS (100.100.100.100), put the DHCP copy back ("status" does the same check)
+# Settings: hostname iphone6, --shields-up (nothing on the tailnet can connect in), no --ssh, no routes / exit node,
+# --accept-dns (MagicDNS; plain DNS keeps working: tailscaled forwards other names to the DHCP servers, which the wlan0
+# udhcpc script writes into tailscaled's resolv.conf backup), --netfilter-mode=off (no iptables on the phone).
+# Portmapper (UPnP / NAT-PMP / PCP holes in the router) and Taildrop are disabled. Log: /tmp/tailscale.log
+# Never pkill -f: every kill is by PID.
+PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH
+TS=/data/tailscale
+ST=$TS/state
+RUN=/run/tailscale
+SOCK=$RUN/tailscaled.sock
+PID=$RUN/tailscaled.pid
+T=/tmp/tailscale
+LOG=/tmp/tailscale.log
+UPFLAGS="--hostname=iphone6 --shields-up --accept-dns=true --accept-routes=false --ssh=false
+	--advertise-exit-node=false --advertise-routes= --netfilter-mode=off --qr=false"
+
+log() { echo "$(date +%T) tsup: $*" >> "$LOG"; echo "tsup: $*"; }
+ts() { "$TS/tailscale" --socket=$SOCK "$@"; }
+
+daemon_pid() {
+	p=$(cat $PID 2>/dev/null)
+	[ -n "$p" ] && [ -d /proc/$p ] && [ "$(cat /proc/$p/comm 2>/dev/null)" = tailscaled ] && echo "$p"
+}
+
+# backend state from "tailscale status --json": Running / NeedsLogin / Starting / Stopped / NoState ...
+backend() { ts status --json 2>/dev/null | sed -n 's/^  "BackendState": "\([A-Za-z]*\)".*/\1/p' | head -n 1; }
+
+start_daemon() {
+	[ -n "$(daemon_pid)" ] && return 0
+	mkdir -p $RUN $T "$ST"; chmod 700 "$ST"
+	# TS_LOGS_DIR: logtail's buffer next to the state (persistent, so a crash before upload isn't lost)
+	TS_DISABLE_PORTMAPPER=1 TS_DISABLE_TAILDROP=1 TS_LOGS_DIR="$ST" HOME=/root \
+		setsid "$TS/tailscaled" --state="$ST/tailscaled.state" --statedir="$ST" --socket=$SOCK \
+		--tun=tailscale0 --port=41641 >> "$LOG" 2>&1 < /dev/null 9>&- &
+	echo $! > $PID
+	i=0
+	while [ ! -S $SOCK ] && [ $i -lt 40 ]; do usleep 250000; i=$((i + 1)); done
+	[ -S $SOCK ] || { log "tailscaled did not come up (see $LOG)"; return 1; }
+	log "tailscaled started (pid $(cat $PID))"
+}
+
+# tailscale up: returns at once when the node is already authorised; otherwise it waits for the login, so it runs
+# under a timeout and the printed URL is kept for "tsup url" / Orchard
+do_up() {
+	rm -f $T/login-url
+	# shellcheck disable=SC2086
+	timeout 30 "$TS/tailscale" --socket=$SOCK up $UPFLAGS > $T/up.out 2>&1 9>&-
+	rc=$?
+	cat $T/up.out >> "$LOG"
+	url=$(grep -o 'https://login\.tailscale\.com/[^ ]*' $T/up.out | head -n 1)
+	if [ -n "$url" ]; then
+		echo "$url" > $T/login-url
+		log "needs login: $url"
+	elif [ $rc -eq 0 ]; then
+		log "up: $(ts ip -4 2>/dev/null)"
+	else
+		log "tailscale up exited $rc"
+	fi
+}
+
+do_on() {
+	[ -x "$TS/tailscaled" ] && [ -x "$TS/tailscale" ] || { log "not installed ($TS)"; return 1; }
+	mkdir -p "$TS"; rm -f "$TS/off"
+	start_daemon || return 1
+	do_up
+}
+
+# put the DHCP resolv.conf back if tailscaled died without restoring it (DNS must never stay on 100.100.100.100)
+fix_resolv() {
+	B=/etc/resolv.pre-tailscale-backup.conf
+	if [ -f $B ] && grep -q tailscale /etc/resolv.conf 2>/dev/null; then
+		cat $B > /etc/resolv.conf && rm -f $B && log "restored /etc/resolv.conf"
+	fi
+}
+
+do_off() {
+	mkdir -p "$TS"; touch "$TS/off"
+	p=$(daemon_pid)
+	if [ -n "$p" ]; then
+		timeout 10 "$TS/tailscale" --socket=$SOCK down >> "$LOG" 2>&1
+		kill "$p" 2>/dev/null
+		i=0
+		while [ -d /proc/$p ] && [ $i -lt 40 ]; do usleep 250000; i=$((i + 1)); done
+		[ -d /proc/$p ] && kill -9 "$p" 2>/dev/null
+	fi
+	rm -f $PID $T/login-url
+	fix_resolv
+	log "off"
+}
+
+do_boot() {
+	[ -x "$TS/tailscaled" ] || { log "boot: $TS not installed"; return 0; }
+	[ -e "$TS/off" ] && { log "boot: off flag set"; return 0; }
+	# wait (<= 120 s) for a default route: Wi-Fi associates + DHCPs in the background (45-wifi.sh)
+	i=0
+	while ! ip route | grep -q '^default' && [ $i -lt 240 ]; do usleep 500000; i=$((i + 1)); done
+	do_on
+}
+
+do_status() {
+	if [ -e "$TS/off" ]; then st=off; else st=on; fi
+	if [ ! -x "$TS/tailscaled" ]; then echo "tailscale $st: not-installed"; return 0; fi
+	if [ -z "$(daemon_pid)" ]; then fix_resolv > /dev/null; echo "tailscale $st: stopped"; return 0; fi
+	b=$(backend)
+	case "$b" in
+	Running) echo "tailscale $st: connected ip=$(ts ip -4 2>/dev/null | head -n 1)" ;;
+	NeedsLogin|NeedsMachineAuth)
+		url=$(cat $T/login-url 2>/dev/null)
+		[ -n "$url" ] || url=$(ts status --json 2>/dev/null | sed -n 's/^  "AuthURL": "\(.*\)".*/\1/p' | head -n 1)
+		echo "tailscale $st: needs-login url=${url:--}" ;;
+	Stopped) echo "tailscale $st: stopped" ;;
+	*) echo "tailscale $st: starting" ;;
+	esac
+}
+
+mkdir -p /tmp
+exec 9> /tmp/tailscale.lock
+case "$1" in
+status) do_status ;;
+watch)
+	while sleep 30; do
+		[ -z "$(daemon_pid)" ] && grep -q tailscale /etc/resolv.conf 2>/dev/null || continue
+		flock 9; [ -z "$(daemon_pid)" ] && fix_resolv; flock -u 9
+	done ;;
+url) cat $T/login-url 2>/dev/null ;;
+on|off|boot)
+	flock 9
+	do_$1 ;;
+*) echo "usage: tsup on|off|boot|status|url|watch" >&2; exit 2 ;;
+esac

@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 03:17:46 +0000
+Subject: [PATCH 062/138] iio: light: tsl2583: LOCAL: ignore_chip_id module
+ parameter
+
+Not an upstream-style change. Apple's CT819 may not report a 0x9x chip
+ID (iOS never reads it). With ignore_chip_id=1 the probe continues after
+logging the ID instead of failing with -EINVAL. Default behaviour is
+unchanged.
+
+Assisted-by: Claude:claude-sonnet-5-5
+---
+ drivers/iio/light/tsl2583.c | 19 ++++++++++++++++---
+ 1 file changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/iio/light/tsl2583.c b/drivers/iio/light/tsl2583.c
+index 53fd423aa..beb9d11aa 100644
+--- a/drivers/iio/light/tsl2583.c
++++ b/drivers/iio/light/tsl2583.c
+@@ -19,6 +19,7 @@
+ #include <linux/iio/iio.h>
+ #include <linux/iio/sysfs.h>
+ #include <linux/pm_runtime.h>
++#include <linux/moduleparam.h>
+ 
+ /* Device Registers and Masks */
+ #define TSL2583_CNTRL			0x00
+@@ -791,6 +792,11 @@ static const struct iio_info tsl2583_info = {
+ 	.write_raw = tsl2583_write_raw,
+ };
+ 
++/* LOCAL (not upstream): probe even if the ID register is not 0x9x (Apple CT819) */
++static bool ignore_chip_id;
++module_param(ignore_chip_id, bool, 0444);
++MODULE_PARM_DESC(ignore_chip_id, "Do not fail probe on an unexpected chip ID (Apple CT819)");
++
+ static int tsl2583_probe(struct i2c_client *clientp)
+ {
+ 	int ret;
+@@ -823,9 +829,16 @@ static int tsl2583_probe(struct i2c_client *clientp)
+ 	}
+ 
+ 	if ((ret & TSL2583_CHIP_ID_MASK) != TSL2583_CHIP_ID) {
+-		dev_err(&clientp->dev, "%s: received an unknown chip ID %x\n",
+-			__func__, ret);
+-		return -EINVAL;
++		/* LOCAL (not upstream): Apple's CT819 is not known to report 0x9x */
++		if (!ignore_chip_id) {
++			dev_err(&clientp->dev, "%s: received an unknown chip ID %x\n",
++				__func__, ret);
++			return -EINVAL;
++		}
++		dev_warn(&clientp->dev, "unknown chip ID %x ignored (ignore_chip_id=1)\n",
++			 ret);
++	} else {
++		dev_info(&clientp->dev, "chip ID %x\n", ret);
+ 	}
+ 
+ 	indio_dev->info = &tsl2583_info;

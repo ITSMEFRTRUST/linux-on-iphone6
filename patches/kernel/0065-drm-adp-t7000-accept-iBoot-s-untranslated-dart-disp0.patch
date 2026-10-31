@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 01:25:27 +0000
+Subject: [PATCH 065/138] drm: adp: t7000: accept iBoot's untranslated
+ dart-disp0 (n61 leaves TCR off; TTBRs are junk)
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/gpu/drm/adp/adp-t7000.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/drivers/gpu/drm/adp/adp-t7000.c b/drivers/gpu/drm/adp/adp-t7000.c
+index a0b63e9e8..602c48bff 100644
+--- a/drivers/gpu/drm/adp/adp-t7000.c
++++ b/drivers/gpu/drm/adp/adp-t7000.c
+@@ -688,6 +688,20 @@ static size_t adpt_dart_usable(struct adpt *adp)
+ 
+ 	if (!dart)
+ 		return 0;
++	/*
++	 * n61: iBoot leaves stream 0 untranslated (TCR byte 0 without bit 7, TTBRs hold junk that must
++	 * never be followed): the pipe fetches PA = 0x800000000 + its 32-bit address, so all of vram is usable.
++	 */
++	if (!(readl(dart + DART_TCR) & 0x80)) {
++		iounmap(dart);
++		if ((phys_addr_t)adp->vram_iova + 0x800000000ULL != adp->vram_phys) {
++			drm_err(&adp->drm, "DART bypass but vram iova %#x doesn't match pa %pa\n", adp->vram_iova,
++				&adp->vram_phys);
++			return 0;
++		}
++		drm_info(&adp->drm, "dart-disp0 in bypass: all %zu KB of vram usable\n", adp->vram_size >> 10);
++		return adp->vram_size;
++	}
+ 	for (off = 0; off < adp->vram_size; off += SZ_4K) {
+ 		u32 iova = adp->vram_iova + off;
+ 		u32 ttbr = readl(dart + DART_TTBR(0, iova >> 30));

@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 22:57:14 +0000
+Subject: [PATCH 092/138] ASoC: codecs: cs42l67: Program the serial port sample
+ rate
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+iOS' enableAudio sets register 0x012 [3:0] to the stream rate code
+(0x…86eeb58: 8k=1 ... 44.1k=8, 48k=9), the same codes as the CS42L73's
+VXSPFS XSP field, where 0 means "unknown". We never wrote it, so the
+codec ran with rate 0. Set 48 kHz on power-up, in the place iOS does.
+
+This alone does not make capture work (tested live: SDOUT stays low),
+but it matches iOS.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ sound/soc/codecs/cs42l67.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/sound/soc/codecs/cs42l67.c b/sound/soc/codecs/cs42l67.c
+index 7440f5915..d9567a8af 100644
+--- a/sound/soc/codecs/cs42l67.c
++++ b/sound/soc/codecs/cs42l67.c
+@@ -44,6 +44,9 @@
+ #define  PATH_PDN_OUT		BIT(7)
+ #define  PATH_PDN_IN		BIT(6)
+ #define CS42L67_XSP_CFG1	0x011
++#define CS42L67_SP_FS		0x012	/* [3:0] serial port rate, CS42L73 VXSPFS codes */
++#define  SP_FS_MASK		GENMASK(3, 0)
++#define  SP_FS_48K		9	/* 8k=1 11.025k=2 12k=3 16k=4 22.05k=5 24k=6 32k=7 44.1k=8 */
+ #define CS42L67_XSP_CTL		0x013
+ #define  XSP_PDN		BIT(7)
+ #define  XSP_TX_PDN		BIT(6)	/* codec -> AP */
+@@ -243,6 +246,8 @@ static int cs42l67_power_up(struct cs42l67 *cs)
+ 	regmap_write(map, CS42L67_ANA_202, 0x00);
+ 	regmap_write(map, CS42L67_ANA_239, 0x00);
+ 	regmap_update_bits(map, CS42L67_OUT_CTL, 0x20, 0x20);
++	/* iOS sets the rate here (0x…86eeb58); 0 = "unknown" on the CS42L73 */
++	regmap_update_bits(map, CS42L67_SP_FS, SP_FS_MASK, SP_FS_48K);
+ 	regmap_write(map, CS42L67_MISC_130, 0xa0);
+ 
+ 	/*

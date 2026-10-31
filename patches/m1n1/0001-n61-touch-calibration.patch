@@ -1,0 +1,72 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 00:00:00 +0000
+Subject: [PATCH 1/2] kboot: Forward the iPhone 6 (n61) N1 touch calibration to the DT
+
+The n61 touch IC is an Apple N1 multitouch chip (a Z2 variant). iBoot has
+already copied its SysCfg calibration blobs (MtCl 0x400 bytes, PxCl 0x80
+bytes) into the ADT under /arm-io/spi2/multi-touch; pass both to the
+Linux touchscreen node as apple,z2-cal-blob / apple,z2-prox-cal-blob.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+diff --git a/src/kboot.c b/src/kboot.c
+index 2840651..7b2b49f 100644
+--- a/src/kboot.c
++++ b/src/kboot.c
+@@ -898,6 +898,43 @@ static int dt_set_multitouch(void)
+     return 0;
+ }
+ 
++/*
++ * A8 (t7000) iPhone 6 (n61): the touch IC is an "N1" multitouch chip, not a Z2.
++ * iBoot already put the SysCfg calibration (MtCl 0x400 B, PxCl 0x80 B) into the
++ * ADT; forward both to the Linux touchscreen node.
++ */
++static int dt_set_n1_touch(void)
++{
++    const char *adt_touch;
++    if (fdt_node_check_compatible(dt, 0, "apple,n61") == 0)
++        adt_touch = "/arm-io/spi2/multi-touch";
++    else
++        return 0;
++
++    int node = fdt_node_offset_by_compatible(dt, -1, "apple,n61-touchscreen");
++    if (node < 0)
++        return 0;
++
++    int anode = adt_path_offset(adt, adt_touch);
++    if (anode < 0)
++        bail("ADT: touchscreen node %s not found\n", adt_touch);
++
++    u32 len;
++    const u8 *cal_blob = adt_getprop(adt, anode, "multi-touch-calibration", &len);
++    if (!cal_blob || !len)
++        printf("ADT: Failed to get multi-touch-calibration from %s\n", adt_touch);
++    else
++        fdt_setprop(dt, node, "apple,z2-cal-blob", cal_blob, len);
++
++    const u8 *prox_blob = adt_getprop(adt, anode, "prox-calibration", &len);
++    if (!prox_blob || !len)
++        printf("ADT: Failed to get prox-calibration from %s\n", adt_touch);
++    else
++        fdt_setprop(dt, node, "apple,z2-prox-cal-blob", prox_blob, len);
++
++    return 0;
++}
++
+ #include "keyboard_types.h"
+ 
+ static int dt_set_ipd(void)
+@@ -2982,6 +3019,8 @@ int kboot_prepare_dt(void *fdt)
+         return -1;
+     if (dt_set_multitouch())
+         return -1;
++    if (dt_set_n1_touch())
++        return -1;
+     if (dt_set_sep())
+         return -1;
+     if (dt_set_pmp())
+-- 
+2.51.0
+

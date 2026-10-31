@@ -1,0 +1,160 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 23:37:17 +0000
+Subject: [PATCH 118/138] media: apple: t7000 ISP: ack DART faults, never skip
+ the TLIMIT drains
+
+Review B1: DART_ERROR is W1C on s5l8960x (mainline apple_dart_s5l8960x_irq
+writes it back) but was never cleared, so after one fault every later
+wait aborted at once - including the TLIMIT drain waits right before
+ps_isp is gated.
+
+- isp_dart_fault() acks the error after logging it: only new faults count.
+- __isp_wait() gets a fault_abort flag; the two drains in isp_cpu_stop
+  always wait their full 100 ms like kext ISP_deInit.
+- isp_service() no longer consumes the fault; the callers (cmd wait, IRQ
+  thread, poll worker, stage 7, POWER_DOWN wait) check it, so a fault is
+  seen exactly once.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../media/platform/apple/isp-t7000/isp-boot.c | 30 ++++++++++++++-----
+ .../media/platform/apple/isp-t7000/isp-dart.c |  2 ++
+ .../media/platform/apple/isp-t7000/isp-ipc.c  | 13 ++++++--
+ 3 files changed, 34 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-boot.c b/drivers/media/platform/apple/isp-t7000/isp-boot.c
+index ad69da93e..6263a6989 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-boot.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-boot.c
+@@ -21,9 +21,13 @@ static const u16 isp_tlimit[] = {
+ 	0x48, 0x4c, 0x50, 0x54, 0x58, 0x5c, 0x60, 0x64,
+ };
+ 
+-/* Poll (reg & mask) == want every 10 ms; a DART fault aborts early. */
+-int isp_wait(struct t7000_isp *isp, u32 off, u32 mask, u32 want, uint ms,
+-	     const char *what)
++/*
++ * Poll (reg & mask) == want every 10 ms. With @fault_abort a (new) DART fault
++ * aborts early; without it the fault is only logged + acked and the wait runs
++ * its full time (used for the TLIMIT drains before power-off).
++ */
++static int __isp_wait(struct t7000_isp *isp, u32 off, u32 mask, u32 want, uint ms,
++		      const char *what, bool fault_abort)
+ {
+ 	unsigned long start = jiffies, end = start + msecs_to_jiffies(ms);
+ 	u32 v;
+@@ -38,9 +42,12 @@ int isp_wait(struct t7000_isp *isp, u32 off, u32 mask, u32 want, uint ms,
+ 			return 0;
+ 		}
+ 		if (isp_dart_fault(isp)) {
+-			dev_err(isp->dev, "DART fault while waiting for %s (reg 0x%08x)\n", what, v);
+-			isp_log_window(isp, "on fault");
+-			return -EIO;
++			dev_err(isp->dev, "DART fault while waiting for %s (reg 0x%08x)%s\n", what, v,
++				fault_abort ? "" : ", still waiting");
++			if (fault_abort) {
++				isp_log_window(isp, "on fault");
++				return -EIO;
++			}
+ 		}
+ 		if (time_after(jiffies, end))
+ 			break;
+@@ -53,6 +60,12 @@ int isp_wait(struct t7000_isp *isp, u32 off, u32 mask, u32 want, uint ms,
+ 	return -ETIMEDOUT;
+ }
+ 
++int isp_wait(struct t7000_isp *isp, u32 off, u32 mask, u32 want, uint ms,
++	     const char *what)
++{
++	return __isp_wait(isp, off, mask, want, ms, what, true);
++}
++
+ static void isp_fw_strings(struct t7000_isp *isp, const u8 *d, size_t len)
+ {
+ 	if (len < 0x10a0) {
+@@ -166,8 +179,9 @@ void isp_cpu_stop(struct t7000_isp *isp)
+ 	msleep(10);
+ 	for (i = 0; i < ARRAY_SIZE(isp_tlimit); i++)
+ 		isp_wr(isp, isp_tlimit[i], 0);
+-	isp_wait(isp, ISP_TLIMIT0_OUT, ~0U, 0, 100, "TLIMIT0 drain (+0x44 == 0)");
+-	isp_wait(isp, ISP_TLIMIT1_OUT, ~0U, 0, 100, "TLIMIT1 drain (+0x68 == 0)");
++	/* kext ISP_deInit always waits up to 100 ms per drain, fault or not */
++	__isp_wait(isp, ISP_TLIMIT0_OUT, ~0U, 0, 100, "TLIMIT0 drain (+0x44 == 0)", false);
++	__isp_wait(isp, ISP_TLIMIT1_OUT, ~0U, 0, 100, "TLIMIT1 drain (+0x68 == 0)", false);
+ 	isp->cpu_started = false;
+ 	isp_log_window(isp, "after CPU stop");
+ }
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-dart.c b/drivers/media/platform/apple/isp-t7000/isp-dart.c
+index 77469309e..67b4da7fd 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-dart.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-dart.c
+@@ -47,6 +47,8 @@ bool isp_dart_fault(struct t7000_isp *isp)
+ 		dev_err(isp->dev, "DART fault: error 0x%08x (stream %lu code 0x%02x) addr 0x%08x\n",
+ 			err, (unsigned long)((err >> 24) & 3), err & 0xff,
+ 			dart_rd(isp, DART_ERROR_ADDR));
++	/* W1C ack (mainline apple_dart_s5l8960x_irq): only new faults count from here on */
++	dart_wr(isp, DART_ERROR, err);
+ 	return true;
+ }
+ 
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-ipc.c b/drivers/media/platform/apple/isp-t7000/isp-ipc.c
+index 3fe43a964..2a397bbe3 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-ipc.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-ipc.c
+@@ -163,7 +163,10 @@ static int isp_drain(struct t7000_isp *isp, struct isp_chan *c)
+ 	return done;
+ }
+ 
+-/* One service pass: ack the mailbox, drain all fw->host rings, check the DART. */
++/*
++ * One service pass: ack the mailbox, drain all fw->host rings. The DART error
++ * is checked (and acked) by the callers, so a fault is seen exactly once.
++ */
+ int isp_service(struct t7000_isp *isp)
+ {
+ 	u32 pending, i;
+@@ -179,7 +182,6 @@ int isp_service(struct t7000_isp *isp)
+ 			continue;
+ 		n += isp_drain(isp, c);
+ 	}
+-	isp_dart_fault(isp);
+ 	return n;
+ }
+ 
+@@ -293,6 +295,7 @@ static irqreturn_t isp_irq_thread(int irq, void *data)
+ 
+ 	mutex_lock(&isp->lock);
+ 	isp_service(isp);
++	isp_dart_fault(isp);
+ 	mutex_unlock(&isp->lock);
+ 	return IRQ_HANDLED;
+ }
+@@ -342,8 +345,10 @@ static void isp_poll_fn(struct work_struct *work)
+ 	int n = 0;
+ 
+ 	mutex_lock(&isp->lock);
+-	if (READ_ONCE(isp->poll_on))
++	if (READ_ONCE(isp->poll_on)) {
+ 		n = isp_service(isp);
++		isp_dart_fault(isp);
++	}
+ 	mutex_unlock(&isp->lock);
+ 	if (n && isp->irq >= 0)
+ 		dev_info_ratelimited(isp->dev, "safety poll handled %d message(s) the IRQ did not (irqs so far: %d)\n",
+@@ -437,6 +442,7 @@ int isp_stage_mbox(struct t7000_isp *isp)
+ 	isp->poll_init = true;
+ 	WRITE_ONCE(isp->poll_on, true);
+ 	n = isp_service(isp);
++	isp_dart_fault(isp);
+ 	dev_info(isp->dev, "initial service pass: %d message(s); %s, poll every %u ms\n", n,
+ 		 isp->irq >= 0 ? "IRQ mode" : "poll mode", isp_poll_interval(isp));
+ 	schedule_delayed_work(&isp->poll_work, msecs_to_jiffies(isp_poll_interval(isp)));
+@@ -605,6 +611,7 @@ void isp_fw_shutdown(struct t7000_isp *isp)
+ 			break;
+ 		}
+ 		isp_service(isp);
++		isp_dart_fault(isp);	/* log + ack only: keep waiting */
+ 		if (time_after(jiffies, end)) {
+ 			dev_err(isp->dev, "TIMEOUT (1 s) waiting for gpio0 == 0x8042006 after POWER_DOWN, gpio0 0x%08x\n",
+ 				v);

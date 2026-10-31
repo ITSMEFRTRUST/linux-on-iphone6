@@ -1,0 +1,29 @@
+#!/bin/bash
+# mkdisk - build tools/disk.tgz: e2fsprogs + dmsetup for the phone's writable data area (Alpine aarch64, musl),
+# minus what the initramfs / tools/alsa.tgz already provide. Used by tools/flashdata.
+# usage: bin/mkdisk   (needs network for the apk downloads; stage lives in var/alpine/disk, gitignored)
+set -e
+cd "$(dirname "$(readlink -f "$0")")/.."
+APK=dl/apk/x/sbin/apk.static
+[ -x $APK ] || { echo "no $APK (run ui/fetch-deps.sh first)"; exit 1; }
+R=var/alpine/disk
+REPO=https://dl-cdn.alpinelinux.org/alpine/${REL:-v3.22}
+rm -rf $R; mkdir -p $R
+$APK --arch aarch64 --root $R --initdb --usermode --no-scripts --allow-untrusted \
+	-X $REPO/main -X $REPO/community \
+	add e2fsprogs e2fsprogs-extra device-mapper >/dev/null
+
+BINS="sbin/mke2fs sbin/e2fsck sbin/dmsetup usr/sbin/tune2fs usr/sbin/dumpe2fs"
+DATA="etc/mke2fs.conf"
+
+PROV=var/alpine/provided; rm -rf $PROV; mkdir -p $PROV
+tar xzf tools/alsa.tgz -C $PROV
+mkdir -p $PROV/lib; cp -a $R/lib/ld-musl-aarch64.so.1 $R/lib/libc.musl-aarch64.so.1 $PROV/lib/   # musl is in the initramfs
+LIST=$(mktemp)
+bin/btclosure $R $PROV -- $BINS > $LIST
+for f in $DATA; do echo $f >> $LIST; done
+for f in $(cat $LIST); do [ -e $R/$f ] || [ -L $R/$f ] || { echo "missing $f"; exit 1; }; done
+sort -u $LIST -o $LIST
+tar -C $R --no-recursion --owner=0 --group=0 --numeric-owner -T $LIST -czf tools/disk.tgz.new
+mv tools/disk.tgz.new tools/disk.tgz; rm -f $LIST
+ls -la tools/disk.tgz; tar tzf tools/disk.tgz

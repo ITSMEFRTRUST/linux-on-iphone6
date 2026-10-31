@@ -1,0 +1,85 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 19:15:41 +0000
+Subject: [PATCH 050/138] arm64: dts: apple: t7000: Add UART3 for the NFC
+ controller
+
+UART3 (AIC 161, ps_uart3, pins 178-181) carries the NXP PN548-class NFC
+controller on the iPhone 6 (ADT /arm-io/uart3/stockholm). Enable the
+port on n61 so the controller can be probed from user space first.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ arch/arm64/boot/dts/apple/t7000-common.dtsi |  1 +
+ arch/arm64/boot/dts/apple/t7000-n61.dts     |  5 +++++
+ arch/arm64/boot/dts/apple/t7000.dtsi        | 22 +++++++++++++++++++++
+ 3 files changed, 28 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/apple/t7000-common.dtsi b/arch/arm64/boot/dts/apple/t7000-common.dtsi
+index d1ecb2e3a..8496abee9 100644
+--- a/arch/arm64/boot/dts/apple/t7000-common.dtsi
++++ b/arch/arm64/boot/dts/apple/t7000-common.dtsi
+@@ -15,6 +15,7 @@ aliases {
+ 		asp = &ans;
+ 		serial0 = &serial0;
+ 		serial1 = &serial1;
++		serial3 = &serial3;
+ 		serial6 = &serial6;
+ 	};
+ 
+diff --git a/arch/arm64/boot/dts/apple/t7000-n61.dts b/arch/arm64/boot/dts/apple/t7000-n61.dts
+index 86dd7640f..d7eea3892 100644
+--- a/arch/arm64/boot/dts/apple/t7000-n61.dts
++++ b/arch/arm64/boot/dts/apple/t7000-n61.dts
+@@ -188,6 +188,11 @@ touchscreen@0 {
+ 	};
+ };
+ 
++/* ADT /arm-io/uart3/stockholm: NXP PN548-class NFC controller */
++&serial3 {
++	status = "okay";
++};
++
+ &serial1 {
+ 	status = "okay";
+ 
+diff --git a/arch/arm64/boot/dts/apple/t7000.dtsi b/arch/arm64/boot/dts/apple/t7000.dtsi
+index f2784ec9e..e75e46ef6 100644
+--- a/arch/arm64/boot/dts/apple/t7000.dtsi
++++ b/arch/arm64/boot/dts/apple/t7000.dtsi
+@@ -228,6 +228,21 @@ serial1: serial@20a0c4000 {
+ 			status = "disabled";
+ 		};
+ 
++		serial3: serial@20a0cc000 {
++			compatible = "apple,s5l-uart";
++			reg = <0x2 0x0a0cc000 0x0 0x4000>;
++			reg-io-width = <4>;
++			interrupt-parent = <&aic>;
++			interrupts = <AIC_IRQ 161 IRQ_TYPE_LEVEL_HIGH>;
++			/* Use the bootloader-enabled clocks for now. */
++			clocks = <&clkref>, <&clkref>;
++			clock-names = "uart", "clk_uart_baud0";
++			pinctrl-0 = <&uart3_pins>;
++			pinctrl-names = "default";
++			power-domains = <&ps_uart3>;
++			status = "disabled";
++		};
++
+ 		serial6: serial@20a0d8000 {
+ 			compatible = "apple,s5l-uart";
+ 			reg = <0x2 0x0a0d8000 0x0 0x4000>;
+@@ -451,6 +466,13 @@ uart1_pins: uart1-pins {
+ 					 <APPLE_PINMUX(176, 1)>;
+ 			};
+ 
++			uart3_pins: uart3-pins {
++				pinmux = <APPLE_PINMUX(178, 1)>,
++					 <APPLE_PINMUX(179, 1)>,
++					 <APPLE_PINMUX(180, 1)>,
++					 <APPLE_PINMUX(181, 1)>;
++			};
++
+ 			i2c1_pins: i2c1-pins {
+ 				pinmux = <APPLE_PINMUX(139, 1)>,
+ 					 <APPLE_PINMUX(138, 1)>;

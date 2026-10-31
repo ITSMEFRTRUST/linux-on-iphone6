@@ -1,0 +1,1012 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 01:20:27 +0000
+Subject: [PATCH 064/138] drm: adp: Add a draft driver for the Apple A8 (T7000)
+ display pipe
+
+First draft for the iPhone 6. It keeps everything iBoot set up (DSI,
+panel, ADBE0 timings, the dart-disp0 page tables) and only programs the
+pipe 0 base and stride, optionally latched with the parameter FIFO sync
+word. Scanout buffers are allocated from the 12 MB vram carveout that
+iBoot already maps in the display DART, after checking the mapping by
+walking iBoot's tables, so no IOMMU hand-over is needed.
+
+Vblank and flip completion use the ADP interrupt (AIC 103, enable
+0x1028, W1C status 0x102c), with a storm guard. simpledrm is removed
+through the aperture helpers after both power domains are held.
+
+standalone=1 is a test mode that creates the device without a DT node
+so the module can be loaded on a running kernel.
+
+Untested on hardware.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/gpu/drm/adp/Kconfig     |  14 +
+ drivers/gpu/drm/adp/Makefile    |   1 +
+ drivers/gpu/drm/adp/adp-t7000.c | 945 ++++++++++++++++++++++++++++++++
+ 3 files changed, 960 insertions(+)
+ create mode 100644 drivers/gpu/drm/adp/adp-t7000.c
+
+diff --git a/drivers/gpu/drm/adp/Kconfig b/drivers/gpu/drm/adp/Kconfig
+index 9fcc27eb2..389eca1ed 100644
+--- a/drivers/gpu/drm/adp/Kconfig
++++ b/drivers/gpu/drm/adp/Kconfig
+@@ -15,3 +15,17 @@ config DRM_ADP
+ 	  Chose this option if you have an Apple Arm laptop with a touchbar.
+ 
+ 	  If M is selected, this module will be called adpdrm.
++
++config DRM_ADP_T7000
++	tristate "DRM Support for the Apple A8 (T7000) display pipe"
++	depends on DRM && OF && ARM64
++	depends on ARCH_APPLE || COMPILE_TEST
++	select DRM_KMS_HELPER
++	select GENERIC_ALLOCATOR
++	help
++	  Choose this option for the internal display of Apple A8 devices
++	  (iPhone 6, iPad mini 4, iPod touch 6). The driver takes over the
++	  display pipe that iBoot set up and scans out buffers from the boot
++	  framebuffer carveout.
++
++	  If M is selected, this module will be called adp-t7000.
+diff --git a/drivers/gpu/drm/adp/Makefile b/drivers/gpu/drm/adp/Makefile
+index 8e7b618ed..1993b3149 100644
+--- a/drivers/gpu/drm/adp/Makefile
++++ b/drivers/gpu/drm/adp/Makefile
+@@ -3,3 +3,4 @@
+ adpdrm-y := adp_drv.o
+ adpdrm-mipi-y := adp-mipi.o
+ obj-$(CONFIG_DRM_ADP) += adpdrm.o adpdrm-mipi.o
++obj-$(CONFIG_DRM_ADP_T7000) += adp-t7000.o
+diff --git a/drivers/gpu/drm/adp/adp-t7000.c b/drivers/gpu/drm/adp/adp-t7000.c
+new file mode 100644
+index 000000000..a0b63e9e8
+--- /dev/null
++++ b/drivers/gpu/drm/adp/adp-t7000.c
+@@ -0,0 +1,945 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Apple A8 (T7000) display pipe ("AppleH7DisplayPipe" in iOS), first draft.
++ *
++ * Same H7 ADP IP as the M1 Touch Bar pipe driven by adp_drv.c (identical layer, blend and param-FIFO
++ * registers), but on A8:
++ *  - vblank and "param packet applied" come from the ADP block itself (IRQ enable 0x1028, W1C status
++ *    0x102c, AIC IRQ 103), not from the fe block's 0x34/0x100;
++ *  - there is no DSI bridge to bind: iBoot leaves the Synopsys DSI host, the panel and the ADBE0 timing
++ *    generator running, and this driver never touches them (fixed mode, no modeset);
++ *  - the dart-disp0 DART keeps iBoot's page tables. Scanout buffers are carved out of the 12 MB "vram"
++ *    region that iBoot already maps for the boot framebuffer, so no IOMMU domain switch happens and the
++ *    pipe can never fetch from an unmapped IOVA.
++ *
++ * Reverse engineering notes: re/DISPLAY.md and re/DISPLAY-PHASE2.md in the iphone6-linux repo.
++ *
++ * Test mode: with standalone=1 the module creates its own device on the running kernel (no DT node
++ * needed, hard-coded A8 addresses, the power domains taken from /chosen/framebuffer) and takes over
++ * from simpledrm.
++ */
++
++#include <linux/aperture.h>
++#include <linux/bitfield.h>
++#include <linux/genalloc.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/irqdomain.h>
++#include <linux/mm.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_reserved_mem.h>
++#include <linux/platform_device.h>
++#include <linux/pm_domain.h>
++
++#include <drm/drm_atomic.h>
++#include <drm/drm_atomic_helper.h>
++#include <drm/drm_connector.h>
++#include <drm/drm_drv.h>
++#include <drm/drm_dumb_buffers.h>
++#include <drm/drm_edid.h>
++#include <drm/drm_encoder.h>
++#include <drm/drm_file.h>
++#include <drm/drm_fourcc.h>
++#include <drm/drm_framebuffer.h>
++#include <drm/drm_gem.h>
++#include <drm/drm_gem_framebuffer_helper.h>
++#include <drm/drm_ioctl.h>
++#include <drm/drm_managed.h>
++#include <drm/drm_modeset_helper_vtables.h>
++#include <drm/drm_print.h>
++#include <drm/drm_probe_helper.h>
++#include <drm/drm_vblank.h>
++
++/* ADP ("be" in adp_drv.c) */
++#define ADP_PARAM_STATE		0x101c
++#define ADP_PARAM_STATE_PARMST	GENMASK(7, 4)
++#define ADP_IRQ_EN		0x1028
++#define ADP_IRQ_STATUS		0x102c
++#define ADP_IRQ_VBI		BIT(0)
++#define ADP_IRQ_UNDERRUN	BIT(1)
++#define ADP_IRQ_PKT_MISSED	BIT(3)
++#define ADP_IRQ_PF_ALIGN	BIT(6)
++#define ADP_IRQ_PF_OVER		BIT(9)
++#define ADP_IRQ_PKT_DONE	BIT(10)
++#define ADP_IRQ_RDERR		BIT(11)
++#define ADP_IRQ_ERRORS		(ADP_IRQ_UNDERRUN | ADP_IRQ_PKT_MISSED | ADP_IRQ_PF_ALIGN | \
++				 ADP_IRQ_PF_OVER | ADP_IRQ_RDERR)
++#define ADP_FRAME_COUNT		0x1034
++#define ADP_FIFO_LEVEL		0x1040
++#define ADP_FIFO_LEVEL_MASK	GENMASK(12, 0)
++#define ADP_FIFO		0x10c0
++#define ADP_FIFO_SYNC		0xc0000000
++
++/* generic pipe p (layer) at 0x4000 + 0x2000 * p */
++#define PIPE(p)			(0x4000 + 0x2000 * (p))
++#define PIPE_PIX_FMT		0x2c
++#define PIPE_PIX_FMT_XRGB32	0x53e4001
++#define PIPE_BASE		0x30
++#define PIPE_STRIDE		0x38
++#define PIPE_SRC_SIZE		0x48
++
++/* ADBE0 ("fe"): read only here */
++#define ADBE_SCREEN_SIZE	0x0c
++
++/* A8 constants for standalone=1 (ADT disp0 / dart-disp0 / vram / PMGR) */
++#define T7000_ADP_PHYS		0x206200000ULL
++#define T7000_ADBE_PHYS		0x206400000ULL
++#define T7000_DART_PHYS		0x206304000ULL
++#define T7000_PMGR_PS_PAGE	0x20e020000ULL
++#define T7000_VRAM_PHYS		0x83e900000ULL
++#define T7000_VRAM_SIZE		0xbfb000ULL
++#define T7000_ADP_HWIRQ		103
++
++#define DART_TCR		0x0c
++#define DART_TTBR(sid, i)	(0x40 + 0x10 * (sid) + 4 * (i))
++#define DART_TTBR_VALID		BIT(31)
++#define DART_PTE_VALID		BIT_ULL(0)
++#define DART_PA_MASK		GENMASK_ULL(35, 12)
++
++#define ADP_PITCH_ALIGN		64
++
++static bool standalone;
++module_param(standalone, bool, 0444);
++MODULE_PARM_DESC(standalone, "test mode: create the device without a DT node (hard-coded A8 addresses)");
++static bool fifo_sync;
++module_param(fifo_sync, bool, 0444);
++MODULE_PARM_DESC(fifo_sync, "latch layer registers with a param-FIFO sync word (else: direct writes)");
++static uint iova_base;
++module_param(iova_base, uint, 0444);
++MODULE_PARM_DESC(iova_base, "DART IOVA of vram+0 (0 = read pipe 0 base left by iBoot)");
++static bool verify_dart = true;
++module_param(verify_dart, bool, 0444);
++MODULE_PARM_DESC(verify_dart, "walk iBoot's dart-disp0 tables and only use the linearly mapped part of vram");
++static bool force;
++module_param(force, bool, 0444);
++MODULE_PARM_DESC(force, "probe even if the iBoot pipe state looks unexpected");
++
++struct adpt {
++	struct drm_device drm;
++	struct drm_plane primary;
++	struct drm_crtc crtc;
++	struct drm_encoder encoder;
++	struct drm_connector connector;
++	struct drm_display_mode mode;
++
++	void __iomem *adp;
++	void __iomem *adbe;
++	int irq;
++	struct dev_pm_domain_list *pds;
++
++	phys_addr_t vram_phys;
++	size_t vram_size;	/* usable part */
++	void *vram;		/* WC kernel mapping */
++	u32 vram_iova;
++	struct gen_pool *pool;
++
++	spinlock_t irq_lock;	/* ADP_IRQ_EN read-modify-write */
++	u32 irq_en_orig;
++	struct {
++		u32 base, stride;
++	} boot;			/* iBoot state, restored on remove */
++
++	u32 pitch;
++	u16 tag;
++	u64 flush_seq;		/* vblank count at the last flush */
++	struct drm_pending_vblank_event *event;
++	unsigned long storm_jiffies;
++	unsigned int storm_count;
++};
++
++#define to_adpt(x) container_of(x, struct adpt, drm)
++
++/* ---------------------------------------------------------------- GEM: vram carveout objects */
++
++struct adpt_bo {
++	struct drm_gem_object base;
++	unsigned long vaddr;
++	phys_addr_t phys;
++	u32 iova;
++};
++
++#define to_bo(x) container_of(x, struct adpt_bo, base)
++
++static void adpt_bo_free(struct drm_gem_object *obj)
++{
++	struct adpt *adp = to_adpt(obj->dev);
++	struct adpt_bo *bo = to_bo(obj);
++
++	drm_gem_free_mmap_offset(obj);
++	drm_gem_object_release(obj);
++	gen_pool_free(adp->pool, bo->vaddr, obj->size);
++	kfree(bo);
++}
++
++static int adpt_bo_mmap(struct drm_gem_object *obj, struct vm_area_struct *vma)
++{
++	struct adpt_bo *bo = to_bo(obj);
++	unsigned long pages = vma_pages(vma);
++
++	/* drop the fake offset: from here vm_pgoff is the offset into the object */
++	vma->vm_pgoff -= drm_vma_node_start(&obj->vma_node);
++	if (vma->vm_pgoff + pages > obj->size >> PAGE_SHIFT)
++		return -EINVAL;
++
++	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
++	vma->vm_page_prot = pgprot_writecombine(vm_get_page_prot(vma->vm_flags));
++	return remap_pfn_range(vma, vma->vm_start, (bo->phys >> PAGE_SHIFT) + vma->vm_pgoff,
++			       pages << PAGE_SHIFT, vma->vm_page_prot);
++}
++
++static const struct vm_operations_struct adpt_vm_ops = {
++	.open = drm_gem_vm_open,
++	.close = drm_gem_vm_close,
++};
++
++static const struct drm_gem_object_funcs adpt_bo_funcs = {
++	.free = adpt_bo_free,
++	.mmap = adpt_bo_mmap,
++	.vm_ops = &adpt_vm_ops,
++};
++
++static struct adpt_bo *adpt_bo_create(struct adpt *adp, size_t size)
++{
++	struct adpt_bo *bo;
++	int ret;
++
++	size = PAGE_ALIGN(size);
++	bo = kzalloc(sizeof(*bo), GFP_KERNEL);
++	if (!bo)
++		return ERR_PTR(-ENOMEM);
++
++	bo->vaddr = gen_pool_alloc(adp->pool, size);
++	if (!bo->vaddr) {
++		kfree(bo);
++		return ERR_PTR(-ENOMEM);
++	}
++	bo->phys = gen_pool_virt_to_phys(adp->pool, bo->vaddr);
++	bo->iova = adp->vram_iova + (u32)(bo->phys - adp->vram_phys);
++	memset((void *)bo->vaddr, 0, size);
++
++	drm_gem_private_object_init(&adp->drm, &bo->base, size);
++	bo->base.funcs = &adpt_bo_funcs;
++	ret = drm_gem_create_mmap_offset(&bo->base);
++	if (ret) {
++		drm_gem_object_put(&bo->base);
++		return ERR_PTR(ret);
++	}
++	return bo;
++}
++
++static int adpt_dumb_create(struct drm_file *file, struct drm_device *drm,
++			    struct drm_mode_create_dumb *args)
++{
++	struct adpt *adp = to_adpt(drm);
++	struct adpt_bo *bo;
++	int ret;
++
++	ret = drm_mode_size_dumb(drm, args, ADP_PITCH_ALIGN, PAGE_SIZE);
++	if (ret)
++		return ret;
++
++	bo = adpt_bo_create(adp, args->size);
++	if (IS_ERR(bo))
++		return PTR_ERR(bo);
++
++	ret = drm_gem_handle_create(file, &bo->base, &args->handle);
++	drm_gem_object_put(&bo->base);
++	return ret;
++}
++
++DEFINE_DRM_GEM_FOPS(adpt_fops);
++
++static const struct drm_driver adpt_driver = {
++	.driver_features = DRIVER_GEM | DRIVER_MODESET | DRIVER_ATOMIC,
++	.fops = &adpt_fops,
++	.dumb_create = adpt_dumb_create,
++	.name = "adp-t7000",
++	.desc = "Apple A8 display pipe",
++	.major = 0,
++	.minor = 1,
++};
++
++/* ---------------------------------------------------------------- IRQ */
++
++static void adpt_irq_en(struct adpt *adp, u32 set, u32 clear)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&adp->irq_lock, flags);
++	writel((readl(adp->adp + ADP_IRQ_EN) & ~clear) | set, adp->adp + ADP_IRQ_EN);
++	spin_unlock_irqrestore(&adp->irq_lock, flags);
++}
++
++static irqreturn_t adpt_irq(int irq, void *arg)
++{
++	struct adpt *adp = arg;
++	struct drm_crtc *crtc = &adp->crtc;
++	u32 st;
++
++	st = readl(adp->adp + ADP_IRQ_STATUS);
++	if (!st)
++		return IRQ_NONE;
++	writel(st, adp->adp + ADP_IRQ_STATUS);	/* W1C, as iOS does */
++
++	if (time_after(jiffies, adp->storm_jiffies + HZ)) {
++		adp->storm_jiffies = jiffies;
++		adp->storm_count = 0;
++	}
++	if (++adp->storm_count > 1000) {
++		/* never let a stuck status bit take the phone down: keep VBI only */
++		adpt_irq_en(adp, 0, (u32)~ADP_IRQ_VBI);
++		drm_err_ratelimited(&adp->drm, "IRQ storm, status %08x: masked all but VBI\n", st);
++	}
++
++	if (st & ADP_IRQ_ERRORS)
++		drm_err_ratelimited(&adp->drm, "ADP error status %08x%s%s%s%s%s\n", st,
++				    st & ADP_IRQ_UNDERRUN ? " underrun" : "",
++				    st & ADP_IRQ_PKT_MISSED ? " packet-missed" : "",
++				    st & ADP_IRQ_PF_ALIGN ? " fifo-align" : "",
++				    st & ADP_IRQ_PF_OVER ? " fifo-overflow" : "",
++				    st & ADP_IRQ_RDERR ? " read-error" : "");
++
++	if (st & ADP_IRQ_VBI)
++		drm_crtc_handle_vblank(crtc);
++
++	spin_lock(&adp->drm.event_lock);
++	if (adp->event) {
++		bool done;
++
++		u64 seq = drm_crtc_vblank_count(crtc);
++
++		if (fifo_sync)	/* packet applied; two VBIs without one = give up waiting */
++			done = (st & ADP_IRQ_PKT_DONE) || seq > adp->flush_seq + 1;
++		else	/* direct writes latch at the next frame start: the first VBI after the flush */
++			done = (st & ADP_IRQ_VBI) && seq > adp->flush_seq;
++		if (done) {
++			drm_crtc_send_vblank_event(crtc, adp->event);
++			adp->event = NULL;
++			drm_crtc_vblank_put(crtc);
++		}
++	}
++	spin_unlock(&adp->drm.event_lock);
++
++	return IRQ_HANDLED;
++}
++
++/* ---------------------------------------------------------------- plane / crtc */
++
++static int adpt_plane_atomic_check(struct drm_plane *plane, struct drm_atomic_commit *state)
++{
++	struct drm_plane_state *ps = drm_atomic_get_new_plane_state(state, plane);
++	struct drm_crtc_state *cs;
++	struct drm_framebuffer *fb = ps->fb;
++	int ret;
++
++	if (!ps->crtc)
++		return 0;
++	cs = drm_atomic_get_crtc_state(state, ps->crtc);
++	if (IS_ERR(cs))
++		return PTR_ERR(cs);
++
++	/* full screen only for now: pipe 0 scaler stays in iBoot's (bypass) configuration */
++	ret = drm_atomic_helper_check_plane_state(ps, cs, DRM_PLANE_NO_SCALING, DRM_PLANE_NO_SCALING,
++						  false, false);
++	if (ret || !ps->visible)
++		return ret;
++
++	if (fb->obj[0]->funcs != &adpt_bo_funcs)
++		return -EINVAL;	/* only our vram objects are DART-mapped */
++	if (fb->pitches[0] % ADP_PITCH_ALIGN || fb->offsets[0] % ADP_PITCH_ALIGN)
++		return -EINVAL;
++	if (ps->src.x1 || ps->src.y1)
++		return -EINVAL;
++	return 0;
++}
++
++static void adpt_plane_atomic_update(struct drm_plane *plane, struct drm_atomic_commit *state)
++{
++	struct adpt *adp = to_adpt(plane->dev);
++	struct drm_plane_state *ps = drm_atomic_get_new_plane_state(state, plane);
++	struct drm_framebuffer *fb = ps->fb;
++	int idx;
++
++	if (!fb || !drm_dev_enter(&adp->drm, &idx))
++		return;
++
++	if (fb->pitches[0] != adp->pitch) {
++		writel(fb->pitches[0], adp->adp + PIPE(0) + PIPE_STRIDE);
++		adp->pitch = fb->pitches[0];
++	}
++	writel(to_bo(fb->obj[0])->iova + fb->offsets[0], adp->adp + PIPE(0) + PIPE_BASE);
++	drm_dev_exit(idx);
++}
++
++static void adpt_plane_atomic_disable(struct drm_plane *plane, struct drm_atomic_commit *state)
++{
++	/*
++	 * No known-safe layer disable yet (LAYER_EN* semantics on A8 are unverified). The pipe keeps
++	 * scanning the last buffer; that is harmless because every carveout page stays DART-mapped.
++	 */
++}
++
++static const struct drm_plane_helper_funcs adpt_plane_helper_funcs = {
++	.atomic_check = adpt_plane_atomic_check,
++	.atomic_update = adpt_plane_atomic_update,
++	.atomic_disable = adpt_plane_atomic_disable,
++};
++
++static const struct drm_plane_funcs adpt_plane_funcs = {
++	.update_plane = drm_atomic_helper_update_plane,
++	.disable_plane = drm_atomic_helper_disable_plane,
++	.destroy = drm_plane_cleanup,
++	.reset = drm_atomic_helper_plane_reset,
++	.atomic_duplicate_state = drm_atomic_helper_plane_duplicate_state,
++	.atomic_destroy_state = drm_atomic_helper_plane_destroy_state,
++};
++
++static const u32 adpt_formats[] = { DRM_FORMAT_XRGB8888 };
++
++static enum drm_mode_status adpt_crtc_mode_valid(struct drm_crtc *crtc, const struct drm_display_mode *mode)
++{
++	struct adpt *adp = to_adpt(crtc->dev);
++
++	/* the timing generator is iBoot's; only its mode exists */
++	if (mode->hdisplay != adp->mode.hdisplay || mode->vdisplay != adp->mode.vdisplay)
++		return MODE_BAD;
++	return MODE_OK;
++}
++
++static void adpt_crtc_atomic_enable(struct drm_crtc *crtc, struct drm_atomic_commit *state)
++{
++	drm_crtc_vblank_on(crtc);
++}
++
++static void adpt_crtc_atomic_disable(struct drm_crtc *crtc, struct drm_atomic_commit *state)
++{
++	drm_crtc_vblank_off(crtc);	/* timings keep running: stopping VFTG would need a DSI/panel re-init */
++}
++
++static void adpt_crtc_atomic_flush(struct drm_crtc *crtc, struct drm_atomic_commit *state)
++{
++	struct adpt *adp = to_adpt(crtc->dev);
++	struct drm_pending_vblank_event *event = crtc->state->event;
++	unsigned long flags;
++	int idx;
++
++	if (fifo_sync && drm_dev_enter(&adp->drm, &idx)) {
++		u32 st = readl(adp->adp + ADP_PARAM_STATE), lvl = readl(adp->adp + ADP_FIFO_LEVEL);
++
++		/* never poll: if the FIFO is busy the shadowed values go out with the packet in flight */
++		if (FIELD_GET(ADP_PARAM_STATE_PARMST, st) == 2 || (lvl & ADP_FIFO_LEVEL_MASK))
++			drm_err_ratelimited(&adp->drm, "param FIFO busy (%08x/%08x), no sync\n", st, lvl);
++		else
++			writel(ADP_FIFO_SYNC | (++adp->tag ?: ++adp->tag), adp->adp + ADP_FIFO);
++		drm_dev_exit(idx);
++	}
++
++	if (!event)
++		return;
++	crtc->state->event = NULL;
++
++	spin_lock_irqsave(&crtc->dev->event_lock, flags);
++	if (drm_crtc_vblank_get(crtc) != 0) {
++		drm_crtc_send_vblank_event(crtc, event);
++	} else {
++		WARN_ON(adp->event);
++		adp->event = event;
++		adp->flush_seq = drm_crtc_vblank_count(crtc);
++	}
++	spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
++}
++
++static int adpt_crtc_enable_vblank(struct drm_crtc *crtc)
++{
++	struct adpt *adp = to_adpt(crtc->dev);
++
++	writel(ADP_IRQ_VBI, adp->adp + ADP_IRQ_STATUS);
++	adpt_irq_en(adp, ADP_IRQ_VBI, 0);
++	return 0;
++}
++
++static void adpt_crtc_disable_vblank(struct drm_crtc *crtc)
++{
++	struct adpt *adp = to_adpt(crtc->dev);
++
++	adpt_irq_en(adp, 0, ADP_IRQ_VBI);
++}
++
++static const struct drm_crtc_helper_funcs adpt_crtc_helper_funcs = {
++	.mode_valid = adpt_crtc_mode_valid,
++	.atomic_enable = adpt_crtc_atomic_enable,
++	.atomic_disable = adpt_crtc_atomic_disable,
++	.atomic_flush = adpt_crtc_atomic_flush,
++};
++
++static const struct drm_crtc_funcs adpt_crtc_funcs = {
++	.destroy = drm_crtc_cleanup,
++	.set_config = drm_atomic_helper_set_config,
++	.page_flip = drm_atomic_helper_page_flip,
++	.reset = drm_atomic_helper_crtc_reset,
++	.atomic_duplicate_state = drm_atomic_helper_crtc_duplicate_state,
++	.atomic_destroy_state = drm_atomic_helper_crtc_destroy_state,
++	.enable_vblank = adpt_crtc_enable_vblank,
++	.disable_vblank = adpt_crtc_disable_vblank,
++};
++
++/* ---------------------------------------------------------------- connector: iBoot's fixed panel mode */
++
++static int adpt_connector_get_modes(struct drm_connector *connector)
++{
++	return drm_connector_helper_get_modes_fixed(connector, &to_adpt(connector->dev)->mode);
++}
++
++static const struct drm_connector_helper_funcs adpt_connector_helper_funcs = {
++	.get_modes = adpt_connector_get_modes,
++};
++
++static const struct drm_connector_funcs adpt_connector_funcs = {
++	.reset = drm_atomic_helper_connector_reset,
++	.fill_modes = drm_helper_probe_single_connector_modes,
++	.atomic_duplicate_state = drm_atomic_helper_connector_duplicate_state,
++	.atomic_destroy_state = drm_atomic_helper_connector_destroy_state,
++};
++
++static const struct drm_encoder_funcs adpt_encoder_funcs = {
++	.destroy = drm_encoder_cleanup,
++};
++
++static const struct drm_mode_config_funcs adpt_mode_config_funcs = {
++	.fb_create = drm_gem_fb_create,	/* no .dirty: buffers are scanned out directly */
++	.atomic_check = drm_atomic_helper_check,
++	.atomic_commit = drm_atomic_helper_commit,
++};
++
++static void adpt_init_mode(struct adpt *adp, u32 w, u32 h, u32 wmm, u32 hmm)
++{
++	struct drm_display_mode *m = &adp->mode;
++
++	/*
++	 * The real porches live in ADBE0 0x10..0x18 (semantics not verified yet). Vblank timestamps come
++	 * from the IRQ, so only the refresh rate matters: pick small porches and a clock that gives 60 Hz.
++	 */
++	m->hdisplay = w;
++	m->hsync_start = w + 8;
++	m->hsync_end = w + 16;
++	m->htotal = w + 24;
++	m->vdisplay = h;
++	m->vsync_start = h + 8;
++	m->vsync_end = h + 10;
++	m->vtotal = h + 20;
++	m->clock = DIV_ROUND_UP(m->htotal * m->vtotal * 60, 1000);
++	m->width_mm = wmm;
++	m->height_mm = hmm;
++	m->type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED;
++	drm_mode_set_name(m);
++}
++
++static int adpt_modeset_init(struct adpt *adp)
++{
++	struct drm_device *drm = &adp->drm;
++	int ret;
++
++	ret = drmm_mode_config_init(drm);
++	if (ret)
++		return ret;
++	drm->mode_config.min_width = adp->mode.hdisplay;
++	drm->mode_config.max_width = ALIGN(adp->mode.hdisplay, 64);
++	drm->mode_config.min_height = adp->mode.vdisplay;
++	drm->mode_config.max_height = ALIGN(adp->mode.vdisplay, 64);
++	drm->mode_config.preferred_depth = 24;
++	drm->mode_config.prefer_shadow = 0;
++	drm->mode_config.funcs = &adpt_mode_config_funcs;
++
++	ret = drm_universal_plane_init(drm, &adp->primary, 1, &adpt_plane_funcs, adpt_formats,
++				       ARRAY_SIZE(adpt_formats), NULL, DRM_PLANE_TYPE_PRIMARY, NULL);
++	if (ret)
++		return ret;
++	drm_plane_helper_add(&adp->primary, &adpt_plane_helper_funcs);
++
++	ret = drm_crtc_init_with_planes(drm, &adp->crtc, &adp->primary, NULL, &adpt_crtc_funcs, NULL);
++	if (ret)
++		return ret;
++	drm_crtc_helper_add(&adp->crtc, &adpt_crtc_helper_funcs);
++
++	ret = drm_encoder_init(drm, &adp->encoder, &adpt_encoder_funcs, DRM_MODE_ENCODER_DSI, NULL);
++	if (ret)
++		return ret;
++	adp->encoder.possible_crtcs = drm_crtc_mask(&adp->crtc);
++
++	ret = drmm_connector_init(drm, &adp->connector, &adpt_connector_funcs, DRM_MODE_CONNECTOR_DSI, NULL);
++	if (ret)
++		return ret;
++	drm_connector_helper_add(&adp->connector, &adpt_connector_helper_funcs);
++	adp->connector.display_info.width_mm = adp->mode.width_mm;
++	adp->connector.display_info.height_mm = adp->mode.height_mm;
++	ret = drm_connector_attach_encoder(&adp->connector, &adp->encoder);
++	if (ret)
++		return ret;
++
++	ret = drm_vblank_init(drm, 1);
++	if (ret)
++		return ret;
++
++	drm_mode_config_reset(drm);
++	return 0;
++}
++
++/* ---------------------------------------------------------------- resources */
++
++static bool adpt_pmgr_on(struct adpt *adp)
++{
++	static const struct { u32 off; const char *name; } ps[] = {
++		{ 0x2a8, "disp_busmux" }, { 0x2b0, "disp0" }, { 0x2b8, "mipi_dsi" },
++	};
++	void __iomem *pm = ioremap_np(T7000_PMGR_PS_PAGE, PAGE_SIZE);
++	bool ok = true;
++	int i;
++
++	if (!pm)
++		return false;
++	for (i = 0; i < ARRAY_SIZE(ps); i++) {
++		u32 v = readl(pm + ps[i].off);
++
++		if ((v & 0xff) != 0xff || (v & (BIT(31) | BIT(10)))) {
++			drm_err(&adp->drm, "power domain %s not on (%08x)\n", ps[i].name, v);
++			ok = false;
++		}
++	}
++	iounmap(pm);
++	return ok;
++}
++
++static void __iomem *adpt_map(struct platform_device *pdev, const char *name, resource_size_t phys,
++			      resource_size_t size)
++{
++	struct resource res = DEFINE_RES_MEM_NAMED(phys, size, name);
++
++	if (!standalone)
++		return devm_platform_ioremap_resource_byname(pdev, name);
++	res.flags |= IORESOURCE_MEM_NONPOSTED;
++	return devm_ioremap_resource(&pdev->dev, &res);
++}
++
++static int adpt_get_irq(struct platform_device *pdev)
++{
++	struct irq_fwspec fw = { .param_count = 3, .param = { 0, T7000_ADP_HWIRQ, IRQ_TYPE_LEVEL_HIGH } };
++	struct device_node *aic;
++	int irq;
++
++	if (!standalone)
++		return platform_get_irq_byname(pdev, "adp");
++
++	aic = of_find_compatible_node(NULL, NULL, "apple,aic");
++	if (!aic)
++		return -ENODEV;
++	fw.fwnode = of_fwnode_handle(aic);
++	irq = irq_create_fwspec_mapping(&fw);
++	of_node_put(aic);
++	return irq ?: -ENODEV;
++}
++
++static int adpt_get_vram(struct adpt *adp, struct device *dev)
++{
++	struct device_node *np;
++	struct reserved_mem *rmem;
++
++	if (standalone) {
++		adp->vram_phys = T7000_VRAM_PHYS;
++		adp->vram_size = T7000_VRAM_SIZE;
++		return 0;
++	}
++	np = of_parse_phandle(dev->of_node, "memory-region", 0);
++	if (!np)
++		return -ENODEV;
++	rmem = of_reserved_mem_lookup(np);
++	of_node_put(np);
++	if (!rmem)
++		return -ENODEV;
++	adp->vram_phys = rmem->base;
++	adp->vram_size = rmem->size;
++	return 0;
++}
++
++/* map one iBoot DART table page; NULL ends the usable part (table inside vram, or unmappable) */
++static u64 *adpt_map_table(struct adpt *adp, phys_addr_t pa)
++{
++	if (pa >= adp->vram_phys && pa < adp->vram_phys + adp->vram_size) {
++		drm_warn(&adp->drm, "DART table %pa lies inside vram: usable part ends there\n", &pa);
++		return NULL;
++	}
++	if (region_intersects(pa, SZ_4K, IORESOURCE_SYSTEM_RAM, IORES_DESC_NONE) != REGION_DISJOINT)
++		drm_warn(&adp->drm, "DART table %pa is in Linux RAM: it can get overwritten\n", &pa);
++	/* WB: the linear map for RAM, a cacheable mapping otherwise (ioremap_wc refuses RAM) */
++	return memremap(pa, SZ_4K, MEMREMAP_WB);
++}
++
++/*
++ * Walk iBoot's dart-disp0 stream 0 tables (S5L8960X: 4 TTBRs x 1 GB, 4K pages, two levels) and return
++ * how much of vram, from its start, is mapped 1:1 at vram_iova. Table pages inside vram end the usable
++ * part, so no buffer can ever overwrite a page table.
++ */
++static size_t adpt_dart_usable(struct adpt *adp)
++{
++	void __iomem *dart = ioremap_np(T7000_DART_PHYS, PAGE_SIZE);
++	size_t off, usable = 0;
++	u64 *l1 = NULL, *l2 = NULL;
++	phys_addr_t l1_pa = 0, l2_pa = 0;
++
++	if (!dart)
++		return 0;
++	for (off = 0; off < adp->vram_size; off += SZ_4K) {
++		u32 iova = adp->vram_iova + off;
++		u32 ttbr = readl(dart + DART_TTBR(0, iova >> 30));
++		phys_addr_t pa;
++		u64 e;
++
++		if (!(ttbr & DART_TTBR_VALID))
++			break;
++		pa = (phys_addr_t)(ttbr & 0xffffff) << 12;
++		if (pa != l1_pa) {
++			if (l1)
++				memunmap(l1);
++			l1 = adpt_map_table(adp, pa);
++			l1_pa = pa;
++			if (!l1)
++				break;
++		}
++		e = READ_ONCE(l1[(iova >> 21) & 511]);
++		if (!(e & DART_PTE_VALID))
++			break;
++		pa = e & DART_PA_MASK;
++		if (pa != l2_pa) {
++			if (l2)
++				memunmap(l2);
++			l2 = adpt_map_table(adp, pa);
++			l2_pa = pa;
++			if (!l2)
++				break;
++		}
++		e = READ_ONCE(l2[(iova >> 12) & 511]);
++		if (!(e & DART_PTE_VALID) || (e & DART_PA_MASK) != adp->vram_phys + off)
++			break;
++		usable = off + SZ_4K;
++	}
++	if (l1)
++		memunmap(l1);
++	if (l2)
++		memunmap(l2);
++	iounmap(dart);
++	return usable;
++}
++
++static void adpt_pool_fini(struct drm_device *drm, void *arg)
++{
++	struct adpt *adp = to_adpt(drm);
++
++	gen_pool_destroy(adp->pool);
++	memunmap(adp->vram);
++}
++
++static int adpt_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct dev_pm_domain_attach_data pd_data = { .pd_flags = PD_FLAG_DEV_LINK_ON };
++	struct device_node *fbnp;
++	struct adpt *adp;
++	u32 w = 750, h = 1334, wmm = 0, hmm = 0, fmt, size;
++	size_t usable;
++	int ret;
++
++	adp = devm_drm_dev_alloc(dev, &adpt_driver, struct adpt, drm);
++	if (IS_ERR(adp))
++		return PTR_ERR(adp);
++	spin_lock_init(&adp->irq_lock);
++
++	/* hold disp0 + mipi_dsi before simpledrm (their other user) goes away */
++	ret = devm_pm_domain_attach_list(dev, &pd_data, &adp->pds);
++	if (ret < 0)
++		return dev_err_probe(dev, ret, "power domains\n");
++	if (!adpt_pmgr_on(adp))
++		return -ENODEV;
++
++	adp->adp = adpt_map(pdev, "adp", T7000_ADP_PHYS, 0x8000);
++	if (IS_ERR(adp->adp))
++		return PTR_ERR(adp->adp);
++	adp->adbe = adpt_map(pdev, "adbe", T7000_ADBE_PHYS, 0x8000);
++	if (IS_ERR(adp->adbe))
++		return PTR_ERR(adp->adbe);
++	adp->irq = adpt_get_irq(pdev);
++	if (adp->irq < 0)
++		return adp->irq;
++	ret = adpt_get_vram(adp, dev);
++	if (ret)
++		return dev_err_probe(dev, ret, "no vram carveout\n");
++
++	/* the boot framebuffer's geometry (m1n1 fills it from iBoot's boot_args) */
++	fbnp = of_find_compatible_node(NULL, NULL, "simple-framebuffer");
++	if (fbnp) {
++		of_property_read_u32(fbnp, "width", &w);
++		of_property_read_u32(fbnp, "height", &h);
++		of_node_put(fbnp);
++	}
++	if (dev->of_node && !standalone) {
++		of_property_read_u32(dev->of_node, "width-mm", &wmm);
++		of_property_read_u32(dev->of_node, "height-mm", &hmm);
++	}
++	adpt_init_mode(adp, w, h, wmm, hmm);
++
++	adp->boot.base = readl(adp->adp + PIPE(0) + PIPE_BASE);
++	adp->boot.stride = readl(adp->adp + PIPE(0) + PIPE_STRIDE);
++	adp->pitch = adp->boot.stride;
++	adp->irq_en_orig = readl(adp->adp + ADP_IRQ_EN);
++	fmt = readl(adp->adp + PIPE(0) + PIPE_PIX_FMT);
++	size = readl(adp->adbe + ADBE_SCREEN_SIZE);
++	drm_info(&adp->drm, "iBoot pipe0: base %08x stride %u fmt %08x src %08x, ADBE size %08x, mask %08x\n",
++		 adp->boot.base, adp->boot.stride, fmt, readl(adp->adp + PIPE(0) + PIPE_SRC_SIZE), size,
++		 adp->irq_en_orig);
++	if (fmt != PIPE_PIX_FMT_XRGB32 && !force)
++		return dev_err_probe(dev, -ENODEV, "unexpected pipe0 format %08x (force=1 to ignore)\n", fmt);
++
++	adp->vram_iova = iova_base ?: adp->boot.base;
++	if (!adp->vram_iova || adp->vram_iova & (SZ_4K - 1))
++		return dev_err_probe(dev, -ENODEV, "vram IOVA %08x not usable\n", adp->vram_iova);
++
++	usable = verify_dart ? adpt_dart_usable(adp) : adp->vram_size;
++	drm_info(&adp->drm, "vram %pa+%zx at iova %08x, %zx usable\n", &adp->vram_phys, adp->vram_size,
++		 adp->vram_iova, usable);
++	if (usable < 2 * PAGE_ALIGN(ALIGN(w * 4, ADP_PITCH_ALIGN) * h))
++		return dev_err_probe(dev, -ENODEV, "less than two frames of vram are DART-mapped\n");
++	adp->vram_size = usable;
++
++	/* simpledrm scans the same vram: remove it (our power domain references keep the pipe on) */
++	ret = aperture_remove_conflicting_devices(adp->vram_phys, adp->vram_size, adpt_driver.name);
++	if (ret)
++		return ret;
++
++	adp->vram = memremap(adp->vram_phys, adp->vram_size, MEMREMAP_WC);
++	if (!adp->vram)
++		return -ENOMEM;
++	adp->pool = gen_pool_create(PAGE_SHIFT, NUMA_NO_NODE);
++	if (!adp->pool) {
++		memunmap(adp->vram);
++		return -ENOMEM;
++	}
++	ret = gen_pool_add_virt(adp->pool, (unsigned long)adp->vram, adp->vram_phys, adp->vram_size,
++				NUMA_NO_NODE);
++	if (ret) {
++		gen_pool_destroy(adp->pool);
++		memunmap(adp->vram);
++		return ret;
++	}
++	/* freed with the drm_device, i.e. after the last GEM object */
++	ret = drmm_add_action_or_reset(&adp->drm, adpt_pool_fini, NULL);
++	if (ret)
++		return ret;
++
++	ret = adpt_modeset_init(adp);
++	if (ret)
++		return ret;
++
++	writel(readl(adp->adp + ADP_IRQ_STATUS), adp->adp + ADP_IRQ_STATUS);
++	ret = devm_request_irq(dev, adp->irq, adpt_irq, 0, "adp-t7000", adp);
++	if (ret)
++		return ret;
++	/* VBI is enabled on demand; packet-done is needed for flip completion in FIFO mode */
++	adpt_irq_en(adp, fifo_sync ? ADP_IRQ_PKT_DONE : 0, ADP_IRQ_VBI);
++
++	platform_set_drvdata(pdev, adp);
++	return drm_dev_register(&adp->drm, 0);
++}
++
++static void adpt_remove(struct platform_device *pdev)
++{
++	struct adpt *adp = platform_get_drvdata(pdev);
++
++	drm_dev_unplug(&adp->drm);
++	drm_atomic_helper_shutdown(&adp->drm);
++	/* back to iBoot's register state; the image there is whatever was last drawn into vram+0 */
++	writel(adp->boot.stride, adp->adp + PIPE(0) + PIPE_STRIDE);
++	writel(adp->boot.base, adp->adp + PIPE(0) + PIPE_BASE);
++	if (fifo_sync)
++		writel(ADP_FIFO_SYNC | ++adp->tag, adp->adp + ADP_FIFO);
++	writel(adp->irq_en_orig, adp->adp + ADP_IRQ_EN);
++}
++
++static void adpt_shutdown(struct platform_device *pdev)
++{
++	struct adpt *adp = platform_get_drvdata(pdev);
++
++	if (adp)
++		drm_atomic_helper_shutdown(&adp->drm);
++}
++
++static const struct of_device_id adpt_of_match[] = {
++	{ .compatible = "apple,t7000-display-pipe" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, adpt_of_match);
++
++static struct platform_driver adpt_platform_driver = {
++	.driver = {
++		.name = "adp-t7000",
++		.of_match_table = adpt_of_match,
++	},
++	.probe = adpt_probe,
++	.remove = adpt_remove,
++	.shutdown = adpt_shutdown,
++};
++
++static struct platform_device *adpt_test_pdev;
++
++static int __init adpt_init(void)
++{
++	struct platform_device *pdev;
++	struct device_node *fbnp;
++	int ret;
++
++	ret = platform_driver_register(&adpt_platform_driver);
++	if (ret || !standalone)
++		return ret;
++
++	/*
++	 * Test mode: borrow /chosen/framebuffer's node for its power-domains (disp0 + mipi_dsi). The node
++	 * says "simple-framebuffer", so pin the device to this driver or simpledrm would grab it.
++	 */
++	fbnp = of_find_compatible_node(NULL, NULL, "simple-framebuffer");
++	if (!fbnp) {
++		ret = -ENODEV;
++		goto err_driver;
++	}
++	pdev = platform_device_alloc("adp-t7000", PLATFORM_DEVID_NONE);
++	if (!pdev) {
++		of_node_put(fbnp);
++		ret = -ENOMEM;
++		goto err_driver;
++	}
++	device_set_node(&pdev->dev, of_fwnode_handle(fbnp));	/* reference dropped on release */
++	dev_set_of_node_reused(&pdev->dev);
++	ret = device_set_driver_override(&pdev->dev, "adp-t7000");
++	if (!ret)
++		ret = platform_device_add(pdev);
++	if (ret) {
++		platform_device_put(pdev);
++		goto err_driver;
++	}
++	adpt_test_pdev = pdev;
++	return 0;
++
++err_driver:
++	platform_driver_unregister(&adpt_platform_driver);
++	return ret;
++}
++
++static void __exit adpt_exit(void)
++{
++	if (adpt_test_pdev)
++		platform_device_unregister(adpt_test_pdev);
++	platform_driver_unregister(&adpt_platform_driver);
++}
++
++module_init(adpt_init);
++module_exit(adpt_exit);
++
++MODULE_DESCRIPTION("Apple A8 (T7000) display pipe DRM driver");
++MODULE_LICENSE("GPL");

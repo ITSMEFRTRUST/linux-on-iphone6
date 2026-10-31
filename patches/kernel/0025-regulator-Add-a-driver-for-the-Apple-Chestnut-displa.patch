@@ -1,0 +1,142 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 00:29:27 +0000
+Subject: [PATCH 025/138] regulator: Add a driver for the Apple Chestnut
+ display PMU
+
+Expose the touch analog supply switch (register 0x05, bit 4) of the
+Chestnut display PMU as a regulator.
+
+Tested on the iPhone 6 (N61) together with the touchscreen.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/regulator/Kconfig                    | 12 +++
+ drivers/regulator/Makefile                   |  1 +
+ drivers/regulator/apple-chestnut-regulator.c | 82 ++++++++++++++++++++
+ 3 files changed, 95 insertions(+)
+ create mode 100644 drivers/regulator/apple-chestnut-regulator.c
+
+diff --git a/drivers/regulator/Kconfig b/drivers/regulator/Kconfig
+index 89789ac7a..ec3f12b07 100644
+--- a/drivers/regulator/Kconfig
++++ b/drivers/regulator/Kconfig
+@@ -205,6 +205,18 @@ config REGULATOR_ATC260X
+ 	  ATC260x PMICs. This will enable support for all the software
+ 	  controllable DCDC/LDO regulators.
+ 
++config REGULATOR_APPLE_CHESTNUT
++	tristate "Apple Chestnut display PMU regulator"
++	depends on I2C
++	depends on ARCH_APPLE || COMPILE_TEST
++	select REGMAP_I2C
++	help
++	  This driver supports the touch controller analog supply switch of
++	  the Chestnut display PMU found in the Apple iPhone 6.
++
++	  This driver can also be built as a module. If so, the module
++	  will be called apple-chestnut-regulator.
++
+ config REGULATOR_AW37503
+ 	tristate "Awinic AW37503 Dual Output Power regulators"
+ 	depends on I2C && GPIOLIB
+diff --git a/drivers/regulator/Makefile b/drivers/regulator/Makefile
+index 5a764cec8..d0c9db4fb 100644
+--- a/drivers/regulator/Makefile
++++ b/drivers/regulator/Makefile
+@@ -21,6 +21,7 @@ obj-$(CONFIG_REGULATOR_AAT2870) += aat2870-regulator.o
+ obj-$(CONFIG_REGULATOR_AB8500)	+= ab8500-ext.o ab8500.o
+ obj-$(CONFIG_REGULATOR_ACT8865) += act8865-regulator.o
+ obj-$(CONFIG_REGULATOR_ACT8945A) += act8945a-regulator.o
++obj-$(CONFIG_REGULATOR_APPLE_CHESTNUT) += apple-chestnut-regulator.o
+ obj-$(CONFIG_REGULATOR_AD5398) += ad5398.o
+ obj-$(CONFIG_REGULATOR_ADP5055) += adp5055-regulator.o
+ obj-$(CONFIG_REGULATOR_ANATOP) += anatop-regulator.o
+diff --git a/drivers/regulator/apple-chestnut-regulator.c b/drivers/regulator/apple-chestnut-regulator.c
+new file mode 100644
+index 000000000..e6dced9ce
+--- /dev/null
++++ b/drivers/regulator/apple-chestnut-regulator.c
+@@ -0,0 +1,82 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Apple Chestnut display PMU regulator driver
++ *
++ * The Chestnut display PMU on the iPhone 6 powers the LCD rails, which
++ * are left running by the bootloader, and the analog supply of the touch
++ * controller. Only the latter is exposed here. It is a plain on/off switch
++ * (bit 4 of register 0x05) without a voltage control. The other bits of that
++ * register belong to the display and are never written.
++ */
++
++#include <linux/array_size.h>
++#include <linux/bits.h>
++#include <linux/i2c.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/regmap.h>
++#include <linux/regulator/driver.h>
++
++#define CHESTNUT_REG_LDO_EN		0x05
++#define CHESTNUT_LDO2_EN		BIT(4)
++
++static const struct regmap_config chestnut_regmap_config = {
++	.reg_bits = 8,
++	.val_bits = 8,
++	.max_register = 0xff,
++};
++
++static const struct regulator_ops chestnut_ldo_ops = {
++	.enable = regulator_enable_regmap,
++	.disable = regulator_disable_regmap,
++	.is_enabled = regulator_is_enabled_regmap,
++};
++
++static const struct regulator_desc chestnut_ldo2_desc = {
++	.name = "ldo2",
++	.of_match = "ldo2",
++	.regulators_node = "regulators",
++	.type = REGULATOR_VOLTAGE,
++	.owner = THIS_MODULE,
++	.ops = &chestnut_ldo_ops,
++	.enable_reg = CHESTNUT_REG_LDO_EN,
++	.enable_mask = CHESTNUT_LDO2_EN,
++};
++
++static int chestnut_probe(struct i2c_client *client)
++{
++	struct device *dev = &client->dev;
++	struct regulator_config config = { };
++	struct regulator_dev *rdev;
++
++	config.dev = dev;
++	config.regmap = devm_regmap_init_i2c(client, &chestnut_regmap_config);
++	if (IS_ERR(config.regmap))
++		return dev_err_probe(dev, PTR_ERR(config.regmap),
++				     "failed to init regmap\n");
++
++	rdev = devm_regulator_register(dev, &chestnut_ldo2_desc, &config);
++	if (IS_ERR(rdev))
++		return dev_err_probe(dev, PTR_ERR(rdev),
++				     "failed to register ldo2\n");
++
++	return 0;
++}
++
++static const struct of_device_id chestnut_of_match[] = {
++	{ .compatible = "apple,chestnut" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, chestnut_of_match);
++
++static struct i2c_driver chestnut_driver = {
++	.probe = chestnut_probe,
++	.driver = {
++		.name = "apple-chestnut-regulator",
++		.of_match_table = chestnut_of_match,
++	},
++};
++module_i2c_driver(chestnut_driver);
++
++MODULE_DESCRIPTION("Apple Chestnut display PMU regulator driver");
++MODULE_LICENSE("GPL");

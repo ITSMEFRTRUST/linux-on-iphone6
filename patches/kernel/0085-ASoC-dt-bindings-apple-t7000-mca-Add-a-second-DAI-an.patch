@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 21:01:30 +0000
+Subject: [PATCH 085/138] ASoC: dt-bindings: apple,t7000-mca: Add a second DAI
+ and the MCLK pads
+
+The headset codec of the iPhone 6 shares the speaker's I2S bus, so the
+MCA needs a second DAI for it (one cell selects it). The codec takes its
+MCLK from the pad of an MCA that is otherwise unused; let the node
+provide the five MCLK pads as clocks.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../bindings/sound/apple,t7000-mca.yaml           | 15 +++++++++++++--
+ 1 file changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/sound/apple,t7000-mca.yaml b/Documentation/devicetree/bindings/sound/apple,t7000-mca.yaml
+index bd6f2ff0c..d65911708 100644
+--- a/Documentation/devicetree/bindings/sound/apple,t7000-mca.yaml
++++ b/Documentation/devicetree/bindings/sound/apple,t7000-mca.yaml
+@@ -52,7 +52,17 @@ properties:
+       I2S switch pin group the port is routed to. Defaults to the MCA index.
+ 
+   '#sound-dai-cells':
+-    const: 0
++    enum: [0, 1]
++    description:
++      With 1 cell, DAI 0 is the playback-only DAI and DAI 1 a second DAI
++      with playback and capture, for a second codec on the same bus. Both
++      share the one TX slot.
++
++  '#clock-cells':
++    const: 1
++    description:
++      The node provides the MCLK pads of all MCA instances (index 0-4) as
++      12 MHz clocks, for a codec clocked from the pad of an unused MCA.
+ 
+ required:
+   - compatible
+@@ -82,6 +92,7 @@ examples:
+             interrupts = <AIC_IRQ 171 IRQ_TYPE_LEVEL_HIGH>;
+             clocks = <&nco 2>;
+             power-domains = <&ps_mca2>;
+-            #sound-dai-cells = <0>;
++            #sound-dai-cells = <1>;
++            #clock-cells = <1>;
+         };
+     };

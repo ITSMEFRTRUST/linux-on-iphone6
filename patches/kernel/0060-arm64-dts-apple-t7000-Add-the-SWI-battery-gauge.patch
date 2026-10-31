@@ -1,0 +1,72 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 00:26:44 +0000
+Subject: [PATCH 060/138] arm64: dts: apple: t7000: Add the SWI battery gauge
+
+UART5 drives the battery gauge's HDQ wire on the iPhone 6; enable it on
+n61 with the SN2400 charger as the wire's owner and the battery's supply.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ arch/arm64/boot/dts/apple/t7000-n61.dts |  9 ++++++++-
+ arch/arm64/boot/dts/apple/t7000.dtsi    | 13 +++++++++++++
+ 2 files changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm64/boot/dts/apple/t7000-n61.dts b/arch/arm64/boot/dts/apple/t7000-n61.dts
+index 0f43267be..17270391e 100644
+--- a/arch/arm64/boot/dts/apple/t7000-n61.dts
++++ b/arch/arm64/boot/dts/apple/t7000-n61.dts
+@@ -121,7 +121,7 @@ haptics@5a {
+ 		vib-overdrive-mv = <3320>;
+ 	};
+ 
+-	charger@75 {
++	charger: charger@75 {
+ 		compatible = "ti,sn2400";
+ 		reg = <0x75>;
+ 		input-current-limit-microamp = <500000>;
+@@ -189,6 +189,13 @@ touchscreen@0 {
+ };
+ 
+ /* ADT /arm-io/uart3/stockholm: NXP PN548-class NFC controller */
++/* The battery's bq27540 gauge, reached over UART5 through the charger */
++&swi {
++	apple,swi-master = <&charger>;
++	power-supplies = <&charger>;
++	status = "okay";
++};
++
+ &serial3 {
+ 	status = "okay";
+ 
+diff --git a/arch/arm64/boot/dts/apple/t7000.dtsi b/arch/arm64/boot/dts/apple/t7000.dtsi
+index e75e46ef6..9496cf33b 100644
+--- a/arch/arm64/boot/dts/apple/t7000.dtsi
++++ b/arch/arm64/boot/dts/apple/t7000.dtsi
+@@ -243,6 +243,15 @@ serial3: serial@20a0cc000 {
+ 			status = "disabled";
+ 		};
+ 
++		swi: battery-gauge@20a0d4000 {
++			compatible = "apple,t7000-swi-gauge";
++			reg = <0x2 0x0a0d4000 0x0 0x4000>;
++			pinctrl-0 = <&uart5_pins>;
++			pinctrl-names = "default";
++			power-domains = <&ps_uart5>;
++			status = "disabled";
++		};
++
+ 		serial6: serial@20a0d8000 {
+ 			compatible = "apple,s5l-uart";
+ 			reg = <0x2 0x0a0d8000 0x0 0x4000>;
+@@ -473,6 +482,10 @@ uart3_pins: uart3-pins {
+ 					 <APPLE_PINMUX(181, 1)>;
+ 			};
+ 
++			uart5_pins: uart5-pins {
++				pinmux = <APPLE_PINMUX(57, 1)>;
++			};
++
+ 			i2c1_pins: i2c1-pins {
+ 				pinmux = <APPLE_PINMUX(139, 1)>,
+ 					 <APPLE_PINMUX(138, 1)>;

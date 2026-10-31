@@ -1,0 +1,51 @@
+#!/bin/bash
+# Orchard on the phone from the PC.
+#   orc deploy        push ui/build/phone/orchard.stripped to /tmp and (re)start it
+#   orc shot [f.png]  grab the phone screen (default scratch png path printed)
+#   orc log           tail the Orchard log (FPS / render / flush times)
+#   orc theme DIR     push a theme dir (colors.toml + backgrounds/*; ORCHARD_THEME_DIR) and restart
+#   orc music [dir]   copy MP3s (default ~/Music) to the phone's /tmp/music ("On iPhone" in Music)
+#   orc tap X Y | drag X1 Y1 X2 Y2 MS | key home|power   synthetic input
+set -e
+P=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)	# this checkout (a worktree builds itself)
+case "$1" in
+deploy)	# always rebuilds first, so a stale binary can never ship; B=<build dir> (default build),
+	# PERF=1 = sysmon build (FPS lines in the log; use its own B), ORCHARD_MOTION=1|2 = animation stats
+	make -C $P/ui B=${B:-build} ${PERF:+PERF=1} phone -j16 >/dev/null || { echo "build failed"; exit 1; }
+	cd $P/ui/${B:-build}/phone && cp orchard.stripped orchard-bin
+	(timeout 20 python3 -m http.server 8642 --bind 172.16.43.2 >/dev/null 2>&1 &); sleep 1
+	$P/bin/ph "kill \$(pidof orchard) 2>/dev/null; cd /tmp && wget -q -O orchard http://172.16.43.2:8642/orchard-bin && chmod +x orchard && export TZ=${ORCHARD_TZ:-UTC0} HOME=/root ${ORCHARD_MOTION:+ORCHARD_MOTION=$ORCHARD_MOTION}; mountpoint -q /data && export ORCHARD_DATA=/data/orchard; setsid ./orchard > /tmp/orchard.log 2>&1 < /dev/null & sleep 2; pidof orchard" 12 | tail -1 ;;
+shot)
+	out=${2:-/tmp/orchard-shot.png}
+	python3 - "$out.raw" <<'PY' &
+import socket, sys
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("172.16.43.2", 9000)); s.listen(1); s.settimeout(20)
+c, _ = s.accept(); data = b""
+while (d := c.recv(1 << 20)): data += d
+open(sys.argv[1], "wb").write(data)
+PY
+	sleep 0.5; $P/bin/ph "rm -f /tmp/orchard.raw; echo shot > /tmp/orchard.cmd; sleep 0.5; nc 172.16.43.2 9000 < /tmp/orchard.raw" 10 >/dev/null; wait
+	magick -size 750x1334 -depth 8 bgra:"$out.raw" -alpha off "$out" && rm "$out.raw" && echo "$out" ;;
+theme)
+	T=$P/ui/build/theme && rm -rf $T && mkdir -p $T
+	src=${2:-$ORCHARD_THEME_DIR}; [ -d "$src" ] || { echo "usage: orc theme DIR (colors.toml + backgrounds/)"; exit 1; }
+	name=$(basename "$src")
+	cp "$src/colors.toml" $T/
+	wp=$(ls "$src"/backgrounds/* | head -1)
+	magick "$wp" -resize '750x1334^' -gravity center -extent 750x1334 -alpha off bgra:$T/wallpaper.raw
+	echo "$name: $(basename "$wp")"
+	(cd $T && timeout 20 python3 -m http.server 8643 --bind 172.16.43.2 >/dev/null 2>&1 &); sleep 1
+	$P/bin/ph "mkdir -p /tmp/orchard-theme && cd /tmp/orchard-theme && wget -q -O colors.toml http://172.16.43.2:8643/colors.toml && wget -q -O wallpaper.raw http://172.16.43.2:8643/wallpaper.raw; ls /tmp/orchard-theme" 20 | tail -1
+	$0 deploy ;;
+music)
+	d=${2:-~/Music}
+	ls "$d"/*.mp3 >/dev/null || { echo "no MP3s in $d"; exit 1; }
+	(cd "$d" && timeout 300 python3 -m http.server 8644 --bind 172.16.43.2 >/dev/null 2>&1 &); sleep 1
+	for f in "$d"/*.mp3; do
+		n=$(basename "$f"); u=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$n")
+		$P/bin/ph "mkdir -p /tmp/music && wget -q -O \"/tmp/music/$n\" http://172.16.43.2:8644/$u && echo ok" 60 | tail -1 | sed "s|^|$n: |"
+	done ;;
+log) $P/bin/ph "tail -n ${2:-15} /tmp/orchard.log" 10 | sed 's/\x1b\[[0-9;]*m//g' | grep -v '^\s*$' | tail -n ${2:-15} ;;
+*) $P/bin/ph "echo '$*' > /tmp/orchard.cmd" 5 >/dev/null ;;
+esac

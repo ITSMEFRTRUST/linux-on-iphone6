@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 20:37:39 +0000
+Subject: [PATCH 081/138] power: supply: sn2400: Stop the input limit poll
+ across system suspend
+
+The 5 s poll reads the chip over I2C from a non-freezable work item. On
+suspend-to-idle the timer keeps running (the tick is not frozen on
+T7000), so the poll would fire with the I2C controller's interrupt
+suspended and time out every 5 s. Cancel it on suspend and run it right
+away on resume, which also restores the input limit if a re-plug while
+asleep left the chip at its 90 mA default.
+
+The driver never set its client data; set it so the PM callbacks can
+find their state.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/power/supply/sn2400_charger.c | 28 +++++++++++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/drivers/power/supply/sn2400_charger.c b/drivers/power/supply/sn2400_charger.c
+index d182452e8..68c373bbf 100644
+--- a/drivers/power/supply/sn2400_charger.c
++++ b/drivers/power/supply/sn2400_charger.c
+@@ -294,6 +294,7 @@ static int sn2400_probe(struct i2c_client *client)
+ 		return -ENOMEM;
+ 
+ 	sn->dev = dev;
++	i2c_set_clientdata(client, sn);
+ 	sn->input_limit = SN2400_DEF_INPUT;
+ 	sn->chg_current = SN2400_DEF_CHG;
+ 	device_property_read_u32(dev, "input-current-limit-microamp",
+@@ -348,6 +349,32 @@ static int sn2400_probe(struct i2c_client *client)
+ 	return 0;
+ }
+ 
++/*
++ * The poll talks to the chip over I2C every 5 s. Across system suspend that
++ * would run with the I2C interrupt suspended (the work is not freezable), so
++ * stop it and look at the input limit again right after resume: a re-plug
++ * while asleep can leave the chip at its 90 mA default.
++ */
++static int sn2400_suspend(struct device *dev)
++{
++	struct sn2400 *sn = dev_get_drvdata(dev);
++
++	cancel_delayed_work_sync(&sn->work);
++
++	return 0;
++}
++
++static int sn2400_resume(struct device *dev)
++{
++	struct sn2400 *sn = dev_get_drvdata(dev);
++
++	mod_delayed_work(system_percpu_wq, &sn->work, 0);
++
++	return 0;
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(sn2400_pm_ops, sn2400_suspend, sn2400_resume);
++
+ static const struct of_device_id sn2400_of_match[] = {
+ 	{ .compatible = "ti,sn2400" },
+ 	{ }
+@@ -364,6 +391,7 @@ static struct i2c_driver sn2400_driver = {
+ 	.driver = {
+ 		.name = "sn2400-charger",
+ 		.of_match_table = sn2400_of_match,
++		.pm = pm_sleep_ptr(&sn2400_pm_ops),
+ 	},
+ 	.probe = sn2400_probe,
+ 	.id_table = sn2400_id,

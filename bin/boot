@@ -1,0 +1,10 @@
+#!/bin/bash
+# DFU phone -> pongoOS -> m1n1+Linux; waits for USB net
+cd "$(dirname "$(readlink -f "$0")")/.."
+until lsusb | grep -q 05ac:1227; do sleep 1; done
+sudo RA1N_EARLY_EXIT=1 RA1N_OVERRIDE_PONGO=${PONGO:-$PWD/dl/Pongo.bin} RA1N_NO_COLORS=1 timeout 90 dl/palera1n/bin/palera1n 2>&1 | grep -E "Checkmate|pongo mode|rror"
+sleep 2
+# DUMPDT=1: save iBoot's live device tree (pongoOS `dt`) to re/live-adt.txt before booting Linux
+[ -n "$DUMPDT" ] && { (printf 'dt\n'; sleep 45) | sudo timeout 60 dl/pongoterm > re/live-adt.txt 2>&1; echo "ADT: $(wc -l < re/live-adt.txt) lines"; }
+printf '/send %s\nbootm\n' "${BLOB:-$PWD/m1n1-linux.bin}" | sudo timeout 60 dl/pongoterm 2>&1 | tee var/pongo.log | grep -iE "upload|error|fail"
+for i in $(seq 1 40); do ping -c1 -W1 172.16.43.1 >/dev/null 2>&1 && { echo LINUX_UP; sleep 3; exit 0; }; sleep 2; done; echo NO_LINUX; exit 1

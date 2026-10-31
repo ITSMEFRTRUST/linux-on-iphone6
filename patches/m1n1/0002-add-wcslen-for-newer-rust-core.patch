@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 00:00:00 +0000
+Subject: [PATCH 2/2] string: Add wcslen() for newer Rust core
+
+Newer Rust core (CStr/OsStr helpers) references wcslen(); provide a
+minimal implementation so m1n1 links with current nightly toolchains.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+diff --git a/src/string.c b/src/string.c
+index 8681be3..ca1318a 100644
+--- a/src/string.c
++++ b/src/string.c
+@@ -231,3 +231,12 @@ long atol(const char *s)
+ 
+     return val;
+ }
++
++/* Referenced by newer Rust core (CStr/OsStr helpers) */
++size_t wcslen(const int *s)
++{
++    size_t n = 0;
++    while (s[n])
++        n++;
++    return n;
++}
+-- 
+2.51.0
+

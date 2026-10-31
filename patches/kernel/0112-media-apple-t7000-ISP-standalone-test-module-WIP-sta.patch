@@ -1,0 +1,711 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 23:08:39 +0000
+Subject: [PATCH 112/138] media: apple: t7000 ISP standalone test module (WIP:
+ stages 1-2, power + bridge)
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/media/platform/Kconfig                |   1 +
+ drivers/media/platform/Makefile               |   1 +
+ drivers/media/platform/apple/Kconfig          |  17 ++
+ drivers/media/platform/apple/Makefile         |   1 +
+ .../media/platform/apple/isp-t7000/Makefile   |   3 +
+ .../media/platform/apple/isp-t7000/isp-main.c | 212 +++++++++++++++++
+ .../media/platform/apple/isp-t7000/isp-pwr.c  | 181 +++++++++++++++
+ drivers/media/platform/apple/isp-t7000/isp.h  | 213 ++++++++++++++++++
+ 8 files changed, 629 insertions(+)
+ create mode 100644 drivers/media/platform/apple/Kconfig
+ create mode 100644 drivers/media/platform/apple/Makefile
+ create mode 100644 drivers/media/platform/apple/isp-t7000/Makefile
+ create mode 100644 drivers/media/platform/apple/isp-t7000/isp-main.c
+ create mode 100644 drivers/media/platform/apple/isp-t7000/isp-pwr.c
+ create mode 100644 drivers/media/platform/apple/isp-t7000/isp.h
+
+diff --git a/drivers/media/platform/Kconfig b/drivers/media/platform/Kconfig
+index 2c7699b66..280a9db25 100644
+--- a/drivers/media/platform/Kconfig
++++ b/drivers/media/platform/Kconfig
+@@ -66,6 +66,7 @@ source "drivers/media/platform/allegro-dvt/Kconfig"
+ source "drivers/media/platform/amd/Kconfig"
+ source "drivers/media/platform/amlogic/Kconfig"
+ source "drivers/media/platform/amphion/Kconfig"
++source "drivers/media/platform/apple/Kconfig"
+ source "drivers/media/platform/arm/Kconfig"
+ source "drivers/media/platform/aspeed/Kconfig"
+ source "drivers/media/platform/atmel/Kconfig"
+diff --git a/drivers/media/platform/Makefile b/drivers/media/platform/Makefile
+index d47c47d81..aa82e1899 100644
+--- a/drivers/media/platform/Makefile
++++ b/drivers/media/platform/Makefile
+@@ -9,6 +9,7 @@ obj-y += allegro-dvt/
+ obj-y += amd/
+ obj-y += amlogic/
+ obj-y += amphion/
++obj-y += apple/
+ obj-y += arm/
+ obj-y += aspeed/
+ obj-y += atmel/
+diff --git a/drivers/media/platform/apple/Kconfig b/drivers/media/platform/apple/Kconfig
+new file mode 100644
+index 000000000..dba7f94a8
+--- /dev/null
++++ b/drivers/media/platform/apple/Kconfig
+@@ -0,0 +1,17 @@
++# SPDX-License-Identifier: GPL-2.0-only
++
++comment "Apple media platform drivers"
++
++config VIDEO_APPLE_ISP_T7000
++	tristate "Apple A8 (T7000) ISP bring-up test driver"
++	depends on ARCH_APPLE || COMPILE_TEST
++	depends on OF && ARM64
++	help
++	  Standalone bring-up/test module for the camera ISP of the Apple
++	  A8 (T7000, iPhone 6). It powers the ISP through direct PMGR
++	  writes, programs the ISP DART itself, loads apple/isp-t7000.bin
++	  and boots the ISP firmware stage by stage (module parameter
++	  "stage"). No V4L2 interface yet.
++
++	  To compile this driver as a module, choose M here: the module
++	  will be called apple-isp.
+diff --git a/drivers/media/platform/apple/Makefile b/drivers/media/platform/apple/Makefile
+new file mode 100644
+index 000000000..a56aea1cb
+--- /dev/null
++++ b/drivers/media/platform/apple/Makefile
+@@ -0,0 +1 @@
++obj-y += isp-t7000/
+diff --git a/drivers/media/platform/apple/isp-t7000/Makefile b/drivers/media/platform/apple/isp-t7000/Makefile
+new file mode 100644
+index 000000000..0aafd6690
+--- /dev/null
++++ b/drivers/media/platform/apple/isp-t7000/Makefile
+@@ -0,0 +1,3 @@
++# SPDX-License-Identifier: GPL-2.0-only
++apple-isp-y := isp-main.o isp-pwr.o isp-dart.o isp-boot.o isp-ipc.o
++obj-$(CONFIG_VIDEO_APPLE_ISP_T7000) += apple-isp.o
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-main.c b/drivers/media/platform/apple/isp-t7000/isp-main.c
+new file mode 100644
+index 000000000..d97ec8bc1
+--- /dev/null
++++ b/drivers/media/platform/apple/isp-t7000/isp-main.c
+@@ -0,0 +1,212 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Apple A8 (T7000) ISP bring-up test driver: module entry + stage runner.
++ *
++ * insmod apple-isp.ko stage=N runs stages 1..N and stays loaded; rmmod (or any
++ * failure) unwinds in reverse: CPU halt, DART off, power off what we turned on,
++ * then free memory. stage=0 (default) only logs the PMGR state; dry_run=1 only
++ * reads registers (and peeks at the firmware file), it never writes anything.
++ *
++ *  1 power-up (PMGR media, isp) + version read     6 boot stage 3 (channel table)
++ *  2 bridge settings + clock enable                7 mailbox + rings, poll worker
++ *  3 mini DART + firmware into a DART surface      8 PRINT_ENABLE + START
++ *  4 ISP CPU start, wait for the wake magic        9 CONFIG_GET + BUILDINFO
++ *  5 boot stage 2 (IPC pool + boot args)
++ */
++#include <linux/dma-mapping.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++
++#include "isp.h"
++
++static int stage;
++module_param(stage, int, 0444);
++MODULE_PARM_DESC(stage, "run stages 1..N and stay loaded (0 = only log PMGR state)");
++int isp_dry_run;
++module_param_named(dry_run, isp_dry_run, int, 0444);
++MODULE_PARM_DESC(dry_run, "1 = only read + log registers (ISP window only if already powered)");
++int isp_irq_en;
++module_param_named(irq, isp_irq_en, int, 0444);
++MODULE_PARM_DESC(irq, "1 = use AIC IRQ 91 for the mailbox (default: poll)");
++int isp_sens;
++module_param_named(sens, isp_sens, int, 0444);
++MODULE_PARM_DESC(sens, "1 = also power ps_ispsens0/1 (iOS does; default off)");
++int isp_smmu_en;
++module_param_named(smmu_en, isp_smmu_en, int, 0444);
++MODULE_PARM_DESC(smmu_en, "1 = also set SMMU+0xc byte[sid] |= 0x80 like iOS (default: SMMU read-only)");
++int isp_graceful = 1;
++module_param_named(graceful, isp_graceful, int, 0444);
++MODULE_PARM_DESC(graceful, "1 = STOP + POWER_DOWN handshake before halting a booted fw");
++uint isp_fw_iova;
++module_param_named(fw_iova, isp_fw_iova, uint, 0444);
++MODULE_PARM_DESC(fw_iova, "DART IOVA of the firmware (default 0: fw-relative == absolute)");
++uint isp_dart_sids = 0xf;
++module_param_named(dart_sids, isp_dart_sids, uint, 0444);
++MODULE_PARM_DESC(dart_sids, "DART stream mask to translate (default 0xf = all 4)");
++uint isp_platform_id = 0x2a;
++module_param_named(platform_id, isp_platform_id, uint, 0444);
++MODULE_PARM_DESC(platform_id, "boot-args platform id (ADT sensor-type, default 0x2a)");
++uint isp_poll_ms = 50;
++module_param_named(poll_ms, isp_poll_ms, uint, 0444);
++MODULE_PARM_DESC(poll_ms, "ring poll interval once the fw is up");
++uint isp_boot_timeout_ms = 10000;
++module_param_named(boot_timeout_ms, isp_boot_timeout_ms, uint, 0444);
++MODULE_PARM_DESC(boot_timeout_ms, "timeout of each boot handshake (iOS: 10 s)");
++uint isp_cmd_timeout_ms = 2000;
++module_param_named(cmd_timeout_ms, isp_cmd_timeout_ms, uint, 0444);
++MODULE_PARM_DESC(cmd_timeout_ms, "timeout of one fw command (iOS: 2 s)");
++uint isp_max_shared_mb = 64;
++module_param_named(max_shared_mb, isp_max_shared_mb, uint, 0444);
++MODULE_PARM_DESC(max_shared_mb, "cap on SHAREDMALLOC memory");
++
++static struct t7000_isp *the_isp;
++
++static int isp_stage_power(struct t7000_isp *isp)
++{
++	return isp_power_on(isp);
++}
++
++static int (*const isp_stages[])(struct t7000_isp *) = {
++	NULL,
++	isp_stage_power,	/* 1 */
++	isp_stage_clocks,	/* 2 */
++	isp_stage_fw,		/* 3 */
++	isp_stage_cpu,		/* 4 */
++	isp_stage_args,		/* 5 */
++	isp_stage_chans,	/* 6 */
++	isp_stage_mbox,		/* 7 */
++	isp_stage_start,	/* 8 */
++	isp_stage_query,	/* 9 */
++};
++
++/* Reverse unwind. Memory is freed only after the ISP is powered off. */
++static void isp_teardown(struct t7000_isp *isp)
++{
++	dev_info(isp->dev, "teardown from stage %d\n", isp->done);
++	isp_ipc_stop(isp);
++	mutex_lock(&isp->lock);
++	if (isp->fw_up && isp_graceful)
++		isp_fw_shutdown(isp);
++	if (isp->cpu_started)
++		isp_cpu_stop(isp);
++	if (isp->dart_on)
++		isp_dart_fini(isp);
++	isp_power_off(isp);
++	isp_surf_free_all(isp);
++	isp->done = 0;
++	mutex_unlock(&isp->lock);
++	isp_pmgr_log(isp, "after teardown");
++}
++
++static int isp_run(struct t7000_isp *isp)
++{
++	int n, ret;
++
++	if (stage < 0 || stage >= ARRAY_SIZE(isp_stages)) {
++		dev_err(isp->dev, "stage=%d out of range 0..%zu\n", stage,
++			ARRAY_SIZE(isp_stages) - 1);
++		return -EINVAL;
++	}
++	for (n = 1; n <= stage; n++) {
++		dev_info(isp->dev, "stage %d: start\n", n);
++		if (n > 1 && isp->isp_was_on) {
++			dev_err(isp->dev, "ps_isp was already on at load: someone else owns it, refusing writes\n");
++			return -EBUSY;
++		}
++		mutex_lock(&isp->lock);
++		ret = isp_stages[n](isp);
++		mutex_unlock(&isp->lock);
++		if (ret) {
++			dev_err(isp->dev, "stage %d: FAILED (%d), unwinding\n", n, ret);
++			return ret;
++		}
++		isp->done = n;
++		dev_info(isp->dev, "stage %d: done\n", n);
++	}
++	return 0;
++}
++
++static int __init isp_init(void)
++{
++	struct platform_device_info pinfo = {
++		.name = "apple-isp-t7000",
++		.id = PLATFORM_DEVID_NONE,
++		.dma_mask = DMA_BIT_MASK(64),
++	};
++	struct t7000_isp *isp;
++	int ret;
++
++	isp = kzalloc(sizeof(*isp), GFP_KERNEL);
++	if (!isp)
++		return -ENOMEM;
++	mutex_init(&isp->lock);
++	INIT_LIST_HEAD(&isp->surfs);
++	atomic_set(&isp->irq_count, 0);
++	isp->irq = -1;
++
++	isp->pdev = platform_device_register_full(&pinfo);
++	if (IS_ERR(isp->pdev)) {
++		ret = PTR_ERR(isp->pdev);
++		goto err_free;
++	}
++	isp->dev = &isp->pdev->dev;
++	dev_info(isp->dev, "load: stage=%d dry_run=%d irq=%d sens=%d smmu_en=%d fw_iova=0x%x dart_sids=0x%x platform_id=0x%x\n",
++		 stage, isp_dry_run, isp_irq_en, isp_sens, isp_smmu_en,
++		 isp_fw_iova, isp_dart_sids, isp_platform_id);
++
++	ret = -ENOMEM;
++	isp->pmgr = ioremap_np(PMGR_PS_PHYS, PMGR_PS_SIZE);
++	isp->regs = ioremap_np(ISP_PHYS_BASE, ISP_PHYS_SIZE);
++	if (!isp->pmgr || !isp->regs)
++		goto err_unmap;
++
++	isp_pmgr_log(isp, "load");
++	if (isp_dry_run) {
++		isp_dry_read(isp);
++		goto ok;
++	}
++	if (isp_fw_iova & 0xfff || isp_fw_iova >= 0x30000000 || !isp_dart_sids ||
++	    isp_dart_sids > 0xf) {
++		dev_err(isp->dev, "bad fw_iova/dart_sids\n");
++		ret = -EINVAL;
++		goto err_unmap;
++	}
++	ret = isp_run(isp);
++	if (ret) {
++		isp_teardown(isp);
++		goto err_unmap;
++	}
++ok:
++	dev_info(isp->dev, "loaded, stages done: %d (rmmod unwinds)\n", isp->done);
++	the_isp = isp;
++	return 0;
++
++err_unmap:
++	if (isp->regs)
++		iounmap(isp->regs);
++	if (isp->pmgr)
++		iounmap(isp->pmgr);
++	platform_device_unregister(isp->pdev);
++err_free:
++	kfree(isp);
++	return ret;
++}
++
++static void __exit isp_exit(void)
++{
++	struct t7000_isp *isp = the_isp;
++
++	if (!isp_dry_run)
++		isp_teardown(isp);
++	iounmap(isp->regs);
++	iounmap(isp->pmgr);
++	dev_info(isp->dev, "unloaded\n");
++	platform_device_unregister(isp->pdev);
++	kfree(isp);
++}
++
++module_init(isp_init);
++module_exit(isp_exit);
++MODULE_DESCRIPTION("Apple A8 (T7000) ISP bring-up test driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-pwr.c b/drivers/media/platform/apple/isp-t7000/isp-pwr.c
+new file mode 100644
+index 000000000..cef0f9159
+--- /dev/null
++++ b/drivers/media/platform/apple/isp-t7000/isp-pwr.c
+@@ -0,0 +1,181 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Apple A8 (T7000) ISP: PMGR power (stage 1) and bridge/clock setup (stage 2).
++ *
++ * Rule: the ISP window is touched only after ps_media and ps_isp read ACTUAL == 0xf.
++ * Reading it gated can wedge the fabric.
++ */
++#include <linux/bitfield.h>
++#include <linux/delay.h>
++#include <linux/iopoll.h>
++#include <linux/platform_device.h>
++
++#include "isp.h"
++
++static u32 ps_rd(struct t7000_isp *isp, u32 off)
++{
++	return readl(isp->pmgr + off);
++}
++
++static bool ps_is_on(u32 v)
++{
++	return FIELD_GET(PS_ACTUAL, v) == PS_ACTIVE;
++}
++
++void isp_pmgr_log(struct t7000_isp *isp, const char *when)
++{
++	dev_info(isp->dev, "pmgr %s: media 0x%08x isp 0x%08x ispsens0 0x%08x ispsens1 0x%08x\n",
++		 when, ps_rd(isp, PMGR_PS_MEDIA), ps_rd(isp, PMGR_PS_ISP),
++		 ps_rd(isp, PMGR_PS_ISPSENS0), ps_rd(isp, PMGR_PS_ISPSENS1));
++}
++
++static int ps_set(struct t7000_isp *isp, u32 off, const char *name, u32 state)
++{
++	u32 v = ps_rd(isp, off);
++	int ret;
++
++	v &= ~(PS_AUTO_ENABLE | PS_FLAGS | PS_TARGET);
++	v |= FIELD_PREP(PS_TARGET, state);
++	writel(v, isp->pmgr + off);
++	ret = readl_poll_timeout(isp->pmgr + off, v,
++				 FIELD_GET(PS_ACTUAL, v) == state, 10, 100000);
++	if (ret)
++		dev_err(isp->dev, "pmgr %s: timeout (100 ms) waiting for ACTUAL == 0x%x, reg 0x%08x\n",
++			name, state, v);
++	else
++		dev_info(isp->dev, "pmgr %s: -> 0x%x ok, reg 0x%08x\n", name, state, v);
++	return ret;
++}
++
++/* Power one domain on unless it already is; *ours tells whether we did it. */
++static int ps_on(struct t7000_isp *isp, u32 off, const char *name, bool *ours)
++{
++	u32 v = ps_rd(isp, off);
++	int ret;
++
++	*ours = false;
++	if (!ps_is_on(v)) {
++		*ours = true;	/* even on timeout: the target was changed, undo it */
++		ret = ps_set(isp, off, name, PS_ACTIVE);
++		if (ret)
++			return ret;
++		v = ps_rd(isp, off);
++	} else {
++		dev_info(isp->dev, "pmgr %s: already on (0x%08x), will leave it on\n", name, v);
++	}
++	if (v & (PS_RESET | PS_DEV_DISABLE)) {
++		dev_err(isp->dev, "pmgr %s: RESET/DEV_DISABLE set (0x%08x), refusing\n", name, v);
++		return -EIO;
++	}
++	return 0;
++}
++
++int isp_power_on(struct t7000_isp *isp)
++{
++	int ret;
++
++	isp->isp_was_on = ps_is_on(ps_rd(isp, PMGR_PS_ISP));
++	ret = ps_on(isp, PMGR_PS_MEDIA, "media", &isp->on_media);
++	if (ret)
++		return ret;
++	ret = ps_on(isp, PMGR_PS_ISP, "isp", &isp->on_isp);
++	if (ret)
++		return ret;
++	if (isp_sens) {
++		ret = ps_on(isp, PMGR_PS_ISPSENS0, "ispsens0", &isp->on_sens0);
++		if (!ret)
++			ret = ps_on(isp, PMGR_PS_ISPSENS1, "ispsens1", &isp->on_sens1);
++		if (ret)
++			return ret;
++	}
++	isp->version = isp_rd(isp, ISP_VERSION);
++	dev_info(isp->dev, "version reg (+0xa0000) = 0x%08x -> rev %u%s\n",
++		 isp->version, isp->version >> 16,
++		 (isp->version >> 16) == 4 ? "" : " (only rev 4 is implemented; stage 2+ will refuse)");
++	isp->version >>= 16;
++	isp_log_window(isp, "after power-on");
++	return 0;
++}
++
++void isp_power_off(struct t7000_isp *isp)
++{
++	if (isp->on_sens1) {
++		ps_set(isp, PMGR_PS_ISPSENS1, "ispsens1", PS_PWRGATE);
++		isp->on_sens1 = false;
++	}
++	if (isp->on_sens0) {
++		ps_set(isp, PMGR_PS_ISPSENS0, "ispsens0", PS_PWRGATE);
++		isp->on_sens0 = false;
++	}
++	if (isp->on_isp) {
++		ps_set(isp, PMGR_PS_ISP, "isp", PS_PWRGATE);
++		isp->on_isp = false;
++	}
++	if (isp->on_media) {
++		ps_set(isp, PMGR_PS_MEDIA, "media", PS_PWRGATE);
++		isp->on_media = false;
++	}
++}
++
++void isp_log_window(struct t7000_isp *isp, const char *when)
++{
++	dev_info(isp->dev, "%s: gpio0-7 %08x %08x %08x %08x %08x %08x %08x %08x\n", when,
++		 isp_rd(isp, ISP_GPIO(0)), isp_rd(isp, ISP_GPIO(1)), isp_rd(isp, ISP_GPIO(2)),
++		 isp_rd(isp, ISP_GPIO(3)), isp_rd(isp, ISP_GPIO(4)), isp_rd(isp, ISP_GPIO(5)),
++		 isp_rd(isp, ISP_GPIO(6)), isp_rd(isp, ISP_GPIO(7)));
++	dev_info(isp->dev, "%s: ctrl %08x fwbase %08x win %08x %08x %08x %08x %08x mbox p%08x e%08x\n",
++		 when, isp_rd(isp, ISP_CTRL_V34), isp_rd(isp, ISP_FW_BASE),
++		 isp_rd(isp, ISP_WIN_0C), isp_rd(isp, ISP_WIN_10), isp_rd(isp, ISP_WIN_14),
++		 isp_rd(isp, ISP_WIN_18), isp_rd(isp, ISP_WIN_1C),
++		 isp_rd(isp, ISP_MBOX_PENDING), isp_rd(isp, ISP_MBOX_ENABLE));
++	dev_info(isp->dev, "%s: clken %08x bridge 1c=%08x 20=%08x 48=%08x 1000=%08x tl-out 44=%08x 68=%08x\n",
++		 when, isp_rd(isp, ISP_CLOCK_EN), isp_rd(isp, 0x1c), isp_rd(isp, 0x20),
++		 isp_rd(isp, 0x48), isp_rd(isp, 0x1000), isp_rd(isp, ISP_TLIMIT0_OUT),
++		 isp_rd(isp, ISP_TLIMIT1_OUT));
++}
++
++/* PMGR bridge-settings-6 (= ISP, PMGR reg index 8 = 0x5b00000), applied by iOS PMGR on power-up */
++static const u32 isp_bridge6[][2] = {
++	{ 0x1c, 0x80000004 }, { 0x20, 0x80240010 },
++	{ 0x48, 0x2020 }, { 0x4c, 0x2020 }, { 0x50, 0x2020 }, { 0x54, 0x2020 },
++	{ 0x58, 0x2020 }, { 0x5c, 0x2020 }, { 0x60, 0x2020 }, { 0x64, 0x2020 },
++	{ 0x1000, 0xc00f000f }, { 0x1008, 0xc00f000f },
++	{ 0x21000, 0x808 }, { 0x21004, 0x808 },
++};
++
++int isp_stage_clocks(struct t7000_isp *isp)
++{
++	int i;
++
++	if (isp->version != 4) {
++		dev_err(isp->dev, "rev %u: only rev 4 is implemented\n", isp->version);
++		return -ENODEV;
++	}
++	for (i = 0; i < ARRAY_SIZE(isp_bridge6); i++) {
++		u32 off = isp_bridge6[i][0], old = isp_rd(isp, off);
++
++		isp_wr(isp, off, isp_bridge6[i][1]);
++		dev_info(isp->dev, "bridge +0x%05x: 0x%08x -> 0x%08x (readback 0x%08x)\n",
++			 off, old, isp_bridge6[i][1], isp_rd(isp, off));
++	}
++	isp_wr(isp, ISP_CLOCK_EN, 1);
++	dev_info(isp->dev, "clock enable +0x20080 = 1 (readback 0x%08x)\n",
++		 isp_rd(isp, ISP_CLOCK_EN));
++	isp_log_window(isp, "after stage 2");
++	return 0;
++}
++
++/* dry_run: reads only. The window is read only if media + isp are already on. */
++void isp_dry_read(struct t7000_isp *isp)
++{
++	if (ps_is_on(ps_rd(isp, PMGR_PS_MEDIA)) && ps_is_on(ps_rd(isp, PMGR_PS_ISP))) {
++		isp->version = isp_rd(isp, ISP_VERSION);
++		dev_info(isp->dev, "dry_run: version reg 0x%08x (rev %u)\n",
++			 isp->version, isp->version >> 16);
++		isp_log_window(isp, "dry_run");
++		isp_dart_log(isp, "dry_run");
++	} else {
++		dev_info(isp->dev, "dry_run: ps_media/ps_isp not both on: not reading the ISP window\n");
++	}
++	isp_fw_peek(isp);
++}
+diff --git a/drivers/media/platform/apple/isp-t7000/isp.h b/drivers/media/platform/apple/isp-t7000/isp.h
+new file mode 100644
+index 000000000..df79441d2
+--- /dev/null
++++ b/drivers/media/platform/apple/isp-t7000/isp.h
+@@ -0,0 +1,213 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Apple A8 (T7000) ISP bring-up test driver: shared definitions.
++ *
++ * Register meanings come from static RE of the iOS 12 AppleH6CamIn kext and the
++ * ISP firmware (see re/CAMERA-PHASE0.md and re/CAMERA-PHASE2-STATUS.md in the
++ * iphone6-linux repo). Everything here is unverified on hardware until the first
++ * runbook pass; the dmesg of each stage confirms or refutes it.
++ */
++#ifndef __APPLE_ISP_T7000_H__
++#define __APPLE_ISP_T7000_H__
++
++#include <linux/io.h>
++#include <linux/list.h>
++#include <linux/mutex.h>
++#include <linux/types.h>
++#include <linux/wait.h>
++#include <linux/workqueue.h>
++
++/* --- physical addresses (standalone mode, no DT node) --- */
++#define ISP_PHYS_BASE		0x205b00000ULL	/* ISP window, 5 MB */
++#define ISP_PHYS_SIZE		0x500000
++#define PMGR_PS_PHYS		0x20e020000ULL	/* PMGR power-state page */
++#define PMGR_PS_SIZE		0x1000
++#define PMGR_PS_ISPSENS0	0x210
++#define PMGR_PS_ISPSENS1	0x218
++#define PMGR_PS_ISP		0x2d0
++#define PMGR_PS_MEDIA		0x2d8
++
++/* PMGR power-state register (same layout as drivers/pmdomain/apple) */
++#define PS_RESET		BIT(31)
++#define PS_AUTO_ENABLE		BIT(28)
++#define PS_DEV_DISABLE		BIT(10)
++#define PS_FLAGS		(BIT(9) | BIT(8))
++#define PS_ACTUAL		GENMASK(7, 4)
++#define PS_TARGET		GENMASK(3, 0)
++#define PS_ACTIVE		0xf
++#define PS_PWRGATE		0x0
++
++/* --- offsets inside the ISP window --- */
++#define ISP_VERSION		0xa0000		/* >> 16 = 3/4/5 */
++#define ISP_CLOCK_EN		0x20080		/* kext power_on_hardware writes 1 */
++#define ISP_DART		0x22000		/* dart-isp (s5l8960x) */
++#define ISP_SMMU		0x24000		/* dart-isp second block, read-only here */
++#define ISP_MBOX_PENDING	0x40100
++#define ISP_MBOX_ENABLE		0x40104
++#define ISP_GPIO(n)		(0xc0100 + 4 * (n))
++#define ISP_DOORBELL		0xc0500		/* write 1 << src */
++#define ISP_MBOX_ACK		0xc050c		/* write back the pending value */
++#define ISP_FW_BASE		0x100008
++#define ISP_WIN_0C		0x10000c
++#define ISP_WIN_10		0x100010
++#define ISP_WIN_14		0x100014
++#define ISP_WIN_18		0x100018	/* 0xfffff000 */
++#define ISP_WIN_1C		0x10001c
++#define ISP_CTRL_V34		0x100028	/* 0 = hold, 0x10 = run */
++#define ISP_CTRL_RUN_V34	0x10
++#define ISP_IRQMASK(n)		(0x100a00 + 4 * (n))
++#define ISP_CPU_STAT		0x10081c	/* read 8x by ResetISPCPU */
++#define ISP_TLIMIT0_OUT		0x44		/* outstanding transactions */
++#define ISP_TLIMIT1_OUT		0x68
++
++#define ISP_MAGIC_WAKE		0x8042006
++#define ISP_MAGIC_ARGS		0xf7fbdff9
++#define ISP_MAGIC_IDLE		0xfeedbabe
++
++/* s5l8960x DART registers (drivers/iommu/apple-dart.c) */
++#define DART_STREAM_CMD		0x0
++#define DART_STREAM_CMD_INVAL	BIT(1)
++#define DART_STREAM_CMD_BUSY	BIT(3)
++#define DART_TCR		0xc		/* 8 bits per stream */
++#define DART_TCR_ENABLE		0x80
++#define DART_ERROR		0x10
++#define DART_ERROR_FLAG		BIT(31)
++#define DART_ERROR_ADDR		0x1c
++#define DART_TTBR(sid, i)	(0x40 + 0x10 * (sid) + 4 * (i))
++#define DART_TTBR_VALID		BIT(31)
++#define DART_PTE_VALID		0x3		/* A8: tables + leaves need bits 1:0 = 11 */
++#define DART_PTE_PA		GENMASK_ULL(35, 12)
++
++#define ISP_FW_SIZE_V34		0x300000
++#define ISP_IOVA_SPAN		0x10000000	/* fw sees fw_base .. fw_base + 256 MB */
++#define ISP_IPC_POOL_MIN	0x18000
++#define ISP_ARGS_SIZE		0x74
++#define ISP_MSG_SIZE		0x40
++#define ISP_CHAN_DESC_SIZE	0x100
++#define ISP_MAX_CHANS		0x20
++#define ISP_CMD_BUF_SIZE	0x400
++
++enum { CHAN_CMD = 0, CHAN_REPLY = 1, CHAN_REPORT = 2 };
++
++/* CISP opcodes used here (u16 at +4 of a command packet, status u16 at +6) */
++#define CISP_CMD_START		0x0
++#define CISP_CMD_STOP		0x1
++#define CISP_CMD_CONFIG_GET	0x3
++#define CISP_CMD_PRINT_ENABLE	0x4
++#define CISP_CMD_BUILDINFO	0x6
++#define CISP_CMD_POWER_DOWN	0x10
++
++struct isp_surf {
++	struct list_head list;
++	u32 iova;		/* absolute DART IOVA */
++	u32 size;		/* multiple of PAGE_SIZE */
++	u32 tag;		/* 4cc, for logs */
++	unsigned int npages;
++	struct page **pages;
++	dma_addr_t *dma;
++	void *virt;		/* write-combine (non-cacheable) vmap */
++};
++
++struct isp_chan {
++	char name[0x41];
++	u32 type, src, num, rel;
++	u8 *ring;		/* CPU view of num * 0x40 bytes */
++	u32 idx;		/* next slot to send (cmd) or to look at (reply/report) */
++	unsigned long msgs;
++};
++
++struct t7000_isp {
++	struct platform_device *pdev;
++	struct device *dev;
++	void __iomem *pmgr;
++	void __iomem *regs;
++	struct mutex lock;
++
++	int done;		/* highest stage completed */
++	u32 version;
++	bool on_media, on_isp, on_sens0, on_sens1;	/* we powered these on */
++	bool isp_was_on;
++
++	/* mini DART */
++	bool dart_on;
++	u64 *l1;
++	dma_addr_t l1_dma;
++	u64 *l2[512];
++	dma_addr_t l2_dma[512];
++	u32 iova_next;
++	u64 shared_bytes;
++	struct list_head surfs;
++	struct isp_surf *fw, *ipc, *heap;
++
++	/* boot */
++	bool cpu_started, fw_up;
++	u32 nchans, qsize, heapsize, pool_used;
++	u32 args_off, cmd_off;
++	struct isp_chan chans[ISP_MAX_CHANS];
++	struct isp_chan *io, *sm, *tm, *bh, *bt, *it, *dg;
++
++	/* runtime */
++	struct delayed_work poll_work;
++	bool poll_on;
++	int irq;
++	atomic_t irq_count;
++	unsigned long dart_err_logged;
++};
++
++/* module parameters (isp-main.c) */
++extern int isp_dry_run, isp_irq_en, isp_sens, isp_smmu_en, isp_graceful;
++extern uint isp_fw_iova, isp_dart_sids, isp_platform_id, isp_poll_ms;
++extern uint isp_boot_timeout_ms, isp_cmd_timeout_ms, isp_max_shared_mb;
++
++static inline u32 isp_rd(struct t7000_isp *isp, u32 off)
++{
++	return readl(isp->regs + off);
++}
++
++static inline void isp_wr(struct t7000_isp *isp, u32 off, u32 val)
++{
++	writel(val, isp->regs + off);
++}
++
++static inline u32 isp_rel(u32 iova)
++{
++	return iova - isp_fw_iova;
++}
++
++/* isp-pwr.c */
++void isp_pmgr_log(struct t7000_isp *isp, const char *when);
++int isp_power_on(struct t7000_isp *isp);
++void isp_power_off(struct t7000_isp *isp);
++void isp_log_window(struct t7000_isp *isp, const char *when);
++int isp_stage_clocks(struct t7000_isp *isp);
++void isp_dry_read(struct t7000_isp *isp);
++
++/* isp-dart.c */
++int isp_dart_init(struct t7000_isp *isp);
++void isp_dart_fini(struct t7000_isp *isp);
++void isp_dart_log(struct t7000_isp *isp, const char *when);
++bool isp_dart_fault(struct t7000_isp *isp);
++struct isp_surf *isp_surf_alloc(struct t7000_isp *isp, u32 size, u32 tag);
++void isp_surf_free(struct t7000_isp *isp, struct isp_surf *s);
++void isp_surf_free_all(struct t7000_isp *isp);
++void *isp_translate(struct t7000_isp *isp, u32 rel, u32 len);
++struct isp_surf *isp_surf_find(struct t7000_isp *isp, u32 iova);
++
++/* isp-boot.c */
++int isp_wait(struct t7000_isp *isp, u32 off, u32 mask, u32 want, uint ms,
++	     const char *what);
++void isp_fw_peek(struct t7000_isp *isp);
++int isp_stage_fw(struct t7000_isp *isp);
++int isp_stage_cpu(struct t7000_isp *isp);
++int isp_stage_args(struct t7000_isp *isp);
++int isp_stage_chans(struct t7000_isp *isp);
++void isp_cpu_stop(struct t7000_isp *isp);
++
++/* isp-ipc.c */
++int isp_stage_mbox(struct t7000_isp *isp);
++int isp_stage_start(struct t7000_isp *isp);
++int isp_stage_query(struct t7000_isp *isp);
++void isp_ipc_stop(struct t7000_isp *isp);
++void isp_fw_shutdown(struct t7000_isp *isp);
++
++#endif

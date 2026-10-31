@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 17:31:24 +0000
+Subject: [PATCH 046/138] PCI: apple: make t7000_stage writable (re-probe via
+ sysfs bind)
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/pci/controller/pcie-apple.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/pci/controller/pcie-apple.c b/drivers/pci/controller/pcie-apple.c
+index bfae7de2a..fed238532 100644
+--- a/drivers/pci/controller/pcie-apple.c
++++ b/drivers/pci/controller/pcie-apple.c
+@@ -1024,7 +1024,7 @@ static const struct pci_ecam_ops apple_pcie_cfg_ecam_ops = {
+  * a module to 6, so the bring-up only ever runs on an explicit insmod.
+  */
+ static unsigned int t7000_stage = IS_MODULE(CONFIG_PCIE_APPLE) ? 6 : 0;
+-module_param(t7000_stage, uint, 0444);
++module_param(t7000_stage, uint, 0644);
+ MODULE_PARM_DESC(t7000_stage,
+ 		 "T7000: last bring-up stage to run (0 = none ... 6 = all)");
+ 

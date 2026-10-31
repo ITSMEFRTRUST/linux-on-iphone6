@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 16:26:24 +0000
+Subject: [PATCH 043/138] wifi: brcmfmac: pcie: Add the BCM4345 B1
+
+The iPhone 6 has a BCM4345 B1 (43451) on PCIe, device ID 0x43ab, running
+Apple's msgbuf firmware 7.63. Add the device ID and a firmware table
+entry for the pre-C0 revisions, brcmfmac4345b1-pcie. The board type
+comes from the DT ("apple,tempranillo").
+
+Read its OTP like iOS does (ChipCommon + 0x8c0, 0x172 bytes), but the
+layout is unknown: if the parser rejects it, dump it and carry on with
+the default firmware names instead of failing the probe.
+
+The PCI class code is not checked for this ID until it is seen on
+hardware.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../broadcom/brcm80211/brcmfmac/pcie.c        | 27 +++++++++++++++++++
+ .../broadcom/brcm80211/include/brcm_hw_ids.h  |  1 +
+ 2 files changed, 28 insertions(+)
+
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
+index 55f4d7b97..fb2e8d680 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
+@@ -50,6 +50,7 @@ enum brcmf_pcie_state {
+ };
+ 
+ BRCMF_FW_DEF(43602, "brcmfmac43602-pcie");
++BRCMF_FW_CLM_DEF(4345B1, "brcmfmac4345b1-pcie");
+ BRCMF_FW_DEF(4350, "brcmfmac4350-pcie");
+ BRCMF_FW_DEF(4350C, "brcmfmac4350c2-pcie");
+ BRCMF_FW_CLM_DEF(4355, "brcmfmac4355-pcie");
+@@ -84,6 +85,7 @@ MODULE_FIRMWARE(BRCMF_FW_DEFAULT_PATH "brcmfmac*-pcie.*.txcap_blob");
+ 
+ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
+ 	BRCMF_FW_ENTRY(BRCM_CC_43602_CHIP_ID, 0xFFFFFFFF, 43602),
++	BRCMF_FW_ENTRY(BRCM_CC_4345_CHIP_ID, 0x0000003F, 4345B1), /* pre-C0 */
+ 	BRCMF_FW_ENTRY(BRCM_CC_43465_CHIP_ID, 0xFFFFFFF0, 4366C),
+ 	BRCMF_FW_ENTRY(BRCM_CC_4350_CHIP_ID, 0x000000FF, 4350C),
+ 	BRCMF_FW_ENTRY(BRCM_CC_4350_CHIP_ID, 0xFFFFFF00, 4350),
+@@ -2053,9 +2055,20 @@ static int brcmf_pcie_read_otp(struct brcmf_pciedev_info *devinfo)
+ 	u32 coreid, base, words, idx, sromctl;
+ 	u16 *otp;
+ 	struct brcmf_core *core;
++	bool optional = false;
+ 	int ret;
+ 
+ 	switch (devinfo->ci->chip) {
++	case BRCM_CC_4345_CHIP_ID:
++		/*
++		 * Apple's 4345 B1 (iPhone 6). The OTP layout is not known
++		 * to match the parser yet: dump it and never fail on it.
++		 */
++		coreid = BCMA_CORE_CHIPCOMMON;
++		base = 0x8c0;
++		words = 0xb9;
++		optional = true;
++		break;
+ 	case BRCM_CC_4355_CHIP_ID:
+ 		coreid = BCMA_CORE_CHIPCOMMON;
+ 		base = 0x8c0;
+@@ -2126,6 +2139,14 @@ static int brcmf_pcie_read_otp(struct brcmf_pciedev_info *devinfo)
+ 	}
+ 
+ 	ret = brcmf_pcie_parse_otp(devinfo, (u8 *)otp, 2 * words);
++	if (ret && optional) {
++		dev_info(&pdev->dev,
++			 "OTP not parsed (%d), using the default firmware names; raw OTP:\n",
++			 ret);
++		print_hex_dump(KERN_INFO, "brcmfmac OTP: ", DUMP_PREFIX_OFFSET,
++			       16, 2, otp, 2 * words, false);
++		ret = 0;
++	}
+ 	kfree(otp);
+ 
+ 	return ret;
+@@ -2733,6 +2754,12 @@ static const struct dev_pm_ops brcmf_pciedrvr_pm = {
+ 	}
+ 
+ static const struct pci_device_id brcmf_pcie_devid_table[] = {
++	/* Apple 4345 B1: class code not checked until seen on hardware */
++	{
++		PCI_DEVICE(BRCM_PCIE_VENDOR_ID_BROADCOM,
++			   BRCM_PCIE_4345_DEVICE_ID),
++		.driver_data = BRCMF_DRVDATA_WCC_SEED,
++	},
+ 	BRCMF_PCIE_DEVICE(BRCM_PCIE_4350_DEVICE_ID, WCC),
+ 	BRCMF_PCIE_DEVICE_SUB(0x4355, BRCM_PCIE_VENDOR_ID_BROADCOM, 0x4355, WCC),
+ 	BRCMF_PCIE_DEVICE(BRCM_PCIE_4354_RAW_DEVICE_ID, WCC),
+diff --git a/drivers/net/wireless/broadcom/brcm80211/include/brcm_hw_ids.h b/drivers/net/wireless/broadcom/brcm80211/include/brcm_hw_ids.h
+index df3b67ba4..f88899005 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/include/brcm_hw_ids.h
++++ b/drivers/net/wireless/broadcom/brcm80211/include/brcm_hw_ids.h
+@@ -72,6 +72,7 @@
+ #define CY_USB_4373_DEVICE_ID		0xbd29
+ 
+ /* PCIE Device IDs */
++#define BRCM_PCIE_4345_DEVICE_ID	0x43ab
+ #define BRCM_PCIE_4350_DEVICE_ID	0x43a3
+ #define BRCM_PCIE_4354_DEVICE_ID	0x43df
+ #define BRCM_PCIE_4354_RAW_DEVICE_ID	0x4354

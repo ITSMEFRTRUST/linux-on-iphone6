@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 23:35:32 +0000
+Subject: [PATCH 096/138] arm64: dts: apple: t7000-n61: Keep gpiolib off PMU
+ GPIO 11
+
+LLB programs D2186 GPIO 11 to cfg 0x08 and iOS never writes it again
+(LLB GPIO table, no kext reference); it is presumably the 32 kHz clock of
+the M8 motion coprocessor. A gpiolib output request would rewrite that
+cfg, and a cfg with bits 6:3 = 1000 wedged the PMU's I2C bus on hw. Name
+the line and reserve it. No register is written.
+
+Document gpio-line-names and gpio-reserved-ranges in the binding.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../devicetree/bindings/gpio/apple,adi-pmic-gpio.yaml    | 6 ++++++
+ arch/arm64/boot/dts/apple/t7000-n61.dts                  | 9 ++++++++-
+ 2 files changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/Documentation/devicetree/bindings/gpio/apple,adi-pmic-gpio.yaml b/Documentation/devicetree/bindings/gpio/apple,adi-pmic-gpio.yaml
+index c18587727..20c4632f2 100644
+--- a/Documentation/devicetree/bindings/gpio/apple,adi-pmic-gpio.yaml
++++ b/Documentation/devicetree/bindings/gpio/apple,adi-pmic-gpio.yaml
+@@ -29,6 +29,12 @@ properties:
+   "#gpio-cells":
+     const: 2
+ 
++  gpio-line-names:
++    minItems: 1
++    maxItems: 21
++
++  gpio-reserved-ranges: true
++
+ required:
+   - compatible
+   - reg
+diff --git a/arch/arm64/boot/dts/apple/t7000-n61.dts b/arch/arm64/boot/dts/apple/t7000-n61.dts
+index 5f360f67e..c0e88770f 100644
+--- a/arch/arm64/boot/dts/apple/t7000-n61.dts
++++ b/arch/arm64/boot/dts/apple/t7000-n61.dts
+@@ -369,7 +369,14 @@ pmic_ldo18: ldo18@85 {
+ &pmic_gpio {
+ 	/* ADT oscar function-reset: PMU GPIO 5, active low */
+ 	gpio-line-names = "", "", "", "", "", "OSCAR_RESET_L",
+-			  "", "", "BT_REG_ON", "", "WL_REG_ON";
++			  "", "", "BT_REG_ON", "", "WL_REG_ON", "OSCAR_CLK32K";
++	/*
++	 * PMU GPIO 11: LLB programs cfg 0x08 and iOS never writes it again;
++	 * presumably the M8's 32 kHz clock. Keep it away from gpiolib: an
++	 * output request would rewrite the cfg, and a cfg with bits 6:3 =
++	 * 1000 (0x41) wedged the PMU's I2C bus on hw.
++	 */
++	gpio-reserved-ranges = <11 1>;
+ };
+ 
+ &serial8 {

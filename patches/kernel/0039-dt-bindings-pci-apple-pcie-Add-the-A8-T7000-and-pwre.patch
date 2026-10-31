@@ -1,0 +1,122 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 16:26:24 +0000
+Subject: [PATCH 039/138] dt-bindings: pci: apple,pcie: Add the A8 (T7000) and
+ pwren-gpios
+
+The A8 (T7000) PCIe controller is the ancestor of the M1 one: the same
+DesignWare root ports behind an ECAM window, with the same per-port
+interrupt and MSI registers. Its clock, reset and power-down controls sit
+in the "rc" block, and a single PHY range serves a pair of ports, so it
+takes "config", "rc", "port0", "port1" and "phy0".
+
+Also document the optional pwren-gpios on root port nodes, used for the
+REG_ON pin of a Wi-Fi module.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../devicetree/bindings/pci/apple,pcie.yaml   | 63 +++++++++++++++----
+ 1 file changed, 52 insertions(+), 11 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/pci/apple,pcie.yaml b/Documentation/devicetree/bindings/pci/apple,pcie.yaml
+index c0852be04..30c569db0 100644
+--- a/Documentation/devicetree/bindings/pci/apple,pcie.yaml
++++ b/Documentation/devicetree/bindings/pci/apple,pcie.yaml
+@@ -21,6 +21,10 @@ description: |
+   separate from the port registers. In that case, there is one PHY
+   register range per port register range.
+ 
++  On the A8 (T7000), the clock, reset and power-down controls of all
++  ports live in the "rc" region, one PHY register range is shared by a
++  pair of ports and the MSI doorbell address is fixed at 0xbffff000.
++
+   All root ports share a single ECAM space, but separate GPIOs are
+   used to take the PCI devices on those ports out of reset.  Therefore
+   the standard "reset-gpios" and "max-link-speed" properties appear on
+@@ -42,6 +46,7 @@ properties:
+               - apple,t6000-pcie
+           - const: apple,pcie
+       - const: apple,t6020-pcie
++      - const: apple,t7000-pcie
+ 
+   reg:
+     minItems: 3
+@@ -49,17 +54,7 @@ properties:
+ 
+   reg-names:
+     minItems: 3
+-    items:
+-      - const: config
+-      - const: rc
+-      - const: port0
+-      - const: port1
+-      - const: port2
+-      - const: port3
+-      - const: phy0
+-      - const: phy1
+-      - const: phy2
+-      - const: phy3
++    maxItems: 10
+ 
+   ranges:
+     minItems: 2
+@@ -82,6 +77,19 @@ properties:
+   power-domains:
+     maxItems: 1
+ 
++patternProperties:
++  "^pci@":
++    type: object
++    description: A root port.
++    properties:
++      pwren-gpios:
++        description:
++          Optional GPIO that powers up the device behind this root port,
++          e.g. the REG_ON pin of a Wi-Fi module. It is driven before the
++          port is brought up and PERST# is released.
++        maxItems: 1
++    additionalProperties: true
++
+ required:
+   - compatible
+   - reg
+@@ -97,6 +105,39 @@ unevaluatedProperties: false
+ allOf:
+   - $ref: /schemas/pci/pci-host-bridge.yaml#
+   - $ref: /schemas/interrupt-controller/msi-controller.yaml#
++  - if:
++      properties:
++        compatible:
++          contains:
++            const: apple,t7000-pcie
++    then:
++      properties:
++        reg:
++          maxItems: 5
++        reg-names:
++          items:
++            - const: config
++            - const: rc
++            - const: port0
++            - const: port1
++            - const: phy0
++        interrupts:
++          maxItems: 2
++    else:
++      properties:
++        reg-names:
++          minItems: 3
++          items:
++            - const: config
++            - const: rc
++            - const: port0
++            - const: port1
++            - const: port2
++            - const: port3
++            - const: phy0
++            - const: phy1
++            - const: phy2
++            - const: phy3
+   - if:
+       properties:
+         compatible:

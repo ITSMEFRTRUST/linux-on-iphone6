@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 03:17:38 +0000
+Subject: [PATCH 061/138] arm64: dts: apple: t7000-n61: Add the ambient light
+ sensor
+
+The iOS device tree has /arm-io/i2c2/als ("als,ct819") at 0x29 with
+interrupt 34 (level-low). Its command set is the TAOS TSL2581 one, so
+describe it with the existing tsl2583 binding. The driver polls; the
+interrupt line is only described.
+
+Also pin the I2C bus numbers with aliases, so userspace can rely on
+i2c-2 being the ALS bus.
+
+Assisted-by: Claude:claude-sonnet-5-5
+---
+ arch/arm64/boot/dts/apple/t7000-common.dtsi |  3 +++
+ arch/arm64/boot/dts/apple/t7000-n61.dts     | 12 ++++++++++++
+ 2 files changed, 15 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/apple/t7000-common.dtsi b/arch/arm64/boot/dts/apple/t7000-common.dtsi
+index 8496abee9..91a5c6e0b 100644
+--- a/arch/arm64/boot/dts/apple/t7000-common.dtsi
++++ b/arch/arm64/boot/dts/apple/t7000-common.dtsi
+@@ -13,6 +13,9 @@ / {
+ 	aliases {
+ 		ausbphy0 = &ausbphy0; /* Used by loader */
+ 		asp = &ans;
++		i2c0 = &i2c0;
++		i2c1 = &i2c1;
++		i2c2 = &i2c2;
+ 		serial0 = &serial0;
+ 		serial1 = &serial1;
+ 		serial3 = &serial3;
+diff --git a/arch/arm64/boot/dts/apple/t7000-n61.dts b/arch/arm64/boot/dts/apple/t7000-n61.dts
+index 17270391e..1733267b0 100644
+--- a/arch/arm64/boot/dts/apple/t7000-n61.dts
++++ b/arch/arm64/boot/dts/apple/t7000-n61.dts
+@@ -108,6 +108,18 @@ chestnut_ldo2: ldo2 {
+ 	};
+ };
+ 
++&i2c2 {
++	status = "okay";
++
++	/* ADT /arm-io/i2c2/als: "als,ct819", command-compatible with the TAOS TSL2581 */
++	light-sensor@29 {
++		compatible = "amstaos,tsl2581";
++		reg = <0x29>;
++		/* ADT interrupts [34 1] = level-low; the driver polls, the line is only described */
++		interrupts-extended = <&pinctrl 34 IRQ_TYPE_LEVEL_LOW>;
++	};
++};
++
+ &i2c1 {
+ 	status = "okay";
+ 

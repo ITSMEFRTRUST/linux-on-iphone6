@@ -1,0 +1,287 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 19:23:02 +0000
+Subject: [PATCH 051/138] nfc: nxp-nci: Add a UART link layer
+
+Some NXP NCI controllers are wired to a UART instead of I2C, e.g. the
+PN548-class controller of the Apple iPhone 6 on its UART3. The wire
+carries the same framing as on I2C (plain NCI packets in NCI mode, NXP
+download frames in firmware mode), so add a serdev phy for the existing
+core. The power sequence follows the iOS HAL: set the download line,
+then pulse VEN.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/nfc/nxp-nci/Kconfig  |  12 ++
+ drivers/nfc/nxp-nci/Makefile |   2 +
+ drivers/nfc/nxp-nci/uart.c   | 228 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 242 insertions(+)
+ create mode 100644 drivers/nfc/nxp-nci/uart.c
+
+diff --git a/drivers/nfc/nxp-nci/Kconfig b/drivers/nfc/nxp-nci/Kconfig
+index ab6db98b4..20ab89a59 100644
+--- a/drivers/nfc/nxp-nci/Kconfig
++++ b/drivers/nfc/nxp-nci/Kconfig
+@@ -23,3 +23,15 @@ config NFC_NXP_NCI_I2C
+ 	  To compile this driver as a module, choose m here. The module will
+ 	  be called nxp_nci_i2c.
+ 	  Say N if unsure.
++
++config NFC_NXP_NCI_UART
++	tristate "NXP-NCI UART support"
++	depends on NFC_NXP_NCI && SERIAL_DEV_BUS
++	help
++	  This module adds support for a UART interface to the NXP NCI
++	  chips, as used on the Apple iPhone 6.
++	  Select this if your platform is using a serial port.
++
++	  To compile this driver as a module, choose m here. The module will
++	  be called nxp_nci_uart.
++	  Say N if unsure.
+diff --git a/drivers/nfc/nxp-nci/Makefile b/drivers/nfc/nxp-nci/Makefile
+index 3ff713a92..34aa6c0ac 100644
+--- a/drivers/nfc/nxp-nci/Makefile
++++ b/drivers/nfc/nxp-nci/Makefile
+@@ -5,6 +5,8 @@
+ 
+ nxp-nci-objs = core.o firmware.o
+ nxp-nci_i2c-objs = i2c.o
++nxp-nci_uart-objs = uart.o
+ 
+ obj-$(CONFIG_NFC_NXP_NCI) += nxp-nci.o
+ obj-$(CONFIG_NFC_NXP_NCI_I2C) += nxp-nci_i2c.o
++obj-$(CONFIG_NFC_NXP_NCI_UART) += nxp-nci_uart.o
+diff --git a/drivers/nfc/nxp-nci/uart.c b/drivers/nfc/nxp-nci/uart.c
+new file mode 100644
+index 000000000..3e37f2898
+--- /dev/null
++++ b/drivers/nfc/nxp-nci/uart.c
+@@ -0,0 +1,228 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * UART link layer for the NXP NCI driver
++ *
++ * Some controllers of the family (e.g. the PN548-class part in the
++ * Apple iPhone 6) sit on a UART instead of I2C. The wire carries plain
++ * NCI packets in NCI mode and NXP download frames in firmware mode, the
++ * same framing as on I2C, so only the transport differs.
++ */
++
++#include <linux/delay.h>
++#include <linux/module.h>
++#include <linux/nfc.h>
++#include <linux/gpio/consumer.h>
++#include <linux/serdev.h>
++#include <linux/skbuff.h>
++#include <linux/unaligned.h>
++
++#include <net/nfc/nci.h>
++
++#include "nxp-nci.h"
++
++#define NXP_NCI_UART_DRIVER_NAME	"nxp-nci_uart"
++
++#define NXP_NCI_UART_BAUD		115200
++#define NXP_NCI_UART_MAX_PAYLOAD	255
++#define NXP_NCI_UART_SKB_LEN		(NCI_CTRL_HDR_SIZE + 255)
++#define NXP_NCI_UART_FW_SKB_LEN		(NXP_NCI_FW_HDR_LEN + \
++					 NXP_NCI_FW_FRAME_LEN_MASK + \
++					 NXP_NCI_FW_CRC_LEN)
++
++struct nxp_nci_uart_phy {
++	struct serdev_device *serdev;
++	struct nci_dev *ndev;
++
++	struct gpio_desc *gpiod_en;
++	struct gpio_desc *gpiod_fw;
++
++	struct sk_buff *recv_skb;
++};
++
++static int nxp_nci_uart_set_mode(void *phy_id, enum nxp_nci_mode mode)
++{
++	struct nxp_nci_uart_phy *phy = phy_id;
++
++	if (mode == NXP_NCI_MODE_COLD) {
++		gpiod_set_value_cansleep(phy->gpiod_en, 0);
++		usleep_range(10000, 15000);
++		return 0;
++	}
++
++	/* Same sequence as the iOS HAL: DWL first, then pulse VEN */
++	gpiod_set_value_cansleep(phy->gpiod_fw, mode == NXP_NCI_MODE_FW);
++	usleep_range(500, 1000);
++	gpiod_set_value_cansleep(phy->gpiod_en, 0);
++	usleep_range(10000, 15000);
++	gpiod_set_value_cansleep(phy->gpiod_en, 1);
++	usleep_range(10000, 15000);
++
++	return 0;
++}
++
++static int nxp_nci_uart_write(void *phy_id, struct sk_buff *skb)
++{
++	struct nxp_nci_uart_phy *phy = phy_id;
++	int r;
++
++	r = serdev_device_write(phy->serdev, skb->data, skb->len,
++				MAX_SCHEDULE_TIMEOUT);
++	if (r < 0)
++		return r;
++
++	return r == skb->len ? 0 : -EIO;
++}
++
++static const struct nxp_nci_phy_ops uart_phy_ops = {
++	.set_mode = nxp_nci_uart_set_mode,
++	.write = nxp_nci_uart_write,
++};
++
++/* Bytes still missing from the frame in recv_skb, 0 when it is complete */
++static size_t nxp_nci_uart_missing(struct sk_buff *skb, enum nxp_nci_mode mode)
++{
++	size_t want;
++
++	if (mode == NXP_NCI_MODE_FW) {
++		if (skb->len < NXP_NCI_FW_HDR_LEN)
++			return NXP_NCI_FW_HDR_LEN - skb->len;
++		want = NXP_NCI_FW_HDR_LEN + NXP_NCI_FW_CRC_LEN +
++		       (get_unaligned_be16(skb->data) & NXP_NCI_FW_FRAME_LEN_MASK);
++	} else {
++		if (skb->len < NCI_CTRL_HDR_SIZE)
++			return NCI_CTRL_HDR_SIZE - skb->len;
++		want = NCI_CTRL_HDR_SIZE + skb->data[2];
++	}
++
++	return want - skb->len;
++}
++
++static size_t nxp_nci_uart_receive_buf(struct serdev_device *serdev,
++				       const u8 *data, size_t count)
++{
++	struct nxp_nci_uart_phy *phy = serdev_device_get_drvdata(serdev);
++	struct nxp_nci_info *info;
++	size_t done = 0, n;
++
++	if (!phy->ndev)
++		return count;	/* not probed yet: drop */
++
++	info = nci_get_drvdata(phy->ndev);
++	mutex_lock(&info->info_lock);
++
++	if (info->mode == NXP_NCI_MODE_COLD) {
++		kfree_skb(phy->recv_skb);
++		phy->recv_skb = NULL;
++		done = count;
++		goto out;
++	}
++
++	while (done < count) {
++		if (!phy->recv_skb) {
++			phy->recv_skb = alloc_skb(info->mode == NXP_NCI_MODE_FW ?
++						  NXP_NCI_UART_FW_SKB_LEN :
++						  NXP_NCI_UART_SKB_LEN,
++						  GFP_KERNEL);
++			if (!phy->recv_skb)
++				break;
++		}
++
++		n = min(nxp_nci_uart_missing(phy->recv_skb, info->mode),
++			count - done);
++		skb_put_data(phy->recv_skb, data + done, n);
++		done += n;
++
++		if (nxp_nci_uart_missing(phy->recv_skb, info->mode))
++			continue;
++
++		if (info->mode == NXP_NCI_MODE_FW)
++			nxp_nci_fw_recv_frame(phy->ndev, phy->recv_skb);
++		else
++			nci_recv_frame(phy->ndev, phy->recv_skb);
++		phy->recv_skb = NULL;
++	}
++
++out:
++	mutex_unlock(&info->info_lock);
++	return done;
++}
++
++static const struct serdev_device_ops nxp_nci_uart_serdev_ops = {
++	.receive_buf = nxp_nci_uart_receive_buf,
++	.write_wakeup = serdev_device_write_wakeup,
++};
++
++static int nxp_nci_uart_probe(struct serdev_device *serdev)
++{
++	struct device *dev = &serdev->dev;
++	struct nxp_nci_uart_phy *phy;
++	int r;
++
++	phy = devm_kzalloc(dev, sizeof(*phy), GFP_KERNEL);
++	if (!phy)
++		return -ENOMEM;
++
++	phy->serdev = serdev;
++	serdev_device_set_drvdata(serdev, phy);
++
++	phy->gpiod_en = devm_gpiod_get(dev, "enable", GPIOD_OUT_LOW);
++	if (IS_ERR(phy->gpiod_en))
++		return dev_err_probe(dev, PTR_ERR(phy->gpiod_en),
++				     "Failed to get EN gpio\n");
++
++	phy->gpiod_fw = devm_gpiod_get_optional(dev, "firmware", GPIOD_OUT_LOW);
++	if (IS_ERR(phy->gpiod_fw))
++		return dev_err_probe(dev, PTR_ERR(phy->gpiod_fw),
++				     "Failed to get FW gpio\n");
++
++	serdev_device_set_client_ops(serdev, &nxp_nci_uart_serdev_ops);
++	r = serdev_device_open(serdev);
++	if (r)
++		return dev_err_probe(dev, r, "Unable to open UART\n");
++
++	r = serdev_device_set_baudrate(serdev, NXP_NCI_UART_BAUD);
++	if (r != NXP_NCI_UART_BAUD) {
++		r = dev_err_probe(dev, -EINVAL, "Bad baud rate %d\n", r);
++		goto err_close;
++	}
++	serdev_device_set_flow_control(serdev, true);
++
++	r = nxp_nci_probe(phy, dev, &uart_phy_ops,
++			  NXP_NCI_UART_MAX_PAYLOAD, &phy->ndev);
++	if (r < 0)
++		goto err_close;
++
++	return 0;
++
++err_close:
++	serdev_device_close(serdev);
++	return r;
++}
++
++static void nxp_nci_uart_remove(struct serdev_device *serdev)
++{
++	struct nxp_nci_uart_phy *phy = serdev_device_get_drvdata(serdev);
++
++	nxp_nci_remove(phy->ndev);
++	serdev_device_close(serdev);
++	kfree_skb(phy->recv_skb);
++}
++
++static const struct of_device_id of_nxp_nci_uart_match[] = {
++	{ .compatible = "nxp,pn548-uart" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, of_nxp_nci_uart_match);
++
++static struct serdev_device_driver nxp_nci_uart_driver = {
++	.probe = nxp_nci_uart_probe,
++	.remove = nxp_nci_uart_remove,
++	.driver = {
++		.name = NXP_NCI_UART_DRIVER_NAME,
++		.of_match_table = of_nxp_nci_uart_match,
++	},
++};
++module_serdev_device_driver(nxp_nci_uart_driver);
++
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("UART driver for NXP NCI NFC controllers");

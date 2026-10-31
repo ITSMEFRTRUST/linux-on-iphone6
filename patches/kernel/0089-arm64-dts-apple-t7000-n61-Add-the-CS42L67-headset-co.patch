@@ -1,0 +1,146 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 21:01:31 +0000
+Subject: [PATCH 089/138] arm64: dts: apple: t7000-n61: Add the CS42L67 headset
+ codec
+
+Enable spi1 with the codec (ADT /arm-io/spi1/audio-codec) and give the
+sound card a second link: hw:0,0 stays the speaker amp on MCA2 DAI 0,
+hw:0,1 is the codec's XSP on MCA2 DAI 1 (same bus, MCA2 still the clock
+master, capture from slots 4-7). The three internal mics and the headset
+mic get their MICBIAS routes from the ADT ainN-bias properties.
+
+The codec's MCLK is taken from MCA0's pad, where iOS seems to get it.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ arch/arm64/boot/dts/apple/t7000-n61.dts | 90 ++++++++++++++++++++++---
+ arch/arm64/boot/dts/apple/t7000.dtsi    |  4 +-
+ 2 files changed, 84 insertions(+), 10 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/apple/t7000-n61.dts b/arch/arm64/boot/dts/apple/t7000-n61.dts
+index 1733267b0..d353a4d5e 100644
+--- a/arch/arm64/boot/dts/apple/t7000-n61.dts
++++ b/arch/arm64/boot/dts/apple/t7000-n61.dts
+@@ -34,18 +34,65 @@ vreg_vbat: regulator-vbat {
+ 	sound {
+ 		compatible = "simple-audio-card";
+ 		simple-audio-card,name = "iPhone 6";
+-		simple-audio-card,format = "dsp_a";
+-		simple-audio-card,bitclock-master = <&speaker_cpu>;
+-		simple-audio-card,frame-master = <&speaker_cpu>;
++		#address-cells = <1>;
++		#size-cells = <0>;
+ 
+-		speaker_cpu: simple-audio-card,cpu {
+-			sound-dai = <&mca2>;
++		/*
++		 * ADT audio-codec: ain1 "cimi" (bias 1), ain5 "cims" (bias 4),
++		 * ain6 "cimf" (bias 3), ain2 = headset mic. Physical positions
++		 * are a guess from teardowns.
++		 */
++		simple-audio-card,widgets =
++			"Microphone", "Bottom Mic",
++			"Microphone", "Rear Mic",
++			"Microphone", "Front Mic",
++			"Microphone", "Headset Mic",
++			"Headphone", "Headphones";
++		simple-audio-card,routing =
++			"AIN1", "Bottom Mic",
++			"Bottom Mic", "MICBIAS1",
++			"AIN5", "Rear Mic",
++			"Rear Mic", "MICBIAS4",
++			"AIN6", "Front Mic",
++			"Front Mic", "MICBIAS3",
++			"HSMIC", "Headset Mic",
++			"Headphones", "HPOUT";
++
++		/* hw:0,0: speaker amp, slot 0 of MCA2's 8 x 16-bit frame */
++		simple-audio-card,dai-link@0 {
++			reg = <0>;
++			format = "dsp_a";
++			bitclock-master = <&speaker_cpu>;
++			frame-master = <&speaker_cpu>;
++
++			speaker_cpu: cpu {
++				sound-dai = <&mca2 0>;
++			};
++
++			codec {
++				sound-dai = <&speaker_amp>;
++				/* MCLK pad = 24 MHz nclk / 2 */
++				system-clock-frequency = <12000000>;
++			};
+ 		};
+ 
+-		simple-audio-card,codec {
+-			sound-dai = <&speaker_amp>;
+-			/* MCLK pad = 24 MHz nclk / 2 */
+-			system-clock-frequency = <12000000>;
++		/*
++		 * hw:0,1: headset codec XSP on the same I2S bus (ADT xsp_active
++		 * = pin2), MCA2 still the clock master. Capture = slots 4-7.
++		 */
++		simple-audio-card,dai-link@1 {
++			reg = <1>;
++			format = "dsp_a";
++			bitclock-master = <&codec_cpu>;
++			frame-master = <&codec_cpu>;
++
++			codec_cpu: cpu {
++				sound-dai = <&mca2 1>;
++			};
++
++			codec {
++				sound-dai = <&headset_codec>;
++			};
+ 		};
+ 	};
+ };
+@@ -171,6 +218,31 @@ cirrus,hg-algo {
+ 	};
+ };
+ 
++&spi1 {
++	status = "okay";
++	/* ADT spi1 function-spi_cs0 = GPIO(0xf, 0x10001): pin 15, active-low */
++	cs-gpios = <&pinctrl 15 GPIO_ACTIVE_LOW>;
++
++	/* ADT /arm-io/spi1/audio-codec (audio-control,cs42l67) */
++	headset_codec: codec@0 {
++		compatible = "cirrus,cs42l67";
++		reg = <0>;
++		/* iOS runs it at 83 ns (~12 MHz) */
++		spi-max-frequency = <1000000>;
++		/* ADT interrupts [127 1]; the driver does not use it yet */
++		interrupts-extended = <&pinctrl 127 IRQ_TYPE_LEVEL_LOW>;
++		/*
++		 * iOS asks the codec's MCA0 data nub for MCLK, so the pad is
++		 * MCA0's (guess); the MCA2 node provides all five pads.
++		 */
++		clocks = <&mca2 0>;
++		clock-names = "mclk";
++		cirrus,xsp-tx-slot = <4>;
++		cirrus,xsp-rx-slot = <0>;
++		#sound-dai-cells = <0>;
++	};
++};
++
+ &spi2 {
+ 	status = "okay";
+ 	/* ADT spi2 function-spi_cs0 = GPIO(0xb9, 0x10001): pin 185, active-low */
+diff --git a/arch/arm64/boot/dts/apple/t7000.dtsi b/arch/arm64/boot/dts/apple/t7000.dtsi
+index 9496cf33b..079feadb3 100644
+--- a/arch/arm64/boot/dts/apple/t7000.dtsi
++++ b/arch/arm64/boot/dts/apple/t7000.dtsi
+@@ -275,7 +275,9 @@ mca2: i2s@20a0a8000 {
+ 			interrupts = <AIC_IRQ 171 IRQ_TYPE_LEVEL_HIGH>;
+ 			clocks = <&nco 2>;
+ 			power-domains = <&ps_mca2>;
+-			#sound-dai-cells = <0>;
++			#sound-dai-cells = <1>;
++			/* the MCLK pads of MCA0-4 */
++			#clock-cells = <1>;
+ 			status = "disabled";
+ 		};
+ 

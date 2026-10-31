@@ -1,0 +1,392 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 01:20:19 +0000
+Subject: [PATCH 076/138] drm: adp: t7000: Freezable stall watchdog, idle
+ fallback timer, stall test knob
+
+Review fixes for the stall watchdog:
+
+- Queue the watchdog on system_freezable_wq. During system suspend the
+  IRQ line is suspended while timers and unfrozen kworkers keep running,
+  so a work on system_wq declared a healthy pipe stalled. A frozen work
+  first runs again after thaw, when the VBIs are back.
+- The fallback hrtimer (after a storm-guard kill or a stall) only runs
+  while DRM vblank is enabled: the callback returns HRTIMER_NORESTART
+  when vblank is off and enable_vblank restarts it. That avoids 60 Hz
+  wakeups with the screen off. It is not cancelled from disable_vblank,
+  which runs under vbl_lock and the callback can reach vbl_lock through
+  drm_vblank_put().
+- Report the layer write as done only if the IRQ actually wrote it
+  (layer_done), not by the absence of a stall.
+- The watchdog's counters are reset in the work itself (enable_vblank
+  only sets a flag).
+- debugfs "stall": "trip" declares a stall on the next watchdog run on a
+  healthy pipe, through the real stall path; "recover" undoes a watchdog
+  stall (IRQ back on, timer off, watchdog rearmed). A storm-guard kill
+  stays permanent.
+- Record the ADBE0 frame/line register at the moment the IRQ writes
+  LAYER_CTL and show it in debugfs "power", to settle where the VBI
+  falls in the frame.
+- Move the scanout-off comment back above its function.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/gpu/drm/adp/adp-t7000.c | 198 ++++++++++++++++++++++++++------
+ 1 file changed, 160 insertions(+), 38 deletions(-)
+
+diff --git a/drivers/gpu/drm/adp/adp-t7000.c b/drivers/gpu/drm/adp/adp-t7000.c
+index 68f44e8a1..bdbff09cf 100644
+--- a/drivers/gpu/drm/adp/adp-t7000.c
++++ b/drivers/gpu/drm/adp/adp-t7000.c
+@@ -106,6 +106,7 @@
+ /* ADBE0 ("fe"): read only here */
+ #define ADBE_VFTG_CTL		0x08	/* bit 31 = run, bit 30 = running (ADBE0Driver_Impl @0xfffffff008907978/a70) */
+ #define ADBE_SCREEN_SIZE	0x0c
++#define ADBE_LINE		0x1c	/* [31:16] frame, [15:0] line (read by iOS at runtime) */
+ 
+ /* A8 constants for standalone=1 (ADT disp0 / dart-disp0 / vram / PMGR) */
+ #define T7000_ADP_PHYS		0x206200000ULL
+@@ -241,16 +242,23 @@ struct adpt {
+ 
+ 	/* LAYER_CTL write armed for the next VBI (under irq_lock) */
+ 	bool layer_armed;
++	bool layer_done;	/* the IRQ wrote layer_req */
+ 	u32 layer_req;
++	u32 layer_line;		/* ADBE0 0x1c (frame << 16 | line) when it did */
+ 	wait_queue_head_t layer_wq;
+ 
+-	/* VBI watchdog */
++	/* VBI watchdog (work on system_freezable_wq: frozen across suspend with the IRQs) */
+ 	struct delayed_work vbl_wd;
+ 	unsigned int vbi_count;	/* real VBIs seen by the IRQ handler */
+-	unsigned int wd_last;
++	unsigned int wd_last;	/* the work's own; enable_vblank only sets wd_reset */
+ 	unsigned int wd_misses;
+-	bool vbl_on;		/* DRM vblank enabled */
+-	bool stalled;		/* the watchdog gave up on the pipe */
++	bool wd_reset;
++	bool wd_trip;		/* debugfs "stall trip": declare a stall on the next run */
++	bool vbl_on;		/* DRM vblank enabled (also gates the fallback hrtimer) */
++	bool stalled;		/* the watchdog gave up on the pipe (debugfs "stall recover" undoes it) */
++	bool storm_killed;	/* the storm guard gave up on the line: permanent */
++	bool stall_irq_off;	/* adpt_pipe_stalled() did disable_irq() */
++	u32 irq_en_stall;	/* ADP_IRQ_EN when the stall was declared */
+ };
+ 
+ #define to_adpt(x) container_of(x, struct adpt, drm)
+@@ -418,11 +426,18 @@ static void adpt_handle_events(struct adpt *adp, u32 st)
+ 	spin_unlock(&adp->drm.event_lock);
+ }
+ 
+-/* stand-in for IRQ 103 once the storm guard killed it: flips still complete, nothing waits for timeouts */
++/*
++ * Stand-in for IRQ 103 once the storm guard or the stall watchdog took it away: flips still complete,
++ * nothing waits for timeouts. Runs only while DRM vblank is enabled (enable_vblank restarts it), so a
++ * dead line costs no 60 Hz wakeups with the screen off. Never cancelled from disable_vblank: that runs
++ * under vbl_lock, which this callback can reach through drm_vblank_put().
++ */
+ static enum hrtimer_restart adpt_vbl_timer(struct hrtimer *t)
+ {
+ 	struct adpt *adp = container_of(t, struct adpt, vbl_timer);
+ 
++	if (!READ_ONCE(adp->vbl_on))
++		return HRTIMER_NORESTART;
+ 	adpt_handle_events(adp, ADP_IRQ_VBI | ADP_IRQ_PKT_DONE);
+ 	hrtimer_forward_now(t, adp->vbl_period);
+ 	return HRTIMER_RESTART;
+@@ -456,6 +471,7 @@ static bool adpt_storm_guard(struct adpt *adp, u32 st)
+ 	 * down. Mask the block, turn the AIC line off and fake vblanks from a timer from now on.
+ 	 */
+ 	adp->irq_dead = true;
++	adp->storm_killed = true;
+ 	adpt_irq_en(adp, 0, ~0u);
+ 	disable_irq_nosync(adp->irq);
+ 	hrtimer_start(&adp->vbl_timer, adp->vbl_period, HRTIMER_MODE_REL_HARD);
+@@ -486,7 +502,9 @@ static irqreturn_t adpt_irq(int irq, void *arg)
+ 		spin_lock(&adp->irq_lock);
+ 		if (adp->layer_armed) {
+ 			writel(adp->layer_req, adp->adp + ADP_LAYER_CTL);
++			adp->layer_line = readl(adp->adbe + ADBE_LINE);
+ 			adp->layer_armed = false;
++			adp->layer_done = true;
+ 			done = true;
+ 		}
+ 		spin_unlock(&adp->irq_lock);
+@@ -515,8 +533,9 @@ static irqreturn_t adpt_irq(int irq, void *arg)
+  * and it panics (@0xfffffff0088e8e8c), i.e. the pipe only comes back through a full re-init. Here: say
+  * so once, and switch to the storm guard's fallback (line off, 60 Hz hrtimer vblank) so flips, vblank
+  * waits and DPMS keep completing instead of blocking for seconds. The screen needs a reboot.
++ * @test: debugfs "stall trip" on a healthy pipe (undone with "stall recover").
+  */
+-static void adpt_pipe_stalled(struct adpt *adp)
++static void adpt_pipe_stalled(struct adpt *adp, bool test)
+ {
+ 	unsigned long flags;
+ 
+@@ -528,14 +547,17 @@ static void adpt_pipe_stalled(struct adpt *adp)
+ 	adp->irq_dead = true;
+ 	adp->stalled = true;
+ 	adp->layer_armed = false;
++	adp->irq_en_stall = readl(adp->adp + ADP_IRQ_EN);
+ 	writel(0, adp->adp + ADP_IRQ_EN);
+ 	spin_unlock_irqrestore(&adp->irq_lock, flags);
+ 	wake_up(&adp->layer_wq);
+ 
+ 	disable_irq(adp->irq);
+-	hrtimer_start(&adp->vbl_timer, adp->vbl_period, HRTIMER_MODE_REL_HARD);
++	adp->stall_irq_off = true;
++	hrtimer_start(&adp->vbl_timer, adp->vbl_period, HRTIMER_MODE_REL_HARD);	/* stops itself if vblank is off */
+ 	drm_err(&adp->drm,
+-		"display pipe stalled: no vblank for %u ms (IRQ_STATUS %08x, frame %04x, VFTG %08x, LAYER_CTL %08x); timer vblank from now on, reboot to get the screen back\n",
++		"display pipe stalled%s: no vblank for %u ms (IRQ_STATUS %08x, frame %04x, VFTG %08x, LAYER_CTL %08x); timer vblank from now on, reboot to get the screen back\n",
++		test ? " (TEST, debugfs stall trip)" : "",
+ 		ADPT_WD_MISSES * ADPT_WD_PERIOD_MS, readl(adp->adp + ADP_IRQ_STATUS),
+ 		readl(adp->adp + ADP_FRAME_COUNT) & 0xffff, readl(adp->adbe + ADBE_VFTG_CTL),
+ 		readl(adp->adp + ADP_LAYER_CTL));
+@@ -546,16 +568,25 @@ static void adpt_vbl_wd(struct work_struct *work)
+ 	struct adpt *adp = container_of(to_delayed_work(work), struct adpt, vbl_wd);
+ 	unsigned int n = READ_ONCE(adp->vbi_count);
+ 
++	if (READ_ONCE(adp->wd_trip)) {
++		WRITE_ONCE(adp->wd_trip, false);
++		adpt_pipe_stalled(adp, true);
++		return;
++	}
+ 	if (!READ_ONCE(adp->vbl_on) || READ_ONCE(adp->irq_dead))
+ 		return;
+-	if (n != adp->wd_last) {
++	if (READ_ONCE(adp->wd_reset)) {
++		WRITE_ONCE(adp->wd_reset, false);
++		adp->wd_last = n;
++		adp->wd_misses = 0;
++	} else if (n != adp->wd_last) {
+ 		adp->wd_last = n;
+ 		adp->wd_misses = 0;
+ 	} else if (++adp->wd_misses >= ADPT_WD_MISSES) {
+-		adpt_pipe_stalled(adp);
++		adpt_pipe_stalled(adp, false);
+ 		return;
+ 	}
+-	schedule_delayed_work(&adp->vbl_wd, msecs_to_jiffies(ADPT_WD_PERIOD_MS));
++	queue_delayed_work(system_freezable_wq, &adp->vbl_wd, msecs_to_jiffies(ADPT_WD_PERIOD_MS));
+ }
+ 
+ static void adpt_vbl_wd_cancel(void *arg)
+@@ -622,24 +653,6 @@ static void adpt_panel_wake_locked(struct adpt *adp)
+ 		drm_err(&adp->drm, "panel did not take the wake-up commands\n");
+ }
+ 
+-/*
+- * Stop the pipe's vram fetch, so DRAM can drop into self-refresh while the screen is off. This is
+- * the first thing iOS does on display off (AppleMobileADBE0::do_power_state_change_gated, power-off
+- * branch @0xfffffff0088f5198 -> vtable 0xc00 = 0xfffffff0088ee678): with the timing generator still
+- * running it masks every ADP interrupt (0x1028 &= ~0xfff), queues a frame with no layer
+- * (0x1038 = bit 16 only, @0xfffffff0088ebf88) and waits until the frame has latched. Only after
+- * that come backlight off, panel off, timing generator stop and the power gate.
+- *
+- * Here VBI is left to the DRM vblank code (already off on the CRTC disable path; on the debugfs path
+- * flips keep completing). Nothing else changes: base, stride, format, blend and the timing
+- * generator stay as they are, so writing the saved LAYER_CTL back is the whole undo.
+- *
+- * Not done: iOS stops the timing generator (ADBE0 0x08 bit 31, then waits for bit 30) only after the
+- * panel and the DSI link are down, and power-gates the pipe right after; it never restarts timings
+- * under a DSI link left in video mode. Whether that restart works without a DSI/panel re-init is not
+- * known, so VFTG, the DSI link (no ULPS on n61 either) and the power domains stay on.
+- * Called with panel_lock held and inside drm_dev_enter().
+- */
+ /*
+  * Write LAYER_CTL from the next VBI interrupt and wait for it (plus one frame). Needs DRM vblank to be
+  * usable (CRTC on); fails without touching the register when it is not, when the line is gone (storm
+@@ -648,7 +661,7 @@ static void adpt_panel_wake_locked(struct adpt *adp)
+ static int adpt_layer_ctl_sync(struct adpt *adp, u32 val)
+ {
+ 	unsigned long flags;
+-	bool armed;
++	bool done;
+ 	int ret;
+ 
+ 	if (READ_ONCE(adp->irq_dead))
+@@ -658,6 +671,7 @@ static int adpt_layer_ctl_sync(struct adpt *adp, u32 val)
+ 		return ret;
+ 	spin_lock_irqsave(&adp->irq_lock, flags);
+ 	adp->layer_req = val;
++	adp->layer_done = false;
+ 	adp->layer_armed = true;
+ 	spin_unlock_irqrestore(&adp->irq_lock, flags);
+ 
+@@ -665,18 +679,37 @@ static int adpt_layer_ctl_sync(struct adpt *adp, u32 val)
+ 			   msecs_to_jiffies(ADPT_LAYER_TIMEOUT_MS));
+ 
+ 	spin_lock_irqsave(&adp->irq_lock, flags);
+-	armed = adp->layer_armed;	/* still armed = never written */
++	done = adp->layer_done;		/* only the IRQ sets it, right after the write */
+ 	adp->layer_armed = false;
+ 	spin_unlock_irqrestore(&adp->irq_lock, flags);
+ 	drm_crtc_vblank_put(&adp->crtc);
+-	if (armed || READ_ONCE(adp->stalled))
++	if (!done)
+ 		return -ETIMEDOUT;
++	drm_dbg_driver(&adp->drm, "LAYER_CTL %08x written at ADBE line %08x\n", val, adp->layer_line);
+ 	if (fifo_sync)
+ 		adpt_fifo_kick(adp);
+ 	msleep(ADPT_LATCH_MS);
+ 	return 0;
+ }
+ 
++/*
++ * Stop the pipe's vram fetch, so DRAM can drop into self-refresh while the screen is off. This is
++ * the first thing iOS does on display off (AppleMobileADBE0::do_power_state_change_gated, power-off
++ * branch @0xfffffff0088f5198 -> vtable 0xc00 = 0xfffffff0088ee678): with the timing generator still
++ * running it masks every ADP interrupt (0x1028 &= ~0xfff), queues a frame with no layer
++ * (0x1038 = bit 16 only, @0xfffffff0088ebf88) and waits until the frame has latched. Only after
++ * that come backlight off, panel off, timing generator stop and the power gate.
++ *
++ * Here VBI is left to the DRM vblank code (already off on the CRTC disable path; on the debugfs path
++ * flips keep completing). Nothing else changes: base, stride, format, blend and the timing
++ * generator stay as they are, so writing the saved LAYER_CTL back is the whole undo.
++ *
++ * Not done: iOS stops the timing generator (ADBE0 0x08 bit 31, then waits for bit 30) only after the
++ * panel and the DSI link are down, and power-gates the pipe right after; it never restarts timings
++ * under a DSI link left in video mode. Whether that restart works without a DSI/panel re-init is not
++ * known, so VFTG, the DSI link (no ULPS on n61 either) and the power domains stay on.
++ * Called with panel_lock held and inside drm_dev_enter().
++ */
+ static void adpt_scanout_off_locked(struct adpt *adp)
+ {
+ 	unsigned long flags;
+@@ -823,6 +856,7 @@ static int adpt_power_show(struct seq_file *m, void *unused)
+ 		   adp->dsi ? "" : " (no DSI)",
+ 		   adp->stalled ? "; PIPE STALLED (timer vblank)" : adp->irq_dead ? "; IRQ off (timer vblank)" : "",
+ 		   READ_ONCE(deep_off), READ_ONCE(panel_sleep), READ_ONCE(adp->vbi_count));
++	seq_printf(m, "last LAYER_CTL write at ADBE 0x1c = %08x (f<<16|line)\n", adp->layer_line);
+ 	if (drm_dev_enter(&adp->drm, &idx)) {
+ 		seq_printf(m, "LAYER_CTL %08x (saved %08x) IRQ_EN %08x (masked %08x) IRQ_STATUS %08x frame %04x VFTG %08x\n",
+ 			   readl(adp->adp + ADP_LAYER_CTL), adp->layer_ctl, readl(adp->adp + ADP_IRQ_EN),
+@@ -911,6 +945,91 @@ static const struct file_operations adpt_power_fops = {
+ 	.release = single_release,
+ };
+ 
++/*
++ * debugfs "stall": test the stall safety net on a healthy pipe. "trip" makes the watchdog declare a
++ * stall on its next run (same path as a real one: IRQ masked + off, timer vblank); "recover" undoes a
++ * stall (also a real one: if the pipe is really dead the watchdog trips again 300 ms later). A storm
++ * guard kill is not undone.
++ */
++static int adpt_stall_show(struct seq_file *m, void *unused)
++{
++	struct adpt *adp = m->private;
++
++	seq_printf(m, "%s; vblank %s; vbi %u\n",
++		   adp->storm_killed ? "storm-killed (permanent)" : adp->stalled ? "stalled (timer vblank)" : "ok",
++		   READ_ONCE(adp->vbl_on) ? "on" : "off", READ_ONCE(adp->vbi_count));
++	return 0;
++}
++
++static int adpt_stall_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, adpt_stall_show, inode->i_private);
++}
++
++static int adpt_stall_recover(struct adpt *adp)
++{
++	unsigned long flags;
++	bool ok;
++	u32 en;
++
++	mutex_lock(&adp->panel_lock);
++	spin_lock_irqsave(&adp->irq_lock, flags);
++	ok = adp->stalled && !adp->storm_killed;
++	if (ok) {
++		adp->irq_dead = false;
++		adp->stalled = false;
++	}
++	spin_unlock_irqrestore(&adp->irq_lock, flags);
++	if (!ok) {
++		mutex_unlock(&adp->panel_lock);
++		return -EINVAL;
++	}
++	hrtimer_cancel(&adp->vbl_timer);	/* no lock held that its callback takes */
++	if (!test_noack)
++		writel(readl(adp->adp + ADP_IRQ_STATUS), adp->adp + ADP_IRQ_STATUS);
++	en = (adp->irq_en_stall & ~ADP_IRQ_VBI) | (READ_ONCE(adp->vbl_on) ? ADP_IRQ_VBI : 0);
++	adpt_irq_en(adp, en, ~0u);
++	if (adp->stall_irq_off) {
++		adp->stall_irq_off = false;
++		enable_irq(adp->irq);
++	}
++	if (READ_ONCE(adp->vbl_on)) {
++		WRITE_ONCE(adp->wd_reset, true);
++		mod_delayed_work(system_freezable_wq, &adp->vbl_wd, msecs_to_jiffies(ADPT_WD_PERIOD_MS));
++	}
++	mutex_unlock(&adp->panel_lock);
++	drm_info(&adp->drm, "stall recovered: IRQ back on (IRQ_EN %08x)\n", en);
++	return 0;
++}
++
++static ssize_t adpt_stall_write(struct file *file, const char __user *ubuf, size_t len, loff_t *ppos)
++{
++	struct adpt *adp = ((struct seq_file *)file->private_data)->private;
++	char buf[8] = {};
++	int ret = 0;
++
++	if (copy_from_user(buf, ubuf, min(len, sizeof(buf) - 1)))
++		return -EFAULT;
++	if (sysfs_streq(buf, "trip")) {
++		WRITE_ONCE(adp->wd_trip, true);
++		mod_delayed_work(system_freezable_wq, &adp->vbl_wd, 0);
++	} else if (sysfs_streq(buf, "recover")) {
++		ret = adpt_stall_recover(adp);
++	} else {
++		return -EINVAL;
++	}
++	return ret ?: len;
++}
++
++static const struct file_operations adpt_stall_fops = {
++	.owner = THIS_MODULE,
++	.open = adpt_stall_open,
++	.read = seq_read,
++	.write = adpt_stall_write,
++	.llseek = seq_lseek,
++	.release = single_release,
++};
++
+ /* ---------------------------------------------------------------- plane / crtc */
+ 
+ static int adpt_plane_atomic_check(struct drm_plane *plane, struct drm_atomic_commit *state)
+@@ -1055,11 +1174,13 @@ static int adpt_crtc_enable_vblank(struct drm_crtc *crtc)
+ 
+ 	writel(ADP_IRQ_VBI, adp->adp + ADP_IRQ_STATUS);
+ 	adpt_irq_en(adp, ADP_IRQ_VBI, 0);
+-	if (!READ_ONCE(adp->irq_dead)) {
+-		adp->wd_last = READ_ONCE(adp->vbi_count);
+-		adp->wd_misses = 0;
+-		WRITE_ONCE(adp->vbl_on, true);
+-		mod_delayed_work(system_wq, &adp->vbl_wd, msecs_to_jiffies(ADPT_WD_PERIOD_MS));
++	WRITE_ONCE(adp->vbl_on, true);
++	if (READ_ONCE(adp->irq_dead)) {
++		/* always (re)start: one returning NORESTART right now keeps a timer started meanwhile */
++		hrtimer_start(&adp->vbl_timer, adp->vbl_period, HRTIMER_MODE_REL_HARD);
++	} else {
++		WRITE_ONCE(adp->wd_reset, true);
++		mod_delayed_work(system_freezable_wq, &adp->vbl_wd, msecs_to_jiffies(ADPT_WD_PERIOD_MS));
+ 	}
+ 	return 0;
+ }
+@@ -1068,7 +1189,7 @@ static void adpt_crtc_disable_vblank(struct drm_crtc *crtc)
+ {
+ 	struct adpt *adp = to_adpt(crtc->dev);
+ 
+-	WRITE_ONCE(adp->vbl_on, false);	/* the watchdog stops by itself */
++	WRITE_ONCE(adp->vbl_on, false);	/* the watchdog and the fallback timer stop by themselves */
+ 	adpt_irq_en(adp, 0, ADP_IRQ_VBI);
+ }
+ 
+@@ -1520,6 +1641,7 @@ static int adpt_probe(struct platform_device *pdev)
+ 	aperture_remove_conflicting_devices(adp->vram_phys, adp->vram_size, adpt_driver.name);
+ 	debugfs_create_file("panel", 0600, adp->drm.debugfs_root, adp, &adpt_panel_fops);
+ 	debugfs_create_file("power", 0600, adp->drm.debugfs_root, adp, &adpt_power_fops);
++	debugfs_create_file("stall", 0600, adp->drm.debugfs_root, adp, &adpt_stall_fops);
+ 	return 0;
+ }
+ 

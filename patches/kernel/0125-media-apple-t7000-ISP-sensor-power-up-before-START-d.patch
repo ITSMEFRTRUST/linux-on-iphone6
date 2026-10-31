@@ -1,0 +1,1615 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 01:49:52 +0000
+Subject: [PATCH 125/138] media: apple: t7000 ISP: sensor power-up before
+ START, /dev/isp0 streaming (stage 10)
+
+Sensor power (sens_pwr=1, start of stage 8, like iOS power_on_hardware):
+GPIO 198 (camera AVDD LDO) high, PMGR ISP ref clocks 0x20e010218/1c
+programmed (srcSel 0, cfg 0x28), MCLK pins 191/197 to periph 1, sensor
+shutdown pins 190/196 high; all undone in reverse at teardown.
+
+stream=1 (with stage=9): misc device /dev/isp0 (uapi
+apple-isp-t7000.h): INFO/START/STOP/RELEASE ioctls, read()/poll() frame
+queue fed from BUF_T2H, mmap of the NV12 DART surfaces (WC, read-only).
+START runs CH_INFO_GET, CAMERA_CONFIG_GET per preset, SET_FILE_LOAD,
+CONFIG_SELECT, recycle mode, crop, OUTPUT_CONFIG_SET (NV12),
+PREVIEW_STREAM_SET, SIF format, META pool, buffer lists on BUF_H2T and
+CH_START. Buffer lists use the A8 u32 layout (0x28-byte entries).
+BUF_T2H is answered like the kext (list | 1, 0, 0x80000000). The ISP is
+powered off when /dev/isp0 is closed (keep_on=0) and booted on open.
+stream_dump=1 logs every frame, debugfs apple-isp/ has counters.
+
+Not run on hardware. Layouts: re/CAMERA-STREAM.md.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../media/platform/apple/isp-t7000/Makefile   |   2 +-
+ .../media/platform/apple/isp-t7000/isp-cdev.c | 238 +++++++++++++
+ .../media/platform/apple/isp-t7000/isp-ipc.c  |  30 +-
+ .../media/platform/apple/isp-t7000/isp-main.c |  97 ++++-
+ .../media/platform/apple/isp-t7000/isp-scfg.c | 331 ++++++++++++++++++
+ .../media/platform/apple/isp-t7000/isp-sens.c | 194 ++++++++++
+ .../platform/apple/isp-t7000/isp-stream.c     | 321 +++++++++++++++++
+ drivers/media/platform/apple/isp-t7000/isp.h  | 108 ++++++
+ include/uapi/linux/apple-isp-t7000.h          |  51 +++
+ 9 files changed, 1350 insertions(+), 22 deletions(-)
+ create mode 100644 drivers/media/platform/apple/isp-t7000/isp-cdev.c
+ create mode 100644 drivers/media/platform/apple/isp-t7000/isp-scfg.c
+ create mode 100644 drivers/media/platform/apple/isp-t7000/isp-sens.c
+ create mode 100644 drivers/media/platform/apple/isp-t7000/isp-stream.c
+ create mode 100644 include/uapi/linux/apple-isp-t7000.h
+
+diff --git a/drivers/media/platform/apple/isp-t7000/Makefile b/drivers/media/platform/apple/isp-t7000/Makefile
+index 0aafd6690..f7a00deb1 100644
+--- a/drivers/media/platform/apple/isp-t7000/Makefile
++++ b/drivers/media/platform/apple/isp-t7000/Makefile
+@@ -1,3 +1,3 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+-apple-isp-y := isp-main.o isp-pwr.o isp-dart.o isp-boot.o isp-ipc.o
++apple-isp-y := isp-main.o isp-pwr.o isp-dart.o isp-boot.o isp-ipc.o isp-sens.o isp-stream.o isp-scfg.o isp-cdev.o
+ obj-$(CONFIG_VIDEO_APPLE_ISP_T7000) += apple-isp.o
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-cdev.c b/drivers/media/platform/apple/isp-t7000/isp-cdev.c
+new file mode 100644
+index 000000000..5c0760a96
+--- /dev/null
++++ b/drivers/media/platform/apple/isp-t7000/isp-cdev.c
+@@ -0,0 +1,238 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Apple A8 (T7000) ISP: /dev/isp0 (stream=1). Contract: include/uapi/linux/apple-isp-t7000.h
++ * and BRIEF-CAMERA-STREAM.md. First open boots the ISP (stages 1-9) if it is off; last
++ * close stops the stream and, unless keep_on=1, powers sensor + ISP off again.
++ * Frame buffers are DART surfaces (isp-dart.c), mapped read-only write-combine.
++ */
++#include <linux/debugfs.h>
++#include <linux/fs.h>
++#include <linux/miscdevice.h>
++#include <linux/mm.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/poll.h>
++#include <linux/uaccess.h>
++#include <uapi/linux/apple-isp-t7000.h>
++
++#include "isp.h"
++
++#define ISP_FULL_STAGE	9
++
++static DEFINE_MUTEX(isp_open_lock);
++static struct t7000_isp *cdev_isp;
++
++static int isp_open(struct inode *inode, struct file *f)
++{
++	struct t7000_isp *isp = cdev_isp;
++	int ret = 0;
++
++	mutex_lock(&isp_open_lock);
++	if (isp->open_count == 0 && isp->done < ISP_FULL_STAGE) {
++		dev_info(isp->dev, "/dev/isp0 opened: booting the ISP\n");
++		ret = isp_boot(isp, ISP_FULL_STAGE);
++		if (ret)
++			isp_teardown(isp);
++	}
++	if (!ret)
++		isp->open_count++;
++	mutex_unlock(&isp_open_lock);
++	f->private_data = isp;
++	return ret;
++}
++
++static int isp_release(struct inode *inode, struct file *f)
++{
++	struct t7000_isp *isp = f->private_data;
++
++	mutex_lock(&isp_open_lock);
++	if (--isp->open_count == 0) {
++		mutex_lock(&isp->lock);
++		isp_stream_stop(isp);
++		mutex_unlock(&isp->lock);
++		if (!isp_keep_on) {
++			dev_info(isp->dev, "/dev/isp0 closed: powering sensor + ISP off (keep_on=0)\n");
++			isp_teardown(isp);
++		}
++	}
++	mutex_unlock(&isp_open_lock);
++	return 0;
++}
++
++static long isp_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
++{
++	struct t7000_isp *isp = f->private_data;
++	struct isp_stream *st = &isp->st;
++	void __user *up = (void __user *)arg;
++	struct isp_info info;
++	u32 v;
++	long ret;
++
++	switch (cmd) {
++	case ISP_IOC_INFO:
++		memset(&info, 0, sizeof(info));
++		info.version = ISP_INFO_VERSION;
++		mutex_lock(&isp->lock);
++		if (st->on) {
++			info.width = st->width;
++			info.height = st->height;
++			info.stride = st->stride;
++			info.nbufs = st->nbufs;
++			info.bufsize = st->bufsize;
++			info.sensor_id = st->sensor_id;
++			strscpy(info.sensor_name, st->sensor_name, sizeof(info.sensor_name));
++		}
++		mutex_unlock(&isp->lock);
++		return copy_to_user(up, &info, sizeof(info)) ? -EFAULT : 0;
++	case ISP_IOC_START:
++		if (get_user(v, (u32 __user *)up))
++			return -EFAULT;
++		mutex_lock(&isp->lock);
++		ret = isp_stream_start(isp, v);
++		mutex_unlock(&isp->lock);
++		isp_term_flush(isp);
++		return ret;
++	case ISP_IOC_STOP:
++		mutex_lock(&isp->lock);
++		isp_stream_stop(isp);
++		mutex_unlock(&isp->lock);
++		isp_term_flush(isp);
++		return 0;
++	case ISP_IOC_RELEASE:
++		if (get_user(v, (u32 __user *)up))
++			return -EFAULT;
++		mutex_lock(&isp->lock);
++		isp_stream_release(isp, v);
++		mutex_unlock(&isp->lock);
++		return 0;
++	}
++	return -ENOTTY;
++}
++
++static bool isp_frame_ready(struct isp_stream *st)
++{
++	return READ_ONCE(st->nready) || !READ_ONCE(st->on);
++}
++
++static ssize_t isp_read(struct file *f, char __user *ubuf, size_t len, loff_t *off)
++{
++	struct t7000_isp *isp = f->private_data;
++	struct isp_stream *st = &isp->st;
++	struct isp_frame fr = {};
++	struct isp_sbuf *b;
++	int ret;
++
++	if (len < sizeof(fr))
++		return -EINVAL;
++	for (;;) {
++		if (!READ_ONCE(st->on))
++			return -EIO;
++		spin_lock(&st->frame_lock);
++		if (st->nready) {
++			fr.index = st->ready[0];
++			memmove(st->ready, st->ready + 1, --st->nready * sizeof(st->ready[0]));
++			b = &st->buf[fr.index];
++			b->state = BUF_USER;
++			fr.seq = b->seq;
++			fr.timestamp_ns = b->ts;
++			fr.bytesused = st->stride * st->height * 3 / 2;
++			fr.flags = (b->fwflags & 0x40000000) ? 0 : ISP_FRAME_FLAG_NOT_FILLED;
++			spin_unlock(&st->frame_lock);
++			break;
++		}
++		spin_unlock(&st->frame_lock);
++		if (f->f_flags & O_NONBLOCK)
++			return -EAGAIN;
++		ret = wait_event_interruptible(st->wait, isp_frame_ready(st));
++		if (ret)
++			return ret;
++	}
++	return copy_to_user(ubuf, &fr, sizeof(fr)) ? -EFAULT : sizeof(fr);
++}
++
++static __poll_t isp_poll(struct file *f, poll_table *wait)
++{
++	struct t7000_isp *isp = f->private_data;
++
++	poll_wait(f, &isp->st.wait, wait);
++	if (READ_ONCE(isp->st.nready))
++		return EPOLLIN | EPOLLRDNORM;
++	return READ_ONCE(isp->st.on) ? 0 : EPOLLERR;
++}
++
++/* nbufs * bufsize, read-only, write-combine (the ISP writes it by DMA, no CPU cache) */
++static int isp_mmap(struct file *f, struct vm_area_struct *vma)
++{
++	struct t7000_isp *isp = f->private_data;
++	struct isp_stream *st = &isp->st;
++	unsigned long addr = vma->vm_start, len = vma->vm_end - vma->vm_start;
++	unsigned long first = vma->vm_pgoff, pg, npg = len >> PAGE_SHIFT, per;
++	int ret = 0;
++
++	if (vma->vm_flags & VM_WRITE)
++		return -EPERM;
++	mutex_lock(&isp->lock);
++	per = st->bufsize >> PAGE_SHIFT;
++	if (!st->on || !per || first + npg > st->nbufs * per) {
++		ret = -EINVAL;
++		goto out;
++	}
++	vm_flags_mod(vma, VM_DONTEXPAND | VM_DONTDUMP, VM_MAYWRITE);
++	vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
++	for (pg = first; pg < first + npg && !ret; pg++, addr += PAGE_SIZE)
++		ret = vm_insert_page(vma, addr, st->buf[pg / per].surf->pages[pg % per]);
++out:
++	mutex_unlock(&isp->lock);
++	return ret;
++}
++
++static const struct file_operations isp_fops = {
++	.owner = THIS_MODULE,
++	.open = isp_open,
++	.release = isp_release,
++	.unlocked_ioctl = isp_ioctl,
++	.read = isp_read,
++	.poll = isp_poll,
++	.mmap = isp_mmap,
++	.llseek = noop_llseek,
++};
++
++static struct miscdevice isp_misc = {
++	.minor = MISC_DYNAMIC_MINOR,
++	.name = "isp0",
++	.fops = &isp_fops,
++	.mode = 0600,
++};
++
++int isp_cdev_init(struct t7000_isp *isp)
++{
++	struct isp_stream *st = &isp->st;
++	int ret;
++
++	cdev_isp = isp;
++	ret = misc_register(&isp_misc);
++	if (ret) {
++		dev_err(isp->dev, "misc_register(isp0) = %d\n", ret);
++		return ret;
++	}
++	isp->cdev_on = true;
++	isp->dbg = debugfs_create_dir("apple-isp", NULL);
++	debugfs_create_u64("frames", 0444, isp->dbg, &st->frames);
++	debugfs_create_u64("dropped", 0444, isp->dbg, &st->dropped);
++	debugfs_create_u64("recycled", 0444, isp->dbg, &st->recycled);
++	debugfs_create_u64("errors", 0444, isp->dbg, &st->errors);
++	debugfs_create_u64("h2t_posts", 0444, isp->dbg, &st->h2t_posts);
++	debugfs_create_u64("h2t_busy", 0444, isp->dbg, &st->h2t_busy);
++	debugfs_create_u64("t2h_msgs", 0444, isp->dbg, &st->t2h_msgs);
++	dev_info(isp->dev, "stream: /dev/isp0 ready (debugfs apple-isp/)\n");
++	return 0;
++}
++
++void isp_cdev_exit(struct t7000_isp *isp)
++{
++	if (!isp->cdev_on)
++		return;
++	debugfs_remove_recursive(isp->dbg);
++	misc_deregister(&isp_misc);
++	isp->cdev_on = false;
++}
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-ipc.c b/drivers/media/platform/apple/isp-t7000/isp-ipc.c
+index 86898b9de..4e0bf467d 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-ipc.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-ipc.c
+@@ -199,6 +199,11 @@ static int isp_drain(struct t7000_isp *isp, struct isp_chan *c)
+ 				reply = isp_sm_request(isp, w0, w1, w2);
+ 				WRITE_ONCE(m[1], 0);
+ 				WRITE_ONCE(m[2], 0);
++			} else if (c == isp->bt) {
++				/* kext 0x845c744: b138(ch, list or 0, 0, 0x80000000) */
++				reply = isp_bt_handle(isp, w0, w1, w2);
++				WRITE_ONCE(m[1], 0);
++				WRITE_ONCE(m[2], 0x80000000);
+ 			} else {
+ 				if (c == isp->tm)
+ 					isp_terminal(isp, w0 & ~3U, w1);
+@@ -236,6 +241,8 @@ int isp_service(struct t7000_isp *isp)
+ 			continue;
+ 		n += isp_drain(isp, c);
+ 	}
++	if (isp->st.on)
++		isp_stream_kick(isp);	/* resubmit freed frame/meta buffers on BUF_H2T */
+ 	return n;
+ }
+ 
+@@ -390,7 +397,12 @@ static int isp_irq_setup(struct t7000_isp *isp)
+ 
+ static uint isp_poll_interval(struct t7000_isp *isp)
+ {
+-	return isp->irq >= 0 ? ISP_IRQ_SAFETY_MS : max_t(uint, isp_poll_ms, 5);
++	if (isp->irq >= 0)
++		return ISP_IRQ_SAFETY_MS;
++	/* poll mode while streaming: at most 10 ms so 30 fps frames are not batched */
++	if (READ_ONCE(isp->st.on))
++		return clamp_t(uint, isp_poll_ms, 2, 10);
++	return max_t(uint, isp_poll_ms, 5);
+ }
+ 
+ static void isp_poll_fn(struct work_struct *work)
+@@ -534,13 +546,6 @@ void isp_ipc_stop(struct t7000_isp *isp)
+ 				 isp->chans[i].msgs);
+ }
+ 
+-/* CISP packet header: opcode u16 at +4, status u16 at +6 (A8 kext ISP_deInit) */
+-struct isp_cmd_hdr {
+-	u32 unk0;
+-	u16 opcode;
+-	u16 status;
+-} __packed;
+-
+ struct isp_cmd_print_enable {
+ 	struct isp_cmd_hdr h;
+ 	u32 enable;
+@@ -551,13 +556,12 @@ struct isp_cmd_config_get {
+ 	u32 w[5];	/* Asahi: timestamp_freq, num_channels, unk_10/14/18 */
+ } __packed;
+ 
+-static_assert(sizeof(struct isp_cmd_hdr) == 8);
+ static_assert(sizeof(struct isp_cmd_print_enable) == 0xc);
+ static_assert(sizeof(struct isp_cmd_config_get) == 0x1c);
+ 
+ /* Send a fixed-size command and wait; a non-zero status is logged and returned. */
+-static int isp_cmd_simple(struct t7000_isp *isp, const char *name, void *pkt,
+-			  u32 insize, u32 outsize, u16 *status)
++int isp_cmd_simple(struct t7000_isp *isp, const char *name, void *pkt,
++		   u32 insize, u32 outsize, u16 *status)
+ {
+ 	u16 st = 0xffff;
+ 	int ret = isp_cmd_send(isp, pkt, insize, outsize, true, &st);
+@@ -586,6 +590,10 @@ int isp_stage_start(struct t7000_isp *isp)
+ 	u16 st;
+ 	int ret;
+ 
++	/* the fw probes the sensors at START (fw 0x7d6e4): power them first */
++	ret = isp_sensor_power_on(isp);
++	if (ret)
++		return ret;
+ 	ret = isp_cmd_simple(isp, "PRINT_ENABLE", &pe, sizeof(pe), sizeof(pe), &st);
+ 	if (ret)
+ 		return ret;
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-main.c b/drivers/media/platform/apple/isp-t7000/isp-main.c
+index 770f756b4..a8d14a2a9 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-main.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-main.c
+@@ -11,7 +11,10 @@
+  *  2 bridge settings + clock enable                7 mailbox + rings, poll worker
+  *  3 mini DART + firmware into a DART surface      8 PRINT_ENABLE + START
+  *  4 ISP CPU start, wait for the wake magic        9 CONFIG_GET + BUILDINFO
+- *  5 boot stage 2 (IPC pool + boot args)
++ *  5 boot stage 2 (IPC pool + boot args)      (8 starts with the sensor power-up, sens_pwr=1)
++ *
++ * stream=1 (with stage=9) adds /dev/isp0 (isp-cdev.c): the ISP is powered off again
++ * after the boot test unless keep_on=1, booted on open and powered off on last close.
+  */
+ #include <linux/dma-mapping.h>
+ #include <linux/module.h>
+@@ -63,6 +66,40 @@ uint isp_max_shared_mb = 64;
+ module_param_named(max_shared_mb, isp_max_shared_mb, uint, 0444);
+ MODULE_PARM_DESC(max_shared_mb, "cap on SHAREDMALLOC memory");
+ 
++int isp_sens_pwr = 1;
++module_param_named(sens_pwr, isp_sens_pwr, int, 0444);
++MODULE_PARM_DESC(sens_pwr, "1 = power the sensors before START like iOS power_on_hardware (GPIO 198/190/196, ref clocks, extclk pins)");
++int isp_refclk = 1;
++module_param_named(refclk, isp_refclk, int, 0444);
++MODULE_PARM_DESC(refclk, "1 = program the PMGR sensor ref clocks (0x20e010218/1c) with refclk_cfg");
++uint isp_refclk_cfg = 0x28;
++module_param_named(refclk_cfg, isp_refclk_cfg, uint, 0444);
++MODULE_PARM_DESC(refclk_cfg, "ISPC byte: srcSel = bits 7:6, divider cfg = bits 5:0 (ADT ISPC arg byte 0 = 0x28)");
++int isp_extclk_periph = 1;
++module_param_named(extclk_periph, isp_extclk_periph, int, 0444);
++MODULE_PARM_DESC(extclk_periph, "pin function (PERIPH) for the MCLK pins 191/197; -1 = leave as iBoot set them");
++int isp_stream_en;
++module_param_named(stream, isp_stream_en, int, 0444);
++MODULE_PARM_DESC(stream, "1 (with stage=9) = streaming via /dev/isp0");
++int isp_stream_dump;
++module_param_named(stream_dump, isp_stream_dump, int, 0644);
++MODULE_PARM_DESC(stream_dump, "1 = log every frame (seq, index, bytes) and every buffer list");
++int isp_keep_on;
++module_param_named(keep_on, isp_keep_on, int, 0644);
++MODULE_PARM_DESC(keep_on, "stream=1: 1 = keep the ISP booted when /dev/isp0 is closed (default: power everything off, boot again on open)");
++int isp_preset = -1;
++module_param_named(preset, isp_preset, int, 0644);
++MODULE_PARM_DESC(preset, "sensor preset to stream (-1 = smallest output >= 640x480)");
++uint isp_nbufs = 4;
++module_param_named(nbufs, isp_nbufs, uint, 0444);
++MODULE_PARM_DESC(nbufs, "frame buffers (2..8)");
++uint isp_setfile_rear = 0x8421;
++module_param_named(setfile_rear, isp_setfile_rear, uint, 0644);
++MODULE_PARM_DESC(setfile_rear, "IMX237 module setfile apple/isp_<hex>_01XX.dat (0x8421/0x8422/0x8423, 0 = none)");
++uint isp_setfile_front = 0x1421;
++module_param_named(setfile_front, isp_setfile_front, uint, 0644);
++MODULE_PARM_DESC(setfile_front, "IMX190 module setfile (0x1421/0x1422, 0 = none)");
++
+ static struct t7000_isp *the_isp;
+ 
+ static int isp_stage_power(struct t7000_isp *isp)
+@@ -83,16 +120,22 @@ static int (*const isp_stages[])(struct t7000_isp *) = {
+ 	isp_stage_query,	/* 9 */
+ };
+ 
+-/* Reverse unwind. Memory is freed only after the ISP is powered off. */
+-static void isp_teardown(struct t7000_isp *isp)
++/* Reverse unwind. Memory is freed only after the ISP is powered off. Caller: no isp->lock. */
++void isp_teardown(struct t7000_isp *isp)
+ {
+ 	dev_info(isp->dev, "teardown from stage %d\n", isp->done);
++	if (isp->st.on) {
++		mutex_lock(&isp->lock);
++		isp_stream_stop(isp);
++		mutex_unlock(&isp->lock);
++	}
+ 	isp_ipc_stop(isp);
+ 	mutex_lock(&isp->lock);
+ 	if (isp->fw_up && isp_graceful)
+ 		isp_fw_shutdown(isp);
+ 	if (isp->cpu_started)
+ 		isp_cpu_stop(isp);
++	isp_sensor_power_off(isp);
+ 	if (isp->dart_on)
+ 		isp_dart_fini(isp);
+ 	if (isp_power_off(isp) && (isp->l1 || !list_empty(&isp->surfs))) {
+@@ -109,22 +152,28 @@ static void isp_teardown(struct t7000_isp *isp)
+ 	} else {
+ 		isp_surf_free_all(isp);
+ 	}
++	/* stream buffers were surfaces: forget them (counters stay for debugfs) */
++	memset(isp->st.buf, 0, sizeof(isp->st.buf));
++	memset(isp->st.meta, 0, sizeof(isp->st.meta));
++	isp->st.lists = isp->st.setf = NULL;
++	isp->st.nbufs = 0;
++	/* per-boot state, so isp_boot() can run again (stream=1, open after idle-off) */
+ 	isp->done = 0;
++	isp->started = isp->io_dead = isp->fw_up = false;
++	isp->nchans = isp->pool_used = 0;
++	isp->io = isp->sm = isp->tm = isp->bh = isp->bt = isp->it = isp->dg = NULL;
++	memset(isp->chans, 0, sizeof(isp->chans));
+ 	mutex_unlock(&isp->lock);
+ 	isp_term_flush(isp);
+ 	isp_pmgr_log(isp, "after teardown");
+ }
+ 
+-static int isp_run(struct t7000_isp *isp)
++/* Run stages done+1 .. upto. On failure the caller unwinds with isp_teardown(). */
++int isp_boot(struct t7000_isp *isp, int upto)
+ {
+ 	int n, ret;
+ 
+-	if (stage < 0 || stage >= ARRAY_SIZE(isp_stages)) {
+-		dev_err(isp->dev, "stage=%d out of range 0..%zu\n", stage,
+-			ARRAY_SIZE(isp_stages) - 1);
+-		return -EINVAL;
+-	}
+-	for (n = 1; n <= stage; n++) {
++	for (n = isp->done + 1; n <= upto; n++) {
+ 		dev_info(isp->dev, "stage %d: start\n", n);
+ 		if (n > 1 && isp->isp_was_on) {
+ 			dev_err(isp->dev, "ps_isp was already on at load: someone else owns it, refusing writes\n");
+@@ -144,6 +193,20 @@ static int isp_run(struct t7000_isp *isp)
+ 	return 0;
+ }
+ 
++static int isp_run(struct t7000_isp *isp)
++{
++	if (stage < 0 || stage >= ARRAY_SIZE(isp_stages)) {
++		dev_err(isp->dev, "stage=%d out of range 0..%zu\n", stage,
++			ARRAY_SIZE(isp_stages) - 1);
++		return -EINVAL;
++	}
++	if (isp_stream_en && stage != ARRAY_SIZE(isp_stages) - 1) {
++		dev_err(isp->dev, "stream=1 needs stage=%zu\n", ARRAY_SIZE(isp_stages) - 1);
++		return -EINVAL;
++	}
++	return isp_boot(isp, stage);
++}
++
+ static int __init isp_init(void)
+ {
+ 	struct platform_device_info pinfo = {
+@@ -159,6 +222,8 @@ static int __init isp_init(void)
+ 		return -ENOMEM;
+ 	mutex_init(&isp->lock);
+ 	spin_lock_init(&isp->term_lock);
++	spin_lock_init(&isp->st.frame_lock);
++	init_waitqueue_head(&isp->st.wait);
+ 	INIT_LIST_HEAD(&isp->surfs);
+ 	atomic_set(&isp->irq_count, 0);
+ 	isp->irq = -1;
+@@ -195,6 +260,17 @@ static int __init isp_init(void)
+ 		isp_teardown(isp);
+ 		goto err_unmap;
+ 	}
++	if (isp_stream_en) {
++		ret = isp_cdev_init(isp);
++		if (ret) {
++			isp_teardown(isp);
++			goto err_unmap;
++		}
++		if (!isp_keep_on) {
++			dev_info(isp->dev, "stream: boot ok; powering the ISP off until /dev/isp0 is opened (keep_on=0)\n");
++			isp_teardown(isp);
++		}
++	}
+ ok:
+ 	dev_info(isp->dev, "loaded, stages done: %d (rmmod unwinds)\n", isp->done);
+ 	the_isp = isp;
+@@ -215,6 +291,7 @@ static void __exit isp_exit(void)
+ {
+ 	struct t7000_isp *isp = the_isp;
+ 
++	isp_cdev_exit(isp);	/* no open fd can exist: each one holds a module reference */
+ 	if (!isp_dry_run)
+ 		isp_teardown(isp);
+ 	iounmap(isp->regs);
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-scfg.c b/drivers/media/platform/apple/isp-t7000/isp-scfg.c
+new file mode 100644
+index 000000000..e80765e46
+--- /dev/null
++++ b/drivers/media/platform/apple/isp-t7000/isp-scfg.c
+@@ -0,0 +1,331 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Apple A8 (T7000) ISP: stream configuration (ISP_IOC_START). The command sequence and
++ * every packet layout are in re/CAMERA-STREAM.md §3/§5 (fw 13.42.00 dispatcher + kext).
++ * Called with isp->lock held; every command is bounded by cmd_timeout_ms.
++ */
++#include <linux/firmware.h>
++#include <linux/mm.h>
++#include <linux/platform_device.h>
++#include <linux/sizes.h>
++#include <linux/slab.h>
++
++#include "isp.h"
++
++#define ISP_INFO_SIZE		0xc4	/* kext ISP_InitialSensorDetection */
++#define ISP_CAMCFG_SIZE		0x84	/* kext CAMERA_CONFIG_GET */
++#define ISP_POOLGET_SIZE	0x110	/* fw 0x16b90 writes up to 15 x 0x10 records from +0x10 */
++#define ISP_MAX_PRESETS		16
++#define ISP_SETFILE_MAX		SZ_64K
++
++/* Send @size bytes in and out; a non-zero fw status is an error when @must. */
++static int isp_ch_cmd(struct t7000_isp *isp, const char *name, void *pkt, u32 size, bool must)
++{
++	u16 st = 0xffff;
++	int ret = isp_cmd_simple(isp, name, pkt, size, size, &st);
++
++	if (ret)
++		return ret;
++	if (st && must)
++		return -EIO;
++	return 0;
++}
++
++static int isp_ch_simple(struct t7000_isp *isp, const char *name, u16 op, u32 ch, u32 size,
++			 u32 a0, u32 a1, bool must)
++{
++	struct isp_cmd_ch c = { .h.opcode = op, .chan = ch, .arg = { a0, a1 } };
++
++	return isp_ch_cmd(isp, name, &c, size, must);
++}
++
++static u16 rd16(const u8 *p, u32 off)
++{
++	return *(const u16 *)(p + off);
++}
++
++static u32 rd32(const u8 *p, u32 off)
++{
++	return *(const u32 *)(p + off);
++}
++
++/* CH_INFO_GET + CAMERA_CONFIG_GET per preset; picks the preset to stream. */
++static int isp_pick_preset(struct t7000_isp *isp, u8 *buf)
++{
++	struct isp_stream *st = &isp->st;
++	u32 p, best = U32_MAX, best_area = U32_MAX, ow, oh, small = U32_MAX, small_area = U32_MAX;
++	u16 small_dim[4] = {};
++	int ret;
++
++	memset(buf, 0, ISP_INFO_SIZE);
++	((struct isp_cmd_hdr *)buf)->opcode = CISP_CMD_CH_INFO_GET;
++	*(u32 *)(buf + 8) = st->ch;
++	ret = isp_ch_cmd(isp, "CH_INFO_GET", buf, ISP_INFO_SIZE, true);
++	if (ret)
++		return ret;
++	st->sensor_id = rd32(buf, 0x20);
++	st->npresets = rd32(buf, 0x60);
++	dev_info(isp->dev, "ch %u: sensor 0x%04x, %u preset(s), ts freq %u, module '%.18s'\n",
++		 st->ch, st->sensor_id, st->npresets, rd32(buf, 0x98), buf + 0x9e);
++	print_hex_dump(KERN_INFO, "apple-isp: CH_INFO: ", DUMP_PREFIX_OFFSET, 32, 4, buf,
++		       ISP_INFO_SIZE, false);
++	if (!st->npresets) {
++		dev_err(isp->dev, "ch %u: no sensor (0 presets): sensor power/clock problem?\n", st->ch);
++		return -ENODEV;
++	}
++	snprintf(st->sensor_name, sizeof(st->sensor_name), "%s",
++		 st->sensor_id == 0x237 ? "IMX237 rear" :
++		 st->sensor_id == 0x190 ? "IMX190 front" : "unknown");
++
++	for (p = 0; p < min_t(u32, st->npresets, ISP_MAX_PRESETS); p++) {
++		memset(buf, 0, ISP_CAMCFG_SIZE);
++		((struct isp_cmd_hdr *)buf)->opcode = CISP_CMD_CH_CAMERA_CONFIG_GET;
++		*(u32 *)(buf + 8) = st->ch;
++		*(u32 *)(buf + 0xc) = p;
++		ret = isp_ch_cmd(isp, "CAMERA_CONFIG_GET", buf, ISP_CAMCFG_SIZE, true);
++		if (ret)
++			return ret;
++		ow = rd16(buf, 0x14);
++		oh = rd16(buf, 0x16);
++		dev_info(isp->dev, "ch %u preset %u: in %ux%u out %ux%u, +0x18 %04x %04x +0x1c %04x %04x\n",
++			 st->ch, p, rd16(buf, 0x10), rd16(buf, 0x12), ow, oh, rd16(buf, 0x18),
++			 rd16(buf, 0x1a), rd16(buf, 0x1c), rd16(buf, 0x1e));
++		if (!ow || !oh || ow > 4096 || oh > 4096)
++			continue;
++		if (ow * oh < small_area) {	/* fallback when nothing is >= 640x480 */
++			small = p;
++			small_area = ow * oh;
++			small_dim[0] = rd16(buf, 0x10);
++			small_dim[1] = rd16(buf, 0x12);
++			small_dim[2] = ow;
++			small_dim[3] = oh;
++		}
++		if (isp_preset >= 0 ? p == isp_preset :
++		    ow >= 640 && oh >= 480 && ow * oh < best_area) {
++			best = p;
++			best_area = ow * oh;
++			st->in_w = rd16(buf, 0x10);
++			st->in_h = rd16(buf, 0x12);
++			st->width = ow;
++			st->height = oh;
++		}
++	}
++	if (best == U32_MAX && isp_preset < 0 && small != U32_MAX) {
++		best = small;
++		st->in_w = small_dim[0];
++		st->in_h = small_dim[1];
++		st->width = small_dim[2];
++		st->height = small_dim[3];
++	}
++	if (best == U32_MAX) {
++		dev_err(isp->dev, "ch %u: no usable preset (preset=%d)\n", st->ch, isp_preset);
++		return -EINVAL;
++	}
++	st->preset = best;
++	st->stride = ALIGN(st->width, 64);
++	st->bufsize = PAGE_ALIGN(st->stride * st->height * 3 / 2);
++	dev_info(isp->dev, "ch %u: streaming preset %u: %ux%u NV12, stride %u, buffer 0x%x\n",
++		 st->ch, best, st->width, st->height, st->stride, st->bufsize);
++	return 0;
++}
++
++/* Optional tuning data (Asahi: a missing setfile only costs calibration). */
++static void isp_load_setfile(struct t7000_isp *isp)
++{
++	struct isp_stream *st = &isp->st;
++	u32 mod = st->ch ? isp_setfile_front : isp_setfile_rear;
++	const struct firmware *fw;
++	char name[40];
++	u32 magic;
++
++	if (!mod)
++		return;
++	snprintf(name, sizeof(name), "apple/isp_%04x_01XX.dat", mod);
++	if (request_firmware_direct(&fw, name, isp->dev)) {
++		dev_warn(isp->dev, "setfile %s not found: streaming without calibration\n", name);
++		return;
++	}
++	magic = fw->size >= 4 ? be32_to_cpup((const __be32 *)fw->data) : 0;
++	if (fw->size > ISP_SETFILE_MAX || magic >> 16 != mod) {
++		dev_warn(isp->dev, "setfile %s: size 0x%zx magic 0x%08x does not match, skipped\n",
++			 name, fw->size, magic);
++		goto out;
++	}
++	if (!st->setf)
++		st->setf = isp_surf_alloc(isp, ISP_SETFILE_MAX, 0x46544553 /* "SETF" */);
++	if (!st->setf)
++		goto out;
++	memcpy(st->setf->virt, fw->data, fw->size);
++	dma_wmb();
++	dev_info(isp->dev, "setfile %s: 0x%zx bytes, magic 0x%08x\n", name, fw->size, magic);
++	isp_ch_simple(isp, "CH_SET_FILE_LOAD", CISP_CMD_CH_SET_FILE_LOAD, st->ch, 0x14,
++		      isp_rel(st->setf->iova), fw->size, false);
++out:
++	release_firmware(fw);
++}
++
++/* BUFFER_POOL_CONFIG_GET (logged) gives the META pool size; then POOL_CONFIG_SET(META). */
++static void isp_config_meta(struct t7000_isp *isp, u8 *buf)
++{
++	struct isp_stream *st = &isp->st;
++	u32 i, off;
++
++	memset(buf, 0, ISP_POOLGET_SIZE);
++	((struct isp_cmd_hdr *)buf)->opcode = CISP_CMD_CH_BUFFER_POOL_CONFIG_GET;
++	*(u32 *)(buf + 8) = st->ch;
++	st->meta_size = 0;
++	if (isp_ch_cmd(isp, "BUFFER_POOL_CONFIG_GET", buf, ISP_POOLGET_SIZE, true))
++		return;
++	for (i = 0; i < 15; i++) {
++		off = 0x10 + i * 0x10;
++		if (!rd32(buf, off) && !rd32(buf, off + 4) && !rd32(buf, off + 8))
++			continue;
++		dev_info(isp->dev, "pool record %u: type %u id %u %04x count %u size 0x%x %04x %04x\n",
++			 i, rd16(buf, off), rd16(buf, off + 2), rd16(buf, off + 4),
++			 rd16(buf, off + 6), rd32(buf, off + 8), rd16(buf, off + 0xc),
++			 rd16(buf, off + 0xe));
++		if (rd16(buf, off) == ISP_POOL_META && rd32(buf, off + 8) <= SZ_1M)
++			st->meta_size = rd32(buf, off + 8);
++	}
++	if (!st->meta_size) {
++		dev_warn(isp->dev, "no META pool reported: not submitting meta buffers\n");
++		return;
++	}
++	/* fw 0x16b64 reads: u16 pool type @0xc, u32 @0x10, u32 @0x14 (Asahi meta_size0/1) */
++	memset(buf, 0, 0x9c);
++	((struct isp_cmd_hdr *)buf)->opcode = CISP_CMD_CH_BUFFER_POOL_CONFIG_SET;
++	*(u32 *)(buf + 8) = st->ch;
++	*(u16 *)(buf + 0xc) = ISP_POOL_META;
++	*(u16 *)(buf + 0xe) = clamp_t(u32, isp_nbufs, 2, ISP_MAX_BUFS);
++	*(u32 *)(buf + 0x10) = st->meta_size;
++	*(u32 *)(buf + 0x14) = st->meta_size;
++	isp_ch_cmd(isp, "BUFFER_POOL_CONFIG_SET(META)", buf, 0x9c, false);
++}
++
++/*
++ * Frame (+ meta) surfaces and the H2T list area. Surfaces can only be freed after the
++ * ISP is powered off, so they are allocated once per boot and reused by later STARTs
++ * of the same size.
++ */
++static int isp_alloc_bufs(struct t7000_isp *isp)
++{
++	struct isp_stream *st = &isp->st;
++	u32 n = clamp_t(u32, isp_nbufs, 2, ISP_MAX_BUFS), i;
++
++	if (st->nbufs) {
++		if (st->buf[0].surf->size == st->bufsize &&
++		    (!st->meta_size || (st->meta[0].surf && st->meta[0].surf->size >= st->meta_size)))
++			return 0;
++		dev_err(isp->dev, "buffers of this boot are 0x%x bytes, preset needs 0x%x: close /dev/isp0 (power cycle) first\n",
++			st->buf[0].surf->size, st->bufsize);
++		return -EBUSY;
++	}
++	if (!st->lists)
++		st->lists = isp_surf_alloc(isp, isp->bh->num * ISP_BUFLIST_SLOT,
++					   0x4c465542 /* "BUFL" */);
++	if (!st->lists)
++		return -ENOMEM;
++	for (i = 0; i < n; i++) {
++		st->buf[i].surf = isp_surf_alloc(isp, st->bufsize, 0x304d5246 + (i << 24));
++		if (!st->buf[i].surf)
++			return -ENOMEM;
++		st->buf[i].state = BUF_FREE;
++		if (!st->meta_size)
++			continue;
++		st->meta[i].surf = isp_surf_alloc(isp, st->meta_size, 0x3041544d + (i << 24));
++		if (!st->meta[i].surf)
++			return -ENOMEM;
++		st->meta[i].state = BUF_FREE;
++	}
++	st->nbufs = n;
++	return 0;
++}
++
++struct isp_cmd_output_config {
++	struct isp_cmd_hdr h;
++	u32 chan, width, height, colorspace, format;
++	u32 strides[3];
++	u32 padding_rows, unk_h0, compress, unk_w2;
++} __packed;
++static_assert(sizeof(struct isp_cmd_output_config) == 0x38);
++
++/* ISP_IOC_START: camera 0 = rear = fw channel 0, 1 = front = channel 1 (kext row 0x2a). */
++int isp_stream_start(struct t7000_isp *isp, u32 camera)
++{
++	struct isp_stream *st = &isp->st;
++	struct isp_cmd_output_config oc = { .h.opcode = CISP_CMD_CH_OUTPUT_CONFIG_SET };
++	u8 *buf;
++	int ret;
++
++	if (camera > 1)
++		return -EINVAL;
++	if (st->on)
++		return -EBUSY;
++	if (!isp->started || isp->io_dead || !isp->bh || !isp->bt) {
++		dev_err(isp->dev, "stream: fw not started or BUF_H2T/BUF_T2H missing\n");
++		return -ENODEV;
++	}
++	buf = kzalloc(ISP_POOLGET_SIZE, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++	st->ch = camera;
++	ret = isp_pick_preset(isp, buf);
++	if (ret)
++		goto out;
++	isp_load_setfile(isp);
++	ret = isp_ch_simple(isp, "CAMERA_CONFIG_SELECT", CISP_CMD_CH_CAMERA_CONFIG_SELECT,
++			    st->ch, 0x10, st->preset, 0, true);
++	if (!ret)
++		ret = isp_ch_simple(isp, "BUFFER_RECYCLE_MODE_SET", CISP_CMD_CH_BUFFER_RECYCLE_MODE_SET,
++				    st->ch, 0x10, 1, 0, false);
++	if (!ret)
++		ret = isp_ch_simple(isp, "BUFFER_RECYCLE_START", CISP_CMD_CH_BUFFER_RECYCLE_START,
++				    st->ch, 0xc, 0, 0, false);
++	if (ret)
++		goto out;
++	{
++		struct isp_cmd_ch c = { .h.opcode = CISP_CMD_CH_CROP_SET, .chan = st->ch,
++					.arg = { 0, 0, st->in_w, st->in_h } };
++
++		ret = isp_ch_cmd(isp, "CROP_SET", &c, 0x1c, false);
++		if (ret)
++			goto out;
++	}
++	oc.chan = st->ch;
++	oc.width = st->width;
++	oc.height = st->height;
++	oc.colorspace = 1;		/* REC709 (Asahi) */
++	oc.format = 0;			/* 2-plane YUV 4:2:0 = NV12 (fw 0x162b8) */
++	oc.strides[0] = st->stride;
++	oc.strides[1] = st->stride;
++	oc.unk_h0 = st->height;
++	oc.unk_w2 = st->width;
++	ret = isp_ch_cmd(isp, "OUTPUT_CONFIG_SET", &oc, sizeof(oc), true);
++	if (!ret)
++		ret = isp_ch_simple(isp, "PREVIEW_STREAM_SET", CISP_CMD_CH_PREVIEW_STREAM_SET,
++				    st->ch, 0x10, 1, 0, true);
++	if (ret)
++		goto out;
++	isp_ch_simple(isp, "SIF_PIXEL_FORMAT_SET", CISP_CMD_CH_SIF_PIXEL_FORMAT_SET, st->ch, 0x14,
++		      3 | 1 << 8, 0, false);	/* u8 format 3, u8 type 1 (Asahi) */
++	isp_config_meta(isp, buf);
++	ret = isp_alloc_bufs(isp);
++	if (ret)
++		goto out;
++	st->seq = 0;
++	st->nready = 0;
++	st->stopping = false;
++	st->on = true;
++	isp_stream_kick(isp);		/* every buffer is FREE: one or two lists on BUF_H2T */
++	ret = isp_ch_simple(isp, "CH_START", CISP_CMD_CH_START, st->ch, 0xc, 0, 0, true);
++	if (ret) {
++		isp_stream_stop(isp);
++		goto out;
++	}
++	dev_info(isp->dev, "stream on: camera %u (%s 0x%04x), %ux%u, %u buffer(s)%s\n", camera,
++		 st->sensor_name, st->sensor_id, st->width, st->height, st->nbufs,
++		 st->meta_size ? " + meta" : "");
++out:
++	kfree(buf);
++	return ret;
++}
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-sens.c b/drivers/media/platform/apple/isp-t7000/isp-sens.c
+new file mode 100644
+index 000000000..2dfbda843
+--- /dev/null
++++ b/drivers/media/platform/apple/isp-t7000/isp-sens.c
+@@ -0,0 +1,194 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Apple A8 (T7000) ISP: sensor power-up (stage 8 prologue, sens_pwr=1).
++ *
++ * iOS power_on_hardware (kext 0x845d2d4) powers the sensors from the AP before the
++ * fw probes them at START (re/CAMERA-STREAM.md §1):
++ *   cam_avdd_ldo GPIO 198 = 1, 1 ms; ISPC ref clocks (PMGR 0x20e010218 + 4*n:
++ *   (old & 0xfcffffc0) | srcSel << 24 | cfg, wait for bit 30 to clear); per sensor:
++ *   extclk pin (191 rear, 197 front) to its alternate function, shutdown pin
++ *   (190 rear, 196 front) = 1 (active high), 5 ms.
++ * GPIO outputs go through gpiolib (the pinctrl driver owns the pins); the extclk
++ * pin function is a direct read-modify-write of the pin register (PERIPH, bits 6:5),
++ * restored on power-off. Everything is undone in reverse.
++ */
++#include <linux/bitfield.h>
++#include <linux/delay.h>
++#include <linux/gpio.h>
++#include <linux/gpio/driver.h>
++#include <linux/iopoll.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/platform_device.h>
++
++#include "isp.h"
++
++#define PINCTRL_PHYS		0x20e300000ULL
++#define PIN_PERIPH		GENMASK(6, 5)
++#define REFCLK_PHYS		0x20e010218ULL	/* kRegGroupISPRef0ClkCfg: AppleT7000PMGR 0x8537a38 */
++#define REFCLK_BUSY		BIT(30)
++#define REFCLK_KEEP		0xfcffffc0	/* configISPRefClock 0x852b49c */
++
++#define PIN_AVDD		198
++#define PIN_SHUT_REAR		190
++#define PIN_SHUT_FRONT		196
++#define PIN_CLK_REAR		191
++#define PIN_CLK_FRONT		197
++
++static const u8 isp_log_pins[] = { 190, 191, 196, 197, 198 };
++
++static void isp_pins_log(struct t7000_isp *isp, const char *when)
++{
++	u32 v[ARRAY_SIZE(isp_log_pins)];
++	int i;
++
++	if (!isp->pinregs)
++		return;
++	for (i = 0; i < ARRAY_SIZE(isp_log_pins); i++)
++		v[i] = readl(isp->pinregs + 4 * isp_log_pins[i]);
++	dev_info(isp->dev, "sensor pins %s: 190 %08x 191 %08x 196 %08x 197 %08x 198 %08x; refclk %08x %08x\n",
++		 when, v[0], v[1], v[2], v[3], v[4],
++		 isp->refclk ? readl(isp->refclk) : 0, isp->refclk ? readl(isp->refclk + 4) : 0);
++}
++
++/* gpiolib number of an AP GPIO (ADT phandle 24 = pinctrl@20e300000) */
++static int isp_gpio_base(struct t7000_isp *isp)
++{
++	struct device_node *np;
++	struct gpio_device *gdev = NULL;
++	struct resource res;
++	int base = -ENODEV;
++
++	for_each_compatible_node(np, NULL, "apple,pinctrl") {
++		if (of_address_to_resource(np, 0, &res) || res.start != PINCTRL_PHYS)
++			continue;
++		gdev = gpio_device_find_by_fwnode(of_fwnode_handle(np));
++		of_node_put(np);
++		break;
++	}
++	if (gdev) {
++		base = gpio_device_get_base(gdev);
++		gpio_device_put(gdev);
++	}
++	return base;
++}
++
++static int isp_pin_out(struct t7000_isp *isp, int idx, int pin, const char *name)
++{
++	int ret = gpio_request_one(isp->gpio_base + pin, GPIOF_OUT_INIT_HIGH, name);
++
++	if (ret) {
++		dev_err(isp->dev, "sens_pwr: gpio %d (%s) request failed: %d\n", pin, name, ret);
++		return ret;
++	}
++	isp->gpio_on[idx] = pin;
++	dev_info(isp->dev, "sens_pwr: gpio %d (%s) = 1, reads %d\n", pin, name,
++		 gpio_get_value(isp->gpio_base + pin));
++	return 0;
++}
++
++static int isp_refclk_set(struct t7000_isp *isp, int n)
++{
++	void __iomem *r = isp->refclk + 4 * n;
++	u32 old = readl(r), v;
++	int ret;
++
++	isp->refclk_old[n] = old;
++	isp->refclk_saved |= BIT(n);
++	writel((old & REFCLK_KEEP) | (isp_refclk_cfg & 0x3f) | ((isp_refclk_cfg >> 6) & 3) << 24, r);
++	ret = readl_poll_timeout(r, v, !(v & REFCLK_BUSY), 10, 10000);
++	dev_info(isp->dev, "sens_pwr: ref clock %d (PMGR +0x%x): 0x%08x -> 0x%08x%s\n", n,
++		 0x10218 + 4 * n, old, v, ret ? " (TIMEOUT: bit 30 still set after 10 ms)" : "");
++	return ret;
++}
++
++static void isp_extclk_set(struct t7000_isp *isp, int n, int pin)
++{
++	void __iomem *r = isp->pinregs + 4 * pin;
++	u32 old = readl(r);
++
++	isp->extclk_old[n] = old;
++	isp->extclk_saved |= BIT(n);
++	writel((old & ~PIN_PERIPH) | FIELD_PREP(PIN_PERIPH, isp_extclk_periph), r);
++	dev_info(isp->dev, "sens_pwr: extclk pin %d: 0x%08x -> 0x%08x (periph %d)\n", pin, old,
++		 readl(r), isp_extclk_periph);
++}
++
++int isp_sensor_power_on(struct t7000_isp *isp)
++{
++	int ret, n;
++
++	if (!isp_sens_pwr) {
++		dev_info(isp->dev, "sens_pwr=0: not touching the sensor rails/pins\n");
++		return 0;
++	}
++	isp->gpio_base = isp_gpio_base(isp);
++	if (isp->gpio_base < 0) {
++		dev_err(isp->dev, "sens_pwr: pinctrl@20e300000 gpio chip not found (%d)\n",
++			isp->gpio_base);
++		return -ENODEV;
++	}
++	isp->sens_on = true;	/* from here on isp_sensor_power_off() undoes it */
++	isp->pinregs = ioremap(PINCTRL_PHYS, 0x1000);
++	isp->refclk = ioremap(REFCLK_PHYS, 8);
++	if (!isp->pinregs || !isp->refclk)
++		return -ENOMEM;
++	isp_pins_log(isp, "before");
++
++	ret = isp_pin_out(isp, 0, PIN_AVDD, "isp-cam-avdd");
++	if (ret)
++		return ret;
++	msleep(2);				/* iOS: IOSleep(1) after the rails */
++	if (isp_refclk)
++		for (n = 0; n < 2; n++)
++			if (isp_refclk_set(isp, n))
++				return -ETIMEDOUT;
++	if (isp_extclk_periph >= 0 && isp_extclk_periph <= 3) {
++		isp_extclk_set(isp, 0, PIN_CLK_REAR);
++		isp_extclk_set(isp, 1, PIN_CLK_FRONT);
++	}
++	ret = isp_pin_out(isp, 1, PIN_SHUT_REAR, "isp-rear-shutdown");
++	if (!ret)
++		ret = isp_pin_out(isp, 2, PIN_SHUT_FRONT, "isp-front-shutdown");
++	if (ret)
++		return ret;
++	msleep(10);				/* iOS: IOSleep(5) after EnableSensorN */
++	isp_pins_log(isp, "after power-up");
++	return 0;
++}
++
++static void isp_pin_release(struct t7000_isp *isp, int idx)
++{
++	if (!isp->gpio_on[idx])
++		return;
++	gpio_set_value(isp->gpio_base + isp->gpio_on[idx], 0);
++	gpio_free(isp->gpio_base + isp->gpio_on[idx]);
++	isp->gpio_on[idx] = 0;
++}
++
++/* Reverse order: shutdown pins low, extclk + ref clocks restored, AVDD off. */
++void isp_sensor_power_off(struct t7000_isp *isp)
++{
++	int n;
++
++	if (!isp->sens_on)
++		return;
++	isp_pin_release(isp, 2);
++	isp_pin_release(isp, 1);
++	for (n = 1; n >= 0; n--) {
++		if (isp->extclk_saved & BIT(n))
++			writel(isp->extclk_old[n],
++			       isp->pinregs + 4 * (n ? PIN_CLK_FRONT : PIN_CLK_REAR));
++		if (isp->refclk_saved & BIT(n))
++			writel(isp->refclk_old[n], isp->refclk + 4 * n);
++	}
++	isp->extclk_saved = isp->refclk_saved = 0;
++	isp_pin_release(isp, 0);
++	isp_pins_log(isp, "after power-off");
++	if (isp->refclk)
++		iounmap(isp->refclk);
++	if (isp->pinregs)
++		iounmap(isp->pinregs);
++	isp->refclk = isp->pinregs = NULL;
++	isp->sens_on = false;
++}
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-stream.c b/drivers/media/platform/apple/isp-t7000/isp-stream.c
+new file mode 100644
+index 000000000..cf779b9f7
+--- /dev/null
++++ b/drivers/media/platform/apple/isp-t7000/isp-stream.c
+@@ -0,0 +1,321 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Apple A8 (T7000) ISP: preview streaming (stage 10, stream=1). See re/CAMERA-STREAM.md.
++ *
++ * Buffers travel in u32 buffer lists (fw 0xa9590 / 0xa8ff0, kext 0x845bfb0):
++ *   { u32 type, u32 count, count x { u32 addr[3], u32 flags[3], u32 nplanes, u32 pool, u64 tag } }
++ * Host -> fw on BUF_H2T (type-0 ring: word0 = fw-rel list, word1 = length, word2 bit 28 =
++ * list mode); fw -> host on BUF_T2H (type-1 ring: reply word0 = list | 1, word2 = 0x80000000).
++ * Buffer states change under st.frame_lock; everything that talks to the fw holds isp->lock.
++ */
++#include <linux/delay.h>
++#include <linux/firmware.h>
++#include <linux/jiffies.h>
++#include <linux/ktime.h>
++#include <linux/platform_device.h>
++#include <linux/sizes.h>
++#include <linux/slab.h>
++
++#include "isp.h"
++
++#define ISP_TAG_MAGIC		0x49535054ULL	/* 'ISPT' */
++#define ISP_TAG(pool, i)	((ISP_TAG_MAGIC << 32) | ((u64)(pool) << 16) | (i))
++#define ISP_H2T_LIST		0x10000000	/* word2 bit 28: word0 is a buffer list */
++#define ISP_H2T_WORD2		0x30000000	/* Asahi's BUFEXC COMMAND value (bit 28 set) */
++#define ISP_BUF_FILLED		0x40000000	/* per-plane flag (Asahi submits it; fw sets it on data) */
++#define ISP_LIST_MIN		0x180		/* the fw's own T2H list size */
++
++struct isp_bl_entry {
++	u32 addr[3];
++	u32 flags[3];
++	u32 nplanes;
++	u32 pool;
++	u64 tag;
++} __packed;
++static_assert(sizeof(struct isp_bl_entry) == 0x28);
++
++struct isp_bl {
++	u32 type;
++	u32 count;
++	struct isp_bl_entry e[];
++} __packed;
++
++static_assert(sizeof(struct isp_bl) + ISP_BUFLIST_MAX * sizeof(struct isp_bl_entry) <=
++	      ISP_BUFLIST_SLOT);
++
++static void isp_fill_entry(struct t7000_isp *isp, struct isp_bl_entry *e, u32 pool, u32 i)
++{
++	struct isp_stream *st = &isp->st;
++
++	memset(e, 0, sizeof(*e));
++	e->pool = pool;
++	e->tag = ISP_TAG(pool, i);
++	if (pool == ISP_POOL_META) {
++		e->addr[0] = isp_rel(st->meta[i].surf->iova);
++		e->flags[0] = ISP_BUF_FILLED;
++		e->nplanes = 1;
++	} else {
++		e->addr[0] = isp_rel(st->buf[i].surf->iova);
++		e->addr[1] = isp_rel(st->buf[i].surf->iova + st->stride * st->height);
++		e->flags[0] = e->flags[1] = ISP_BUF_FILLED;
++		e->nplanes = 2;
++	}
++}
++
++/* Post one buffer list on BUF_H2T without waiting. isp->lock held. */
++static int isp_h2t_post(struct t7000_isp *isp, u32 n, const u32 *pool, const u32 *idx)
++{
++	struct isp_stream *st = &isp->st;
++	struct isp_chan *c = isp->bh;
++	u32 slot, *m, rel, len, i;
++	struct isp_bl *bl;
++
++	if (!c || !st->lists || !n)
++		return -ENODEV;
++	slot = c->idx;
++	m = (u32 *)(c->ring + slot * ISP_MSG_SIZE);
++	if (!(READ_ONCE(m[0]) & 1)) {
++		st->h2t_busy++;
++		return -EBUSY;		/* fw still owns the slot: retried on the next service pass */
++	}
++	bl = (struct isp_bl *)((u8 *)st->lists->virt + (slot % c->num) * ISP_BUFLIST_SLOT);
++	bl->type = 1;
++	bl->count = n;
++	for (i = 0; i < n; i++)
++		isp_fill_entry(isp, &bl->e[i], pool[i], idx[i]);
++	len = sizeof(*bl) + n * sizeof(bl->e[0]);
++	rel = isp_rel(st->lists->iova + (slot % c->num) * ISP_BUFLIST_SLOT);
++	WRITE_ONCE(m[1], max_t(u32, len, ISP_LIST_MIN));
++	WRITE_ONCE(m[2], ISP_H2T_WORD2);
++	dma_wmb();
++	WRITE_ONCE(m[0], rel);
++	dma_wmb();
++	isp_wr(isp, ISP_DOORBELL, BIT(c->src));
++	c->idx = (slot + 1) % c->num;
++	c->msgs++;
++	st->h2t_posts++;
++	if (READ_ONCE(isp_stream_dump))
++		dev_info(isp->dev, "H2T slot %u: list fw-rel 0x%08x, %u buffer(s), first pool %u idx %u\n",
++			 slot, rel, n, pool[0], idx[0]);
++	return 0;
++}
++
++/* Hand every FREE frame/meta buffer back to the fw, one list per H2T slot. isp->lock held. */
++void isp_stream_kick(struct t7000_isp *isp)
++{
++	struct isp_stream *st = &isp->st;
++	u32 pool[ISP_BUFLIST_MAX], idx[ISP_BUFLIST_MAX], n, i, round;
++
++	for (round = 0; round < 4 && st->on && !st->stopping; round++) {
++		n = 0;
++		spin_lock(&st->frame_lock);
++		for (i = 0; i < st->nbufs && n < ISP_BUFLIST_MAX; i++) {
++			if (st->meta[i].surf && st->meta[i].state == BUF_FREE) {
++				pool[n] = ISP_POOL_META;
++				idx[n++] = i;
++			}
++			if (n < ISP_BUFLIST_MAX && st->buf[i].state == BUF_FREE) {
++				pool[n] = ISP_POOL_RENDERED;
++				idx[n++] = i;
++			}
++		}
++		/* claim them before posting: a T2H for them cannot come earlier than the post */
++		for (i = 0; i < n; i++) {
++			if (pool[i] == ISP_POOL_META)
++				st->meta[idx[i]].state = BUF_FW;
++			else
++				st->buf[idx[i]].state = BUF_FW;
++		}
++		spin_unlock(&st->frame_lock);
++		if (!n)
++			return;
++		if (isp_h2t_post(isp, n, pool, idx)) {
++			spin_lock(&st->frame_lock);	/* slot busy: give them back, retry later */
++			for (i = 0; i < n; i++) {
++				if (pool[i] == ISP_POOL_META)
++					st->meta[idx[i]].state = BUF_FREE;
++				else
++					st->buf[idx[i]].state = BUF_FREE;
++			}
++			spin_unlock(&st->frame_lock);
++			return;
++		}
++	}
++}
++
++/*
++ * Keep at least one buffer with the fw (READY + USER <= nbufs - 1): drop older ready
++ * frames first (the newest stays), then recycle the oldest buffer userspace still holds.
++ * frame_lock held.
++ */
++static void isp_frame_limit(struct isp_stream *st)
++{
++	u32 i, held = 0, oldest;
++
++	for (i = 0; i < st->nbufs; i++)
++		if (st->buf[i].state == BUF_USER)
++			held++;
++	while (st->nready > 1 && st->nready + held > st->nbufs - 1) {
++		st->buf[st->ready[0]].state = BUF_FREE;
++		memmove(st->ready, st->ready + 1, --st->nready * sizeof(st->ready[0]));
++		st->dropped++;
++	}
++	while (held && st->nready + held > st->nbufs - 1) {
++		oldest = U32_MAX;
++		for (i = 0; i < st->nbufs; i++)
++			if (st->buf[i].state == BUF_USER &&
++			    (oldest == U32_MAX || st->buf[i].seq < st->buf[oldest].seq))
++				oldest = i;
++		st->buf[oldest].state = BUF_FREE;	/* userspace kept it too long */
++		st->recycled++;
++		held--;
++	}
++}
++
++static void isp_t2h_entry(struct t7000_isp *isp, const struct isp_bl_entry *e)
++{
++	struct isp_stream *st = &isp->st;
++	u32 pool = e->pool & 0x0fffffff, i = e->tag & 0xffff;
++	struct isp_sbuf *b;
++
++	if ((e->tag >> 32) != ISP_TAG_MAGIC || ((e->tag >> 16) & 0xffff) != pool ||
++	    i >= st->nbufs || (pool != ISP_POOL_META && pool != ISP_POOL_RENDERED)) {
++		st->errors++;
++		dev_warn_ratelimited(isp->dev, "T2H: unknown buffer: pool 0x%x tag 0x%016llx addr 0x%08x\n",
++				     e->pool, e->tag, e->addr[0]);
++		return;
++	}
++	b = pool == ISP_POOL_META ? &st->meta[i] : &st->buf[i];
++	if (READ_ONCE(isp_stream_dump))
++		dev_info(isp->dev, "T2H: pool %u idx %u planes %u addr %08x %08x flags %08x %08x\n",
++			 pool, i, e->nplanes, e->addr[0], e->addr[1], e->flags[0], e->flags[1]);
++	spin_lock(&st->frame_lock);
++	if (b->state != BUF_FW) {
++		st->errors++;
++		spin_unlock(&st->frame_lock);
++		dev_warn_ratelimited(isp->dev, "T2H: pool %u buffer %u returned twice (state %d)\n",
++				     pool, i, b->state);
++		return;
++	}
++	if (pool == ISP_POOL_META || !st->on || st->stopping) {
++		b->state = BUF_FREE;	/* meta, or a buffer handed back by CH_BUFFER_RETURN */
++		spin_unlock(&st->frame_lock);
++		return;
++	}
++	b->state = BUF_READY;
++	b->seq = st->seq++;
++	b->ts = ktime_get_ns();
++	b->fwflags = e->flags[0];
++	st->ready[st->nready++] = i;
++	st->frames++;
++	isp_frame_limit(st);
++	spin_unlock(&st->frame_lock);
++	if (READ_ONCE(isp_stream_dump))
++		dev_info(isp->dev, "frame seq %u: buffer %u, %u bytes, fw flags 0x%08x\n",
++			 b->seq, i, st->stride * st->height * 3 / 2, b->fwflags);
++	wake_up_interruptible(&st->wait);
++}
++
++/*
++ * BUF_T2H request (isp->lock held, from the ring service): walk the list, reply like
++ * the kext (0x845c744): word0 = list | 1 in list mode, else 1.
++ */
++u32 isp_bt_handle(struct t7000_isp *isp, u32 w0, u32 w1, u32 w2)
++{
++	struct isp_stream *st = &isp->st;
++	u32 rel = w0 & ~3U, n, i;
++	const struct isp_bl *bl;
++
++	st->t2h_msgs++;
++	if (!(w2 & ISP_H2T_LIST)) {
++		dev_warn_ratelimited(isp->dev, "T2H: single-buffer message %08x %08x %08x ignored\n",
++				     w0, w1, w2);
++		return 1;
++	}
++	bl = isp_translate(isp, rel, sizeof(*bl));
++	if (!bl) {
++		st->errors++;
++		dev_warn_ratelimited(isp->dev, "T2H: list fw-rel 0x%08x outside every surface\n", rel);
++		return rel | 1;
++	}
++	n = min_t(u32, bl->count, ISP_BUFLIST_MAX);	/* kext clamps to 8 */
++	if (bl->type == 4 || bl->type == 0 || bl->type > 2 ||
++	    !isp_translate(isp, rel, sizeof(*bl) + n * sizeof(bl->e[0]))) {
++		dev_info_ratelimited(isp->dev, "T2H: list type %u count %u (not a buffer return)\n",
++				     bl->type, bl->count);
++		return rel | 1;
++	}
++	if (READ_ONCE(isp_stream_dump))
++		dev_info(isp->dev, "T2H: list fw-rel 0x%08x type %u count %u w1 0x%x w2 0x%08x\n",
++			 rel, bl->type, bl->count, w1, w2);
++	for (i = 0; i < n; i++)
++		isp_t2h_entry(isp, &bl->e[i]);
++	return rel | 1;
++}
++
++/* ISP_IOC_RELEASE: userspace is done with buffer @index. isp->lock held. */
++void isp_stream_release(struct t7000_isp *isp, u32 index)
++{
++	struct isp_stream *st = &isp->st;
++
++	spin_lock(&st->frame_lock);
++	if (index < st->nbufs && st->buf[index].state == BUF_USER)
++		st->buf[index].state = BUF_FREE;
++	spin_unlock(&st->frame_lock);
++	isp_stream_kick(isp);
++}
++
++static bool isp_bufs_with_fw(struct isp_stream *st)
++{
++	bool any = false;
++	u32 i;
++
++	spin_lock(&st->frame_lock);
++	for (i = 0; i < st->nbufs; i++)
++		if (st->buf[i].state == BUF_FW || st->meta[i].state == BUF_FW)
++			any = true;
++	spin_unlock(&st->frame_lock);
++	return any;
++}
++
++/* ISP_IOC_STOP / close / teardown. isp->lock held. */
++void isp_stream_stop(struct t7000_isp *isp)
++{
++	struct isp_stream *st = &isp->st;
++	struct isp_cmd_ch c = { .chan = st->ch };
++	unsigned long end;
++	u32 i;
++
++	if (!st->on)
++		return;
++	st->stopping = true;
++	if (isp->io && !isp->io_dead) {
++		c.h.opcode = CISP_CMD_CH_STOP;
++		isp_cmd_simple(isp, "CH_STOP", &c, 0xc, 0xc, NULL);
++		c.h = (struct isp_cmd_hdr){ .opcode = CISP_CMD_CH_BUFFER_RETURN };
++		isp_cmd_simple(isp, "CH_BUFFER_RETURN", &c, 0xc, 0xc, NULL);
++		end = jiffies + msecs_to_jiffies(500);
++		while (isp_bufs_with_fw(st) && !isp->io_dead && time_before(jiffies, end)) {
++			isp_service(isp);
++			isp_dart_fault(isp);
++			usleep_range(1000, 2000);
++		}
++		if (isp_bufs_with_fw(st))
++			dev_warn(isp->dev, "stream stop: fw kept some buffers after 500 ms (they stay mapped until power-off)\n");
++	}
++	spin_lock(&st->frame_lock);
++	/* buffers the fw still holds stay BUF_FW: a late T2H frees them, START never reposts them */
++	for (i = 0; i < st->nbufs; i++) {
++		if (st->buf[i].state != BUF_FW)
++			st->buf[i].state = BUF_FREE;
++		if (st->meta[i].state != BUF_FW)
++			st->meta[i].state = BUF_FREE;
++	}
++	st->nready = 0;
++	st->on = false;
++	st->stopping = false;
++	spin_unlock(&st->frame_lock);
++	wake_up_interruptible(&st->wait);
++	dev_info(isp->dev, "stream stopped: %llu frame(s), %llu dropped, %llu recycled, %llu error(s)\n",
++		 st->frames, st->dropped, st->recycled, st->errors);
++}
+diff --git a/drivers/media/platform/apple/isp-t7000/isp.h b/drivers/media/platform/apple/isp-t7000/isp.h
+index 584f60880..4f92f63c8 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp.h
++++ b/drivers/media/platform/apple/isp-t7000/isp.h
+@@ -10,6 +10,7 @@
+ #ifndef __APPLE_ISP_T7000_H__
+ #define __APPLE_ISP_T7000_H__
+ 
++#include <linux/build_bug.h>
+ #include <linux/io.h>
+ #include <linux/list.h>
+ #include <linux/mutex.h>
+@@ -100,6 +101,75 @@ enum { CHAN_CMD = 0, CHAN_REPLY = 1, CHAN_REPORT = 2 };
+ #define CISP_CMD_PRINT_ENABLE	0x4
+ #define CISP_CMD_BUILDINFO	0x6
+ #define CISP_CMD_POWER_DOWN	0x10
++#define CISP_CMD_CH_START	0x100
++#define CISP_CMD_CH_STOP	0x101
++#define CISP_CMD_CH_BUFFER_RETURN	0x104
++#define CISP_CMD_CH_CAMERA_CONFIG_GET	0x106
++#define CISP_CMD_CH_CAMERA_CONFIG_SELECT 0x107
++#define CISP_CMD_CH_INFO_GET	0x10d
++#define CISP_CMD_CH_BUFFER_RECYCLE_MODE_SET 0x10e
++#define CISP_CMD_CH_BUFFER_RECYCLE_START 0x10f
++#define CISP_CMD_CH_SET_FILE_LOAD	0x111
++#define CISP_CMD_CH_SIF_PIXEL_FORMAT_SET 0x115
++#define CISP_CMD_CH_BUFFER_POOL_CONFIG_GET 0x116
++#define CISP_CMD_CH_BUFFER_POOL_CONFIG_SET 0x117
++#define CISP_CMD_CH_CROP_SET	0x801
++#define CISP_CMD_CH_OUTPUT_CONFIG_SET	0xb01
++#define CISP_CMD_CH_PREVIEW_STREAM_SET	0xb0d
++
++#define ISP_SENS_GPIOS		3	/* avdd, rear shutdown, front shutdown */
++#define ISP_MAX_BUFS		8
++#define ISP_POOL_META		0
++#define ISP_POOL_RENDERED	1
++#define ISP_BUFLIST_SLOT	0x200	/* one H2T list per BUF_H2T ring slot */
++#define ISP_BUFLIST_MAX		8	/* entries per list (kext clamps T2H lists to 8) */
++
++enum isp_buf_state { BUF_FREE, BUF_FW, BUF_READY, BUF_USER };
++
++struct isp_sbuf {
++	struct isp_surf *surf;
++	enum isp_buf_state state;
++	u32 seq;
++	u64 ts;
++	u32 fwflags;
++};
++
++struct isp_stream {
++	bool on, stopping;
++	u32 ch, sensor_id, preset, npresets;
++	u32 in_w, in_h, width, height, stride, bufsize, nbufs;
++	u32 meta_size;
++	char sensor_name[32];
++	struct isp_sbuf buf[ISP_MAX_BUFS];
++	struct isp_sbuf meta[ISP_MAX_BUFS];
++	struct isp_surf *lists;		/* ISP_BUFLIST_SLOT per BUF_H2T slot */
++	struct isp_surf *setf;		/* setfile copy for CH_SET_FILE_LOAD */
++	u32 seq;
++	/* frame queue (frame_lock): indices in completion order */
++	spinlock_t frame_lock;
++	wait_queue_head_t wait;
++	u32 ready[ISP_MAX_BUFS];
++	u32 nready;
++	/* debug counters (debugfs) */
++	u64 frames, dropped, recycled, errors, h2t_posts, h2t_busy, t2h_msgs;
++};
++
++struct dentry;
++
++/* CISP packet header: opcode u16 at +4, status u16 at +6 (A8 kext ISP_deInit) */
++struct isp_cmd_hdr {
++	u32 unk0;
++	u16 opcode;
++	u16 status;
++} __packed;
++static_assert(sizeof(struct isp_cmd_hdr) == 8);
++
++/* most per-channel commands: header + channel (+ args) */
++struct isp_cmd_ch {
++	struct isp_cmd_hdr h;
++	u32 chan;
++	u32 arg[5];
++} __packed;
+ 
+ struct isp_surf {
+ 	struct list_head list;
+@@ -167,12 +237,29 @@ struct t7000_isp {
+ 	char term_buf[ISP_TERM_LINES][ISP_TERM_MAX + 1];
+ 	unsigned int term_head, term_count;
+ 	unsigned long term_lines, term_shown, term_dropped;
++
++	/* sensor power (isp-sens.c) */
++	bool sens_on;
++	int gpio_base;
++	int gpio_on[ISP_SENS_GPIOS];	/* pin numbers we requested, 0 = none */
++	void __iomem *pinregs, *refclk;
++	u32 refclk_old[2], extclk_old[2];
++	unsigned int refclk_saved, extclk_saved;
++
++	/* streaming (isp-stream.c, isp-cdev.c) */
++	struct isp_stream st;
++	bool cdev_on;
++	int open_count;
++	struct dentry *dbg;
+ };
+ 
+ /* module parameters (isp-main.c) */
+ extern int isp_dry_run, isp_irq_en, isp_sens, isp_smmu_en, isp_graceful, isp_fwlog;
+ extern uint isp_fw_iova, isp_dart_sids, isp_platform_id, isp_poll_ms;
+ extern uint isp_boot_timeout_ms, isp_cmd_timeout_ms, isp_max_shared_mb;
++extern int isp_sens_pwr, isp_refclk, isp_extclk_periph, isp_stream_en, isp_stream_dump;
++extern int isp_keep_on, isp_preset;
++extern uint isp_refclk_cfg, isp_nbufs, isp_setfile_rear, isp_setfile_front;
+ 
+ static inline u32 isp_rd(struct t7000_isp *isp, u32 off)
+ {
+@@ -228,5 +315,26 @@ int isp_stage_start(struct t7000_isp *isp);
+ int isp_stage_query(struct t7000_isp *isp);
+ void isp_ipc_stop(struct t7000_isp *isp);
+ void isp_fw_shutdown(struct t7000_isp *isp);
++int isp_cmd_simple(struct t7000_isp *isp, const char *name, void *pkt,
++		   u32 insize, u32 outsize, u16 *status);
++
++/* isp-sens.c */
++int isp_sensor_power_on(struct t7000_isp *isp);
++void isp_sensor_power_off(struct t7000_isp *isp);
++
++/* isp-stream.c */
++u32 isp_bt_handle(struct t7000_isp *isp, u32 w0, u32 w1, u32 w2);
++int isp_stream_start(struct t7000_isp *isp, u32 camera);
++void isp_stream_stop(struct t7000_isp *isp);
++void isp_stream_release(struct t7000_isp *isp, u32 index);
++void isp_stream_kick(struct t7000_isp *isp);
++
++/* isp-cdev.c */
++int isp_cdev_init(struct t7000_isp *isp);
++void isp_cdev_exit(struct t7000_isp *isp);
++
++/* isp-main.c */
++int isp_boot(struct t7000_isp *isp, int upto);
++void isp_teardown(struct t7000_isp *isp);
+ 
+ #endif
+diff --git a/include/uapi/linux/apple-isp-t7000.h b/include/uapi/linux/apple-isp-t7000.h
+new file mode 100644
+index 000000000..4de9da48d
+--- /dev/null
++++ b/include/uapi/linux/apple-isp-t7000.h
+@@ -0,0 +1,51 @@
++/* SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note */
++/*
++ * Apple A8 (T7000) ISP test driver: /dev/isp0 streaming interface (v1, no V4L2).
++ *
++ *   fd = open("/dev/isp0", O_RDWR);          boots the ISP if it is off
++ *   ioctl(fd, ISP_IOC_START, &camera);       0 = rear, 1 = front; picks the preset
++ *   ioctl(fd, ISP_IOC_INFO, &info);          width/height/stride/nbufs/bufsize (valid after START)
++ *   p = mmap(NULL, nbufs * bufsize, PROT_READ, MAP_SHARED, fd, 0);
++ *   read(fd, &frame, sizeof(frame));         blocks (poll POLLIN) until the next frame
++ *   ... use p + frame.index * bufsize ...    NV12: Y at 0, UV at stride * height
++ *   ioctl(fd, ISP_IOC_RELEASE, &frame.index);
++ *   ioctl(fd, ISP_IOC_STOP);  close(fd);     last close powers the sensor/ISP down (keep_on=0)
++ *
++ * Userspace may hold at most nbufs - 1 buffers; beyond that the driver recycles the
++ * oldest one it handed out.
++ */
++#ifndef _UAPI_LINUX_APPLE_ISP_T7000_H
++#define _UAPI_LINUX_APPLE_ISP_T7000_H
++
++#include <linux/ioctl.h>
++#include <linux/types.h>
++
++#define ISP_INFO_VERSION	1
++
++struct isp_info {
++	__u32 version;		/* ISP_INFO_VERSION */
++	__u32 width;
++	__u32 height;
++	__u32 stride;		/* Y and UV stride, width rounded up to 64 */
++	__u32 nbufs;
++	__u32 bufsize;		/* page aligned; buffer i at mmap offset i * bufsize */
++	__u32 sensor_id;	/* 0x237 rear IMX237, 0x190 front IMX190, 0 = not streaming */
++	char sensor_name[32];
++};
++
++#define ISP_FRAME_FLAG_NOT_FILLED	0x1	/* fw did not mark plane 0 filled (data may be stale) */
++
++struct isp_frame {
++	__u32 index;		/* buffer index */
++	__u32 seq;		/* frame counter since START */
++	__u64 timestamp_ns;	/* CLOCK_MONOTONIC when the driver got it */
++	__u32 bytesused;	/* stride * height * 3 / 2 */
++	__u32 flags;		/* ISP_FRAME_FLAG_* */
++};
++
++#define ISP_IOC_INFO		_IOR('I', 1, struct isp_info)
++#define ISP_IOC_START		_IOW('I', 2, __u32)
++#define ISP_IOC_STOP		_IO('I', 3)
++#define ISP_IOC_RELEASE		_IOW('I', 4, __u32)
++
++#endif /* _UAPI_LINUX_APPLE_ISP_T7000_H */

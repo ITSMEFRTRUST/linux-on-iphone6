@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 00:29:27 +0000
+Subject: [PATCH 030/138] arm64: dts: apple: t7000: Add the touch clock and
+ PMIC LDO15
+
+Add the TOUCH_CTL clock under the PMGR and the touch controller's LDO15
+switch under the PMIC of the A8 iPhones.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ arch/arm64/boot/dts/apple/t7000-6.dtsi | 6 ++++++
+ arch/arm64/boot/dts/apple/t7000.dtsi   | 7 +++++++
+ 2 files changed, 13 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/apple/t7000-6.dtsi b/arch/arm64/boot/dts/apple/t7000-6.dtsi
+index d806865ae..e35afa663 100644
+--- a/arch/arm64/boot/dts/apple/t7000-6.dtsi
++++ b/arch/arm64/boot/dts/apple/t7000-6.dtsi
+@@ -66,6 +66,12 @@ pmic@74 {
+ 		#address-cells = <1>;
+ 		#size-cells = <1>;
+ 
++		/* Enable bit 1 of reg 0x85: touch controller VDD */
++		pmic_ldo15: ldo15@85 {
++			compatible = "apple,adi-pmic-ldo15";
++			reg = <0x85 0x1>;
++		};
++
+ 		rtc@5c0 {
+ 			compatible = "apple,adi-pmic-rtc", "apple,amber-pmic-rtc";
+ 			reg = <0x5c0 0x10>;
+diff --git a/arch/arm64/boot/dts/apple/t7000.dtsi b/arch/arm64/boot/dts/apple/t7000.dtsi
+index ec40f9858..2116a99a5 100644
+--- a/arch/arm64/boot/dts/apple/t7000.dtsi
++++ b/arch/arm64/boot/dts/apple/t7000.dtsi
+@@ -371,6 +371,13 @@ pmgr: power-management@20e000000 {
+ 			#size-cells = <1>;
+ 
+ 			reg = <0x2 0xe000000 0 0x24000>;
++
++			touch_clk: clock-controller@1e000 {
++				compatible = "apple,t7000-touch-clk";
++				reg = <0x1e000 0x4>;
++				clocks = <&clkref>;
++				#clock-cells = <0>;
++			};
+ 		};
+ 
+ 		wdt: watchdog@20e027000 {

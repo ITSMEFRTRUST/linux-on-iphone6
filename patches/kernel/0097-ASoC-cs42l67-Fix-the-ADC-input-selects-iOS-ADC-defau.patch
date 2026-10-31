@@ -1,0 +1,420 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 01:57:23 +0000
+Subject: [PATCH 097/138] ASoC: cs42l67: Fix the ADC input selects, iOS ADC
+ defaults
+
+The ADC2 mics (front and rear) recorded nothing on n61. The driver took
+AppleCS42L67Audio's analog input table to be ain1..ain11 in order, but
+the kext's name table (0x...7624af0) is ain1, ain3, ain4, ain5, ain6,
+ain7, ain8, dmic1a, dmic1b, dmic2a, dmic2b: there is no ain2 (the
+headset mic). Decoding the route function's two jump tables with that
+order gives
+
+  ADC1A: AIN1 = 0, AIN3 = 2    ADC1B: AIN2 (headset) = 1, AIN4 = 3
+  ADC2A: AIN5 = 0, AIN7 = 2    ADC2B: AIN6 = 1, AIN8 = 3
+
+i.e. select = (AINn - 1) % 4, ADC pair 1 = AIN1-4, pair 2 = AIN5-8. So
+n61's rear mic (ADT ain5, MICBIAS4) is ADC2A select 0 and the front mic
+(ain6, MICBIAS3) is ADC2B select 1. The old "ADC2A Mux = AIN6" (select 2)
+picked the unused AIN7, and the old "ADC2B Mux = AIN5" (select 1) picked
+the front mic while DAPM biased the rear one. ADC1A = AIN1 (bottom mic)
+was right by luck. Rename the mux items to the real pins and add AIN8.
+
+Also, as iOS does:
+- write the boost bit (bit7 of 0x208/0x209/0x21c/0x21d, iOS ctl 0x16f,
+  default on) at power-up;
+- write 0x234/0x235 = 0x80 (not 0xf0) while an ADC pair is in use;
+- add "ADCxx Capture Volume" with iOS' encoding of its ctl 0x170
+  (0..76 = -6..+32 dB in 0.5 dB, fine gain in [5:0], two stages in
+  bit6/bit7); "Gain Raw" now covers the whole byte. The default stays
+  iOS' -6 dB (0x34).
+
+Default the input selects to the n61 mic map and ASP TX2 to ADC2A
+(rear). DAPM reads mux state from the chip when it adds the routes,
+which happened before the power-up reset changed it, so cold-start the
+chip in the component probe instead; set_bias_level() then finds it up.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ sound/soc/codecs/cs42l67.c | 205 +++++++++++++++++++++++++++++++------
+ 1 file changed, 172 insertions(+), 33 deletions(-)
+
+diff --git a/sound/soc/codecs/cs42l67.c b/sound/soc/codecs/cs42l67.c
+index bee0192cc..cfa77423d 100644
+--- a/sound/soc/codecs/cs42l67.c
++++ b/sound/soc/codecs/cs42l67.c
+@@ -11,6 +11,15 @@
+  * Supported: the XSP serial port as a TDM slave (the MCA is the clock
+  * master), capture from the analog microphones through the two ADC pairs,
+  * an experimental mono headphone path, and an optional polled jack status.
++ *
++ * Analog inputs: each ADC pair owns four pins, and an ADC's 2-bit input
++ * select is (AINn - 1) % 4. iOS gives the A channel the odd pins and the B
++ * channel the even ones (AppleCS42L67Audio's input table is ain1, ain3, ain4,
++ * ain5, ain6, ain7, ain8, dmic1a..dmic2b; ain2 is the headset mic):
++ *   ADC1A: AIN1 = 0, AIN3 = 2    ADC1B: AIN2 (headset) = 1, AIN4 = 3
++ *   ADC2A: AIN5 = 0, AIN7 = 2    ADC2B: AIN6 = 1, AIN8 = 3
++ * n61: AIN1 = bottom mic (MICBIAS1), AIN5 = rear (MICBIAS4), AIN6 = front
++ * (MICBIAS3), so the rear mic is ADC2A and the front mic ADC2B.
+  */
+ 
+ #include <linux/bitfield.h>
+@@ -27,6 +36,7 @@
+ #include <sound/pcm_params.h>
+ #include <sound/soc.h>
+ #include <sound/soc-dapm.h>
++#include <sound/tlv.h>
+ 
+ /* Registers are page:reg, 128 per page; the SPI frame carries both bytes */
+ #define CS42L67_DEVID_AB	0x001	/* 0x42 */
+@@ -79,10 +89,13 @@
+ #define CS42L67_ADC1_PDN	0x203	/* bit7 ADC1B, bit6 ADC1A, bit2 DMIC1 */
+ #define CS42L67_ADC1_DMIC	0x204
+ #define CS42L67_ADC1_MUX	0x205	/* [5:4] ADC1A input, [7:6] ADC1B input */
++#define  ADC_MUX_A_SHIFT	4
++#define  ADC_MUX_B_SHIFT	6
+ #define CS42L67_ADC1A_GAIN	0x206
+ #define CS42L67_ADC1B_GAIN	0x207
+ #define CS42L67_ADC1A_BOOST	0x208
+ #define CS42L67_ADC1B_BOOST	0x209
++#define  ADC_BOOST		BIT(7)	/* iOS ctl 0x16f, default on; meaning unknown */
+ #define CS42L67_ADC2_PDN	0x217	/* bit7 ADC2B, bit6 ADC2A, bit2 DMIC2 */
+ #define CS42L67_ADC2_DMIC	0x218
+ #define CS42L67_ADC2_MUX	0x219	/* [5:4] ADC2A input, [7:6] ADC2B input */
+@@ -91,9 +104,17 @@
+ #define CS42L67_ADC2A_BOOST	0x21c
+ #define CS42L67_ADC2B_BOOST	0x21d
+ #define  ADC_PDN_IDLE		0xc6	/* iOS' starting value */
+-#define  ADC_GAIN_0		0x34	/* what iOS writes for gain setting 0 */
++/*
++ * ADC PGA (0x206/0x207/0x21a/0x21b) as iOS drives it from its ctl 0x170,
++ * which it declares as 0..76 = -6 dB .. +32 dB in 0.5 dB steps: [5:0] =
++ * signed fine gain in 0.5 dB (0x34 = -6 dB), bit6 / bit7 = two fixed stages
++ * that the encoding only makes continuous at +10 / +20 dB.
++ */
++#define  ADC_VOL_MAX		76
++#define  ADC_VOL_DEFAULT	0	/* iOS ctl 0x170 default: -6 dB = 0x34 */
+ #define CS42L67_ADC1_EN		0x234	/* iOS: 0x80 while an ADC1 channel is on */
+ #define CS42L67_ADC2_EN		0x235	/* iOS: 0x80 while an ADC2 channel is on */
++#define  ADC_EN_SHIFT		4	/* [7:4]: 0x8 on (iOS), 0x7 = reset value */
+ #define CS42L67_ANA_239		0x239
+ #define CS42L67_OUT_PDN1	0x242
+ #define  OUT_PDN_A		BIT(5)
+@@ -131,6 +152,10 @@
+ #define SRC_ADC2A		5
+ #define SRC_ADC2B		6
+ 
++/* ASP TX channel source codes (0x103 / 0x108 [6:5]) */
++#define ASP_SRC_ADC1A		(0 << 5)
++#define ASP_SRC_ADC2A		(2 << 5)
++
+ static bool allow_missing = true;
+ module_param(allow_missing, bool, 0444);
+ MODULE_PARM_DESC(allow_missing,
+@@ -149,6 +174,7 @@ struct cs42l67 {
+ 	unsigned int tx_slot;		/* first TDM slot of XSP TX channel 0 */
+ 	unsigned int rx_slot;		/* TDM slot XSP RX channel 0 listens to */
+ 	bool inert;
++	bool powered;
+ 
+ 	struct snd_soc_jack jack;
+ 	struct delayed_work jack_work;
+@@ -228,6 +254,36 @@ static const struct regmap_config cs42l67_regmap = {
+ 	.cache_type = REGCACHE_NONE,
+ };
+ 
++static const unsigned int cs42l67_adc_gain_regs[] = {
++	CS42L67_ADC1A_GAIN, CS42L67_ADC1B_GAIN, CS42L67_ADC2A_GAIN, CS42L67_ADC2B_GAIN,
++};
++
++/* iOS' PGA encoding (route fn 0x…86ec1dc, decomp ~l.1427-1438) */
++static unsigned int cs42l67_adc_vol_to_reg(unsigned int vol)
++{
++	unsigned int stage = 0;
++
++	if (vol >= 0x34) {
++		stage = 0x80;
++		vol -= 0x28;
++	} else if (vol >= 0x20) {
++		stage = 0x40;
++		vol -= 0x14;
++	}
++	return ((vol + 0x34) & 0x3f) | stage;
++}
++
++static unsigned int cs42l67_reg_to_adc_vol(unsigned int val)
++{
++	int vol = sign_extend32(val & 0x3f, 5) + 12;
++
++	if (val & 0x80)
++		vol += 40;
++	else if (val & 0x40)
++		vol += 20;
++	return clamp(vol, 0, ADC_VOL_MAX);
++}
++
+ /* ---- power sequencing (AppleCS42L67Audio enable 0x…86ebf04 / disable 0x…86ee3b8) ---- */
+ 
+ static int cs42l67_power_up(struct cs42l67 *cs)
+@@ -236,6 +292,9 @@ static int cs42l67_power_up(struct cs42l67 *cs)
+ 	unsigned int rev, i;
+ 	int ret;
+ 
++	if (cs->powered)
++		return 0;
++
+ 	ret = clk_prepare_enable(cs->mclk);
+ 	if (ret)
+ 		return ret;
+@@ -278,15 +337,28 @@ static int cs42l67_power_up(struct cs42l67 *cs)
+ 	regmap_write(map, CS42L67_ADC1_DMIC, 0);
+ 	regmap_write(map, CS42L67_ADC2_PDN, ADC_PDN_IDLE);
+ 	regmap_write(map, CS42L67_ADC2_DMIC, 0);
+-	regmap_write(map, CS42L67_ADC1A_GAIN, ADC_GAIN_0);
+-	regmap_write(map, CS42L67_ADC1B_GAIN, ADC_GAIN_0);
+-	regmap_write(map, CS42L67_ADC2A_GAIN, ADC_GAIN_0);
+-	regmap_write(map, CS42L67_ADC2B_GAIN, ADC_GAIN_0);
++	/* iOS defaults: PGA ctl 0x170 = 0, ctl 0x16f ("boost") = 1 */
++	for (i = 0; i < ARRAY_SIZE(cs42l67_adc_gain_regs); i++) {
++		regmap_write(map, cs42l67_adc_gain_regs[i],
++			     cs42l67_adc_vol_to_reg(ADC_VOL_DEFAULT));
++		regmap_write(map, cs42l67_adc_gain_regs[i] + 2, ADC_BOOST);
++	}
++	/*
++	 * The n61 mic map as default input selects (item 0 of every mux):
++	 * ADC1A = AIN1 (bottom), ADC1B = AIN2 (headset), ADC2A = AIN5 (rear),
++	 * ADC2B = AIN6 (front). Written before DAPM reads the muxes (see
++	 * cs42l67_component_probe), so its view matches the chip.
++	 */
++	regmap_write(map, CS42L67_ADC1_MUX, 0 << ADC_MUX_A_SHIFT | 1 << ADC_MUX_B_SHIFT);
++	regmap_write(map, CS42L67_ADC2_MUX, 0 << ADC_MUX_A_SHIFT | 1 << ADC_MUX_B_SHIFT);
+ 	regmap_write(map, CS42L67_DSP_PDN, 0x4c);
+-	/* both ASP TX channels unused, as iOS' route function leaves them */
++	/*
++	 * Both ASP TX channels unused, as iOS' route function leaves them;
++	 * the sources default to TX1 = ADC1A (bottom), TX2 = ADC2A (rear)
++	 */
+ 	regmap_write(map, CS42L67_ASP_MISC, 0);
+ 	for (i = 0; i < 2; i++) {
+-		regmap_write(map, CS42L67_ASP_TX(i, 0), 0);
++		regmap_write(map, CS42L67_ASP_TX(i, 0), i ? ASP_SRC_ADC2A : ASP_SRC_ADC1A);
+ 		regmap_write(map, CS42L67_ASP_TX(i, 1), 0x3f);
+ 		regmap_write(map, CS42L67_ASP_TX(i, 2), 0x3f | i << 6);
+ 		regmap_write(map, CS42L67_ASP_TX(i, 3), 0x3f | i << 6);
+@@ -304,6 +376,7 @@ static int cs42l67_power_up(struct cs42l67 *cs)
+ 	regmap_write(map, CS42L67_OUT_PDN2, 0x60);
+ 	regmap_update_bits(map, CS42L67_OUT_CTL, OUT_CTL_IDLE, OUT_CTL_IDLE);
+ 
++	cs->powered = true;
+ 	dev_dbg(cs->dev, "powered up, rev %#x\n", rev);
+ 	return 0;
+ }
+@@ -314,6 +387,9 @@ static void cs42l67_power_down(struct cs42l67 *cs)
+ 	unsigned int val;
+ 	int ret;
+ 
++	if (!cs->powered)
++		return;
++
+ 	regmap_write(map, CS42L67_OUTA_VOL, OUT_VOL_MUTE);
+ 	regmap_write(map, CS42L67_OUTA_VOL_R, OUT_VOL_MUTE);
+ 	regmap_write(map, CS42L67_OUTB_VOL, OUT_VOL_MUTE);
+@@ -336,6 +412,7 @@ static void cs42l67_power_down(struct cs42l67 *cs)
+ 	usleep_range(10000, 11000);
+ 	regmap_write(map, CS42L67_RESET, RESET_HOLD);
+ 	clk_disable_unprepare(cs->mclk);
++	cs->powered = false;
+ }
+ 
+ static int cs42l67_set_bias_level(struct snd_soc_component *component,
+@@ -385,6 +462,11 @@ static int cs42l67_micbias_event(struct snd_soc_dapm_widget *w,
+ 	.shift = wshift, .mask = 0, .event = cs42l67_micbias_event, \
+ 	.event_flags = SND_SOC_DAPM_POST_PMU | SND_SOC_DAPM_PRE_PMD, }
+ 
++/* 0x234 / 0x235: iOS writes the whole byte, 0x80, while the pair is in use */
++#define CS42L67_ADC_EN(wname, wreg) \
++{	.id = snd_soc_dapm_supply, .name = wname, .reg = wreg, \
++	.shift = ADC_EN_SHIFT, .mask = 0xf, .on_val = 0x8, .off_val = 0x7, }
++
+ static int cs42l67_out_event(struct snd_soc_dapm_widget *w,
+ 			     struct snd_kcontrol *kcontrol, int event)
+ {
+@@ -418,23 +500,26 @@ static int cs42l67_asp_tx_event(struct snd_soc_dapm_widget *w,
+ 	return 0;
+ }
+ 
+-/* ADC input muxes: values are what iOS writes for each ADT "ainN" input */
+-static const char * const adc1a_texts[] = { "AIN1", "AIN2" };
++/*
++ * ADC input muxes: the values iOS writes for each ADT "ainN" input (see the
++ * table at the top). Item 0 of each is the n61 default.
++ */
++static const char * const adc1a_texts[] = { "AIN1", "AIN3" };
+ static const unsigned int adc1a_values[] = { 0, 2 };
+-static const char * const adc1b_texts[] = { "HSMIC", "AIN3" };
++static const char * const adc1b_texts[] = { "HSMIC", "AIN4" };
+ static const unsigned int adc1b_values[] = { 1, 3 };
+-static const char * const adc2a_texts[] = { "AIN4", "AIN6" };
++static const char * const adc2a_texts[] = { "AIN5", "AIN7" };
+ static const unsigned int adc2a_values[] = { 0, 2 };
+-static const char * const adc2b_texts[] = { "AIN5", "AIN7" };
++static const char * const adc2b_texts[] = { "AIN6", "AIN8" };
+ static const unsigned int adc2b_values[] = { 1, 3 };
+ 
+-static SOC_VALUE_ENUM_SINGLE_DECL(adc1a_enum, CS42L67_ADC1_MUX, 4, 3,
++static SOC_VALUE_ENUM_SINGLE_DECL(adc1a_enum, CS42L67_ADC1_MUX, ADC_MUX_A_SHIFT, 3,
+ 				  adc1a_texts, adc1a_values);
+-static SOC_VALUE_ENUM_SINGLE_DECL(adc1b_enum, CS42L67_ADC1_MUX, 6, 3,
++static SOC_VALUE_ENUM_SINGLE_DECL(adc1b_enum, CS42L67_ADC1_MUX, ADC_MUX_B_SHIFT, 3,
+ 				  adc1b_texts, adc1b_values);
+-static SOC_VALUE_ENUM_SINGLE_DECL(adc2a_enum, CS42L67_ADC2_MUX, 4, 3,
++static SOC_VALUE_ENUM_SINGLE_DECL(adc2a_enum, CS42L67_ADC2_MUX, ADC_MUX_A_SHIFT, 3,
+ 				  adc2a_texts, adc2a_values);
+-static SOC_VALUE_ENUM_SINGLE_DECL(adc2b_enum, CS42L67_ADC2_MUX, 6, 3,
++static SOC_VALUE_ENUM_SINGLE_DECL(adc2b_enum, CS42L67_ADC2_MUX, ADC_MUX_B_SHIFT, 3,
+ 				  adc2b_texts, adc2b_values);
+ 
+ static const struct snd_kcontrol_new adc1a_mux = SOC_DAPM_ENUM("ADC1A Input", adc1a_enum);
+@@ -465,13 +550,13 @@ XSP_TX_ENUM(4);
+ 
+ static const struct snd_soc_dapm_widget cs42l67_widgets[] = {
+ 	SND_SOC_DAPM_INPUT("AIN1"),
+-	SND_SOC_DAPM_INPUT("AIN2"),
+ 	SND_SOC_DAPM_INPUT("AIN3"),
+ 	SND_SOC_DAPM_INPUT("AIN4"),
+ 	SND_SOC_DAPM_INPUT("AIN5"),
+ 	SND_SOC_DAPM_INPUT("AIN6"),
+ 	SND_SOC_DAPM_INPUT("AIN7"),
+-	SND_SOC_DAPM_INPUT("HSMIC"),
++	SND_SOC_DAPM_INPUT("AIN8"),
++	SND_SOC_DAPM_INPUT("HSMIC"),	/* AIN2 */
+ 
+ 	CS42L67_MICBIAS("MICBIAS1", CS42L67_MICBIAS1, 0),
+ 	CS42L67_MICBIAS("MICBIAS3", CS42L67_MICBIAS34, 0),
+@@ -495,8 +580,8 @@ static const struct snd_soc_dapm_widget cs42l67_widgets[] = {
+ 	SND_SOC_DAPM_AIF_OUT("XSP TX", "XSP Capture", 0, CS42L67_XSP_CTL, 6, 1),
+ 
+ 	/* the mic path iOS uses: ASP (I2S to MCA0), 2 channels */
+-	SND_SOC_DAPM_SUPPLY("ADC1 Enable", CS42L67_ADC1_EN, 7, 0, NULL, 0),
+-	SND_SOC_DAPM_SUPPLY("ADC2 Enable", CS42L67_ADC2_EN, 7, 0, NULL, 0),
++	CS42L67_ADC_EN("ADC1 Enable", CS42L67_ADC1_EN),
++	CS42L67_ADC_EN("ADC2 Enable", CS42L67_ADC2_EN),
+ 	SND_SOC_DAPM_MUX("ASP TX1 Mux", SND_SOC_NOPM, 0, 0, &asp_tx1_mux),
+ 	SND_SOC_DAPM_MUX("ASP TX2 Mux", SND_SOC_NOPM, 0, 0, &asp_tx2_mux),
+ 	SND_SOC_DAPM_PGA_E("ASP TX1 Path", SND_SOC_NOPM, 0, 0, NULL, 0,
+@@ -519,13 +604,13 @@ static const struct snd_soc_dapm_widget cs42l67_widgets[] = {
+ 
+ static const struct snd_soc_dapm_route cs42l67_routes[] = {
+ 	{ "ADC1A Mux", "AIN1", "AIN1" },
+-	{ "ADC1A Mux", "AIN2", "AIN2" },
++	{ "ADC1A Mux", "AIN3", "AIN3" },
+ 	{ "ADC1B Mux", "HSMIC", "HSMIC" },
+-	{ "ADC1B Mux", "AIN3", "AIN3" },
+-	{ "ADC2A Mux", "AIN4", "AIN4" },
+-	{ "ADC2A Mux", "AIN6", "AIN6" },
+-	{ "ADC2B Mux", "AIN5", "AIN5" },
+-	{ "ADC2B Mux", "AIN7", "AIN7" },
++	{ "ADC1B Mux", "AIN4", "AIN4" },
++	{ "ADC2A Mux", "AIN5", "AIN5" },
++	{ "ADC2A Mux", "AIN7", "AIN7" },
++	{ "ADC2B Mux", "AIN6", "AIN6" },
++	{ "ADC2B Mux", "AIN8", "AIN8" },
+ 
+ 	{ "ADC1A", NULL, "ADC1A Mux" },
+ 	{ "ADC1B", NULL, "ADC1B Mux" },
+@@ -580,12 +665,47 @@ static const struct snd_soc_dapm_route cs42l67_routes[] = {
+ 	{ "HPOUT", NULL, "OUTA" },
+ };
+ 
+-/* raw values: the dB scale of these fields is not known yet */
++static int cs42l67_adc_vol_get(struct snd_kcontrol *kcontrol,
++			       struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
++	struct soc_mixer_control *mc = (struct soc_mixer_control *)kcontrol->private_value;
++
++	ucontrol->value.integer.value[0] =
++		cs42l67_reg_to_adc_vol(snd_soc_component_read(component, mc->reg));
++	return 0;
++}
++
++static int cs42l67_adc_vol_put(struct snd_kcontrol *kcontrol,
++			       struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
++	struct soc_mixer_control *mc = (struct soc_mixer_control *)kcontrol->private_value;
++	long vol = ucontrol->value.integer.value[0];
++
++	if (vol < 0 || vol > ADC_VOL_MAX)
++		return -EINVAL;
++	return snd_soc_component_update_bits(component, mc->reg, 0xff,
++					     cs42l67_adc_vol_to_reg(vol));
++}
++
++/* iOS' declared scale for ctl 0x170; the two stage steps are inferred */
++static const DECLARE_TLV_DB_SCALE(adc_vol_tlv, -600, 50, 0);
++
++#define CS42L67_ADC_VOL(xname, xreg) \
++	SOC_SINGLE_EXT_TLV(xname, xreg, 0, ADC_VOL_MAX, 0, \
++			   cs42l67_adc_vol_get, cs42l67_adc_vol_put, adc_vol_tlv)
++
+ static const struct snd_kcontrol_new cs42l67_controls[] = {
+-	SOC_SINGLE("ADC1A Gain Raw", CS42L67_ADC1A_GAIN, 0, 0x3f, 0),
+-	SOC_SINGLE("ADC1B Gain Raw", CS42L67_ADC1B_GAIN, 0, 0x3f, 0),
+-	SOC_SINGLE("ADC2A Gain Raw", CS42L67_ADC2A_GAIN, 0, 0x3f, 0),
+-	SOC_SINGLE("ADC2B Gain Raw", CS42L67_ADC2B_GAIN, 0, 0x3f, 0),
++	CS42L67_ADC_VOL("ADC1A Capture Volume", CS42L67_ADC1A_GAIN),
++	CS42L67_ADC_VOL("ADC1B Capture Volume", CS42L67_ADC1B_GAIN),
++	CS42L67_ADC_VOL("ADC2A Capture Volume", CS42L67_ADC2A_GAIN),
++	CS42L67_ADC_VOL("ADC2B Capture Volume", CS42L67_ADC2B_GAIN),
++	/* the whole PGA byte: [5:0] fine gain, bit6/bit7 the stages */
++	SOC_SINGLE("ADC1A Gain Raw", CS42L67_ADC1A_GAIN, 0, 0xff, 0),
++	SOC_SINGLE("ADC1B Gain Raw", CS42L67_ADC1B_GAIN, 0, 0xff, 0),
++	SOC_SINGLE("ADC2A Gain Raw", CS42L67_ADC2A_GAIN, 0, 0xff, 0),
++	SOC_SINGLE("ADC2B Gain Raw", CS42L67_ADC2B_GAIN, 0, 0xff, 0),
+ 	SOC_SINGLE("ADC1A Boost Switch", CS42L67_ADC1A_BOOST, 7, 1, 0),
+ 	SOC_SINGLE("ADC1B Boost Switch", CS42L67_ADC1B_BOOST, 7, 1, 0),
+ 	SOC_SINGLE("ADC2A Boost Switch", CS42L67_ADC2A_BOOST, 7, 1, 0),
+@@ -732,13 +852,29 @@ static int cs42l67_component_probe(struct snd_soc_component *component)
+ 	int ret;
+ 
+ 	cs->component = component;
+-	if (cs->inert || !jack_poll)
++	if (cs->inert)
++		return 0;
++
++	/*
++	 * Cold-start the chip now, before the core adds the routes: DAPM
++	 * reads the input/source muxes from the chip once, when it adds them,
++	 * and the power-up reset would otherwise change them behind its back.
++	 * set_bias_level() then finds the chip already up.
++	 */
++	ret = cs42l67_power_up(cs);
++	if (ret)
++		return ret;
++
++	if (!jack_poll)
+ 		return 0;
+ 
+ 	ret = snd_soc_card_jack_new(component->card, "Headphone Jack",
+ 				    SND_JACK_HEADPHONE, &cs->jack);
+-	if (ret)
++	if (ret) {
++		/* a failed probe gets no remove() */
++		cs42l67_power_down(cs);
+ 		return ret;
++	}
+ 	INIT_DELAYED_WORK(&cs->jack_work, cs42l67_jack_work);
+ 	schedule_delayed_work(&cs->jack_work, msecs_to_jiffies(500));
+ 	return 0;
+@@ -750,6 +886,9 @@ static void cs42l67_component_remove(struct snd_soc_component *component)
+ 
+ 	if (!cs->inert && jack_poll)
+ 		cancel_delayed_work_sync(&cs->jack_work);
++	/* normally already done by the card's BIAS_OFF */
++	if (!cs->inert)
++		cs42l67_power_down(cs);
+ }
+ 
+ static const struct snd_soc_component_driver cs42l67_component = {

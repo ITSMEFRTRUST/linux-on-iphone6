@@ -1,0 +1,93 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 20:37:15 +0000
+Subject: [PATCH 080/138] wifi: brcmfmac: pcie: Keep the function in D0 across
+ system suspend
+
+LOCAL (Hoolock, T7000). The mainline suspend path sends D3_INFORM and
+lets the PCI core put the BCM4345 into D3hot, which moves the link into
+PCI-PM L1 and needs a config write to come back. The n61 root port runs
+with ASPM off because iOS cannot touch config space in L1/L2
+(acpie-l1ss-workaround); whether this root complex survives the D3hot
+round trip is unknown, and a bus hang there means DFU.
+
+By default, stay in D0: stop the console timer and save the config
+space. A saved state keeps the PCI core from changing the power state of
+the function and, through skip_bus_pm, of the root port, so the link
+never leaves L0; on suspend-to-idle the noirq power-up is skipped and
+pci_pm_resume() only writes the saved config back, still in L0.
+cfg80211 has already disassociated and enabled MPC by then, so the
+radio is off either way. Resume just restarts the console timer.
+
+brcmfmac.pcie_d3=1 (0644) selects the original D3 handshake.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../broadcom/brcm80211/brcmfmac/pcie.c        | 33 +++++++++++++++++++
+ 1 file changed, 33 insertions(+)
+
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
+index fb2e8d680..e47e11b51 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
+@@ -365,6 +365,7 @@ struct brcmf_pciedev_info {
+ 	bool console_active;
+ 	struct timer_list timer;
+ #endif
++	bool kept_d0;
+ };
+ 
+ struct brcmf_pcie_ringbuf {
+@@ -2654,6 +2655,18 @@ brcmf_pcie_remove(struct pci_dev *pdev)
+ #ifdef CONFIG_PM
+ 
+ 
++/*
++ * LOCAL (Hoolock, T7000): by default the function stays in D0 across system
++ * suspend. The n61 root port runs without ASPM because iOS cannot touch config
++ * space while the link is in L1/L2 (acpie-l1ss-workaround), and D3hot puts the
++ * link into PCI-PM L1 with a config write on the way out. cfg80211 already
++ * disassociates and enables MPC before this runs, so the radio is off either
++ * way. pcie_d3=1 restores the D3 handshake (D3_INFORM + PCI core D3hot).
++ */
++static bool brcmf_pcie_d3;
++module_param_named(pcie_d3, brcmf_pcie_d3, bool, 0644);
++MODULE_PARM_DESC(pcie_d3, "Put the PCIe function into D3 on system suspend (default: keep it in D0)");
++
+ static int brcmf_pcie_pm_enter_D3(struct device *dev)
+ {
+ 	struct brcmf_pciedev_info *devinfo;
+@@ -2665,6 +2678,20 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev)
+ 	devinfo = bus->bus_priv.pcie->devinfo;
+ 
+ 	brcmf_pcie_fwcon_timer(devinfo, false);
++
++	devinfo->kept_d0 = !READ_ONCE(brcmf_pcie_d3);
++	if (devinfo->kept_d0) {
++		/*
++		 * Firmware and link stay as they are. With the config space
++		 * saved here the PCI core leaves this function and the root
++		 * port in D0 (no D3hot, so the link stays in L0); on resume
++		 * it only writes the saved config back, still in L0.
++		 */
++		pci_save_state(devinfo->pdev);
++		brcmf_dbg(PCIE, "staying in D0\n");
++		return 0;
++	}
++
+ 	brcmf_bus_change_state(bus, BRCMF_BUS_DOWN);
+ 
+ 	devinfo->mbdata_completed = false;
+@@ -2697,6 +2724,12 @@ static int brcmf_pcie_pm_leave_D3(struct device *dev)
+ 	devinfo = bus->bus_priv.pcie->devinfo;
+ 	brcmf_dbg(PCIE, "Enter, dev=%p, bus=%p\n", dev, bus);
+ 
++	if (devinfo->kept_d0) {
++		devinfo->kept_d0 = false;
++		brcmf_pcie_fwcon_timer(devinfo, true);
++		return 0;
++	}
++
+ 	/* Check if device is still up and running, if so we are ready */
+ 	if (brcmf_pcie_read_reg32(devinfo, devinfo->reginfo->intmask) != 0) {
+ 		brcmf_dbg(PCIE, "Try to wakeup device....\n");

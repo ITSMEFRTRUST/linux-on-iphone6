@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 20:38:02 +0000
+Subject: [PATCH 082/138] power: supply: apple_swi: Keep the gauge quiet across
+ system suspend
+
+The bq27xxx core polls from a non-freezable work item and is also kicked
+by external_power_changed() when the charger reports a change. A
+transfer during system suspend would need the charger's I2C bus (for
+the SWI handover) while its interrupt is suspended. Cancel the poll on
+suspend, refuse transfers until resume (-EAGAIN, no bus traffic), and
+refresh the cache once on resume.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/power/supply/apple_swi_battery.c | 37 ++++++++++++++++++++++--
+ 1 file changed, 35 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/power/supply/apple_swi_battery.c b/drivers/power/supply/apple_swi_battery.c
+index 158b34615..0dfe9a9bc 100644
+--- a/drivers/power/supply/apple_swi_battery.c
++++ b/drivers/power/supply/apple_swi_battery.c
+@@ -89,6 +89,7 @@ struct apple_swi {
+ 	struct i2c_client *master;
+ 	struct mutex lock;	/* one HDQ transaction at a time */
+ 	bool granted;
++	bool suspended;		/* system sleep: no HDQ traffic */
+ 	struct bq27xxx_device_info di;
+ };
+ 
+@@ -295,6 +296,9 @@ static int swi_begin(struct apple_swi *swi)
+ {
+ 	int ret;
+ 
++	if (READ_ONCE(swi->suspended))
++		return -EAGAIN;
++
+ 	ret = pm_runtime_resume_and_get(swi->dev);
+ 	if (ret)
+ 		return ret;
+@@ -445,8 +449,37 @@ static void apple_swi_remove(struct platform_device *pdev)
+ 	bq27xxx_battery_teardown(&swi->di);
+ }
+ 
+-static DEFINE_RUNTIME_DEV_PM_OPS(apple_swi_pm_ops, swi_runtime_suspend,
+-				 swi_runtime_resume, NULL);
++/*
++ * bq27xxx polls from a non-freezable work item, and a reader can also come in
++ * through external_power_changed() while the charger is suspending. Across
++ * system suspend the transfer would need the charger's I2C bus with its
++ * interrupt suspended, so stop the poll, refuse transfers until resume, and
++ * refresh the cache once on the way back.
++ */
++static int swi_suspend(struct device *dev)
++{
++	struct apple_swi *swi = dev_get_drvdata(dev);
++
++	WRITE_ONCE(swi->suspended, true);
++	cancel_delayed_work_sync(&swi->di.work);
++
++	return 0;
++}
++
++static int swi_resume(struct device *dev)
++{
++	struct apple_swi *swi = dev_get_drvdata(dev);
++
++	WRITE_ONCE(swi->suspended, false);
++	mod_delayed_work(system_percpu_wq, &swi->di.work, 0);
++
++	return 0;
++}
++
++static const struct dev_pm_ops apple_swi_pm_ops = {
++	SYSTEM_SLEEP_PM_OPS(swi_suspend, swi_resume)
++	RUNTIME_PM_OPS(swi_runtime_suspend, swi_runtime_resume, NULL)
++};
+ 
+ static const struct of_device_id apple_swi_of_match[] = {
+ 	{ .compatible = "apple,t7000-swi-gauge" },

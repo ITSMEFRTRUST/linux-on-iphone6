@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 23:38:13 +0000
+Subject: [PATCH 122/138] media: apple: t7000 ISP: flush the DART on shutdown,
+ leak memory if ps_isp stays on
+
+Review S3 (belt and braces for DMA ownership at teardown):
+- isp_dart_fini() invalidates the TLB after clearing TCR/TTBRs.
+- isp_power_off() reports whether the ps_isp we powered on reached
+  ACTUAL == 0. If not, the teardown keeps every surface and the DART
+  tables allocated (deliberate leak, loud dev_err) instead of handing
+  pages the ISP might still reach back to the kernel.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../media/platform/apple/isp-t7000/isp-dart.c    |  1 +
+ .../media/platform/apple/isp-t7000/isp-main.c    | 16 ++++++++++++++--
+ drivers/media/platform/apple/isp-t7000/isp-pwr.c |  8 ++++++--
+ drivers/media/platform/apple/isp-t7000/isp.h     |  2 +-
+ 4 files changed, 22 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-dart.c b/drivers/media/platform/apple/isp-t7000/isp-dart.c
+index aaf7b34e0..3db913d8f 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-dart.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-dart.c
+@@ -129,6 +129,7 @@ void isp_dart_fini(struct t7000_isp *isp)
+ 		if (isp_dart_sids & BIT(sid))
+ 			for (i = 0; i < 4; i++)
+ 				dart_wr(isp, DART_TTBR(sid, i), 0);
++	isp_dart_flush(isp);	/* still dart_on: drop any cached translation */
+ 	isp->dart_on = false;
+ 	dev_info(isp->dev, "dart: translation disabled\n");
+ }
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-main.c b/drivers/media/platform/apple/isp-t7000/isp-main.c
+index e81db4133..ba3e31244 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-main.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-main.c
+@@ -92,8 +92,20 @@ static void isp_teardown(struct t7000_isp *isp)
+ 		isp_cpu_stop(isp);
+ 	if (isp->dart_on)
+ 		isp_dart_fini(isp);
+-	isp_power_off(isp);
+-	isp_surf_free_all(isp);
++	if (isp_power_off(isp) && (isp->l1 || !list_empty(&isp->surfs))) {
++		/*
++		 * ps_isp did not gate: the ISP (and its DART) may still be live, so
++		 * every page it could reach stays allocated. Leaked on purpose.
++		 */
++		dev_err(isp->dev, "!!! ps_isp power-off TIMED OUT: LEAKING all ISP surfaces + DART tables (%llu bytes) so the ISP cannot DMA into reused memory; reboot before the next test !!!\n",
++			isp->shared_bytes);
++		INIT_LIST_HEAD(&isp->surfs);
++		isp->fw = isp->ipc = isp->heap = NULL;
++		isp->l1 = NULL;
++		memset(isp->l2, 0, sizeof(isp->l2));
++	} else {
++		isp_surf_free_all(isp);
++	}
+ 	isp->done = 0;
+ 	mutex_unlock(&isp->lock);
+ 	isp_pmgr_log(isp, "after teardown");
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-pwr.c b/drivers/media/platform/apple/isp-t7000/isp-pwr.c
+index 7a4a858e9..c85fcbcc0 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-pwr.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-pwr.c
+@@ -101,8 +101,11 @@ int isp_power_on(struct t7000_isp *isp)
+ 	return 0;
+ }
+ 
+-void isp_power_off(struct t7000_isp *isp)
++/* Returns -ETIMEDOUT if a ps_isp we powered on did not reach ACTUAL == 0. */
++int isp_power_off(struct t7000_isp *isp)
+ {
++	int ret = 0;
++
+ 	if (isp->on_sens1) {
+ 		ps_set(isp, PMGR_PS_ISPSENS1, "ispsens1", PS_PWRGATE);
+ 		isp->on_sens1 = false;
+@@ -112,13 +115,14 @@ void isp_power_off(struct t7000_isp *isp)
+ 		isp->on_sens0 = false;
+ 	}
+ 	if (isp->on_isp) {
+-		ps_set(isp, PMGR_PS_ISP, "isp", PS_PWRGATE);
++		ret = ps_set(isp, PMGR_PS_ISP, "isp", PS_PWRGATE);
+ 		isp->on_isp = false;
+ 	}
+ 	if (isp->on_media) {
+ 		ps_set(isp, PMGR_PS_MEDIA, "media", PS_PWRGATE);
+ 		isp->on_media = false;
+ 	}
++	return ret;
+ }
+ 
+ void isp_log_window(struct t7000_isp *isp, const char *when)
+diff --git a/drivers/media/platform/apple/isp-t7000/isp.h b/drivers/media/platform/apple/isp-t7000/isp.h
+index 8eba0452e..9064108ea 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp.h
++++ b/drivers/media/platform/apple/isp-t7000/isp.h
+@@ -182,7 +182,7 @@ static inline u32 isp_rel(u32 iova)
+ /* isp-pwr.c */
+ void isp_pmgr_log(struct t7000_isp *isp, const char *when);
+ int isp_power_on(struct t7000_isp *isp);
+-void isp_power_off(struct t7000_isp *isp);
++int isp_power_off(struct t7000_isp *isp);
+ void isp_log_window(struct t7000_isp *isp, const char *when);
+ int isp_stage_clocks(struct t7000_isp *isp);
+ void isp_dry_read(struct t7000_isp *isp);

@@ -1,0 +1,25 @@
+#!/bin/sh
+# mtup - power-cycle and boot the N61 touch controller from userspace (re/MULTITOUCH.md §2, re/TOUCH-POWER.md),
+# then load calibration + firmware with /tmp/mtboot (generate it with re/tools/n61-hbpp.py from YOUR phone's
+# own touch firmware + calibration; none ships here). Needs spidev bound to spi0.0 (done here if missing).
+S="/tmp/spi /dev/spidev0.0 4000000 0"; P="1aa118e118e118e118e118e118e118e1"
+[ -e /dev/spidev0.0 ] || { echo spidev > /sys/bus/spi/devices/spi0.0/driver_override; echo spi0.0 > /sys/bus/spi/drivers/spidev/bind; }
+# off: reset, clock, ldo15, analog
+/tmp/gpio 2=0 >/dev/null; usleep 1000
+v=$(( 0x$(/tmp/mem r 20e01e000 1 | cut -d' ' -f2) ))
+/tmp/mem w 20e01e000 $(printf %x $((v & ~0x80000))) w 20e01e000 $(printf %x $(((v & ~0x80000) | 0x80000000))) >/dev/null
+/tmp/i2c 0 74 W 0085 $(printf %x $(( 0x$(/tmp/i2c 0 74 R 0085 | cut -d= -f2) & ~2 ))) >/dev/null
+/tmp/i2c 0 27 w 05 $(printf %x $(( 0x$(/tmp/i2c 0 27 r 05 | cut -d= -f2) & ~0x10 ))) >/dev/null
+usleep 250000
+# on
+/tmp/i2c 0 27 w 05 $(printf %x $(( 0x$(/tmp/i2c 0 27 r 05 | cut -d= -f2) | 0x10 ))) >/dev/null
+/tmp/i2c 0 74 W 0085 $(printf %x $(( 0x$(/tmp/i2c 0 74 R 0085 | cut -d= -f2) | 2 ))) >/dev/null
+usleep 5000
+v=$(( 0x$(/tmp/mem r 20e01e000 1 | cut -d' ' -f2) ))
+/tmp/mem w 20e01e000 $(printf %x $((v & 0x7fffffff))) s 1 w 20e01e000 $(printf %x $(((v & 0x7ffffc00) | 0x802dc))) >/dev/null
+usleep 15000
+$S 19c1 >/dev/null; usleep 10000
+$S $P >/dev/null
+/tmp/gpio 2=1 >/dev/null; usleep 30000
+echo "probe: $($S $P)"
+sh /tmp/mtboot | paste - - | awk '{print $NF" "$(NF-1)}' | sort | uniq -c | tr '\n' ';'; echo

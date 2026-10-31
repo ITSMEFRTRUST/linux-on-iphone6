@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 03:19:03 +0000
+Subject: [PATCH 034/138] arm64: dts: apple: t7000: Add UART1 and the PMIC
+ GPIOs
+
+UART1 carries Bluetooth on the iPhone 6. iBoot leaves its RTS pin as a
+GPIO, so mux all four pins explicitly.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ arch/arm64/boot/dts/apple/t7000-6.dtsi      |  7 +++++++
+ arch/arm64/boot/dts/apple/t7000-common.dtsi |  1 +
+ arch/arm64/boot/dts/apple/t7000.dtsi        | 22 +++++++++++++++++++++
+ 3 files changed, 30 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/apple/t7000-6.dtsi b/arch/arm64/boot/dts/apple/t7000-6.dtsi
+index e35afa663..7aaa664e1 100644
+--- a/arch/arm64/boot/dts/apple/t7000-6.dtsi
++++ b/arch/arm64/boot/dts/apple/t7000-6.dtsi
+@@ -72,6 +72,13 @@ pmic_ldo15: ldo15@85 {
+ 			reg = <0x85 0x1>;
+ 		};
+ 
++		pmic_gpio: gpio@400 {
++			compatible = "apple,adi-pmic-gpio";
++			reg = <0x400 0x2a>;
++			gpio-controller;
++			#gpio-cells = <2>;
++		};
++
+ 		rtc@5c0 {
+ 			compatible = "apple,adi-pmic-rtc", "apple,amber-pmic-rtc";
+ 			reg = <0x5c0 0x10>;
+diff --git a/arch/arm64/boot/dts/apple/t7000-common.dtsi b/arch/arm64/boot/dts/apple/t7000-common.dtsi
+index 11f251162..d1ecb2e3a 100644
+--- a/arch/arm64/boot/dts/apple/t7000-common.dtsi
++++ b/arch/arm64/boot/dts/apple/t7000-common.dtsi
+@@ -14,6 +14,7 @@ aliases {
+ 		ausbphy0 = &ausbphy0; /* Used by loader */
+ 		asp = &ans;
+ 		serial0 = &serial0;
++		serial1 = &serial1;
+ 		serial6 = &serial6;
+ 	};
+ 
+diff --git a/arch/arm64/boot/dts/apple/t7000.dtsi b/arch/arm64/boot/dts/apple/t7000.dtsi
+index 2116a99a5..795789de0 100644
+--- a/arch/arm64/boot/dts/apple/t7000.dtsi
++++ b/arch/arm64/boot/dts/apple/t7000.dtsi
+@@ -213,6 +213,21 @@ serial0: serial@20a0c0000 {
+ 			status = "disabled";
+ 		};
+ 
++		serial1: serial@20a0c4000 {
++			compatible = "apple,s5l-uart";
++			reg = <0x2 0x0a0c4000 0x0 0x4000>;
++			reg-io-width = <4>;
++			interrupt-parent = <&aic>;
++			interrupts = <AIC_IRQ 159 IRQ_TYPE_LEVEL_HIGH>;
++			/* Use the bootloader-enabled clocks for now. */
++			clocks = <&clkref>, <&clkref>;
++			clock-names = "uart", "clk_uart_baud0";
++			pinctrl-0 = <&uart1_pins>;
++			pinctrl-names = "default";
++			power-domains = <&ps_uart1>;
++			status = "disabled";
++		};
++
+ 		serial6: serial@20a0d8000 {
+ 			compatible = "apple,s5l-uart";
+ 			reg = <0x2 0x0a0d8000 0x0 0x4000>;
+@@ -429,6 +444,13 @@ i2c0_pins: i2c0-pins {
+ 					 <APPLE_PINMUX(96, 1)>;
+ 			};
+ 
++			uart1_pins: uart1-pins {
++				pinmux = <APPLE_PINMUX(173, 1)>,
++					 <APPLE_PINMUX(174, 1)>,
++					 <APPLE_PINMUX(175, 1)>,
++					 <APPLE_PINMUX(176, 1)>;
++			};
++
+ 			i2c1_pins: i2c1-pins {
+ 				pinmux = <APPLE_PINMUX(139, 1)>,
+ 					 <APPLE_PINMUX(138, 1)>;

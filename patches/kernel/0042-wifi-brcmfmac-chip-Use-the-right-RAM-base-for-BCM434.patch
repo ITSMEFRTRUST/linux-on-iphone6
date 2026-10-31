@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 16:26:24 +0000
+Subject: [PATCH 042/138] wifi: brcmfmac: chip: Use the right RAM base for
+ BCM4345 before C0
+
+Broadcom's own driver uses a TCM RAM base of 0x1b0000 for BCM4345
+revisions before C0 (rev 6), and 0x198000 from C0 on. The iOS driver of
+the iPhone 6 BCM4345 B1 agrees (RAM 0x1b0000, 0x90000 bytes). Only the
+C0 and later SDIO parts were supported so far, which keep 0x198000.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/net/wireless/broadcom/brcm80211/brcmfmac/chip.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/chip.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/chip.c
+index 4adc0d0e4..636b6cfbf 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/chip.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/chip.c
+@@ -711,6 +711,10 @@ static u32 brcmf_chip_tcm_rambase(struct brcmf_chip_priv *ci)
+ {
+ 	switch (ci->pub.chip) {
+ 	case BRCM_CC_4345_CHIP_ID:
++		/* Before C0 (e.g. the PCIe B1 in the iPhone 6) */
++		if (ci->pub.chiprev < 6)
++			return 0x1b0000;
++		return 0x198000;
+ 	case BRCM_CC_43454_CHIP_ID:
+ 		return 0x198000;
+ 	case BRCM_CC_4335_CHIP_ID:

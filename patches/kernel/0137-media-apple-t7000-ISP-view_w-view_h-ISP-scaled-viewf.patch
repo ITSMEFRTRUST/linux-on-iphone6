@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 02:13:00 +0000
+Subject: [PATCH 137/138] media: apple: t7000 ISP: view_w/view_h: ISP-scaled
+ viewfinder output (experiment, off by default)
+
+view_w x view_h (0 = off, the default): the PHOTO_VIEW preset's output is
+scaled by the ISP to this size instead of the preset's own, only when it
+shrinks, stays even and keeps the aspect within 1 %. Untested on hw:
+whether the fw scales on OUTPUT_CONFIG_SET is unknown.
+
+From orchard-camvf's 0002 patch.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../media/platform/apple/isp-t7000/isp-scfg.c | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-scfg.c b/drivers/media/platform/apple/isp-t7000/isp-scfg.c
+index bde742896..29cd5a3f3 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-scfg.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-scfg.c
+@@ -64,6 +64,9 @@ static u32 rd32(const u8 *p, u32 off)
+  *    0xc113. AE_START 0x200 (iOS EnableAE) is in neither start path but exists here.
+  * SBS_ENABLE 0x13b / MBNR 0xa3a do not exist in this fw.
+  */
++static uint isp_view_w, isp_view_h;	/* experiment: the viewfinder preset's output size (isp_pick_preset) */
++module_param_named(view_w, isp_view_w, uint, 0644);
++module_param_named(view_h, isp_view_h, uint, 0644);
+ static uint isp_fps_max;	/* 0 = off; 7680 = 30 fps (Asahi ISP_FRAME_RATE_DEN) */
+ module_param_named(fps_max, isp_fps_max, uint, 0644);
+ static uint isp_fps_min;	/* 0 = off; 3840 = 15 fps (Asahi ISP_FRAME_RATE_DEN2) */
+@@ -246,6 +249,22 @@ static int isp_pick_preset(struct t7000_isp *isp, u8 *buf)
+ 	st->in_h = dim[best][1];
+ 	st->width = dim[best][2];
+ 	st->height = dim[best][3];
++	/*
++	 * view_w x view_h (experiment, 0 = off): the viewfinder preset's output scaled by the ISP to this size
++	 * (OUTPUT_CONFIG_SET with CROP_SET = the whole input) instead of the preset's own. Orchard's 3:4
++	 * viewfinder is 750x1000 = a 1000x750 landscape stream: 1.1 MB per frame instead of 3.0 MB and no CPU
++	 * decimation (the ISP's scaler filters; nearest-neighbour picking 61 % of the rows/columns aliases).
++	 * Only when it shrinks the picture, keeps it even and keeps the aspect within 1 %.
++	 */
++	if ((st->mode & ISP_START_PHOTO_VIEW) && isp_view_w && isp_view_h && !(isp_view_w & 1) &&
++	    !(isp_view_h & 1) && isp_view_w < st->width && isp_view_h < st->height &&
++	    abs((int)(isp_view_w * st->height) - (int)(isp_view_h * st->width)) * 100 <=
++	    (int)(isp_view_h * st->width)) {
++		dev_info(isp->dev, "ch %u: viewfinder output scaled %ux%u -> %ux%u (view_w/view_h)\n", st->ch,
++			 st->width, st->height, isp_view_w, isp_view_h);
++		st->width = isp_view_w;
++		st->height = isp_view_h;
++	}
+ 	st->stride = ALIGN(st->width, 64);
+ 	st->bufsize = PAGE_ALIGN(st->stride * st->height * 3 / 2);
+ 	dev_info(isp->dev, "ch %u: streaming preset %u (mode 0x%x): %ux%u NV12, stride %u, buffer 0x%x\n",

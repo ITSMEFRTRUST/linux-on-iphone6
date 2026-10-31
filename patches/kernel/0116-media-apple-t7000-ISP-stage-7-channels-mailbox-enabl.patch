@@ -1,0 +1,138 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 23:18:06 +0000
+Subject: [PATCH 116/138] media: apple: t7000 ISP: stage 7 (channels, mailbox
+ enable) + IPC stop
+
+WIP piece 3: look up the 7 named channels, check their types, log every
+ring head, mbox enable 0x40104 = 0xf, IRQ 91 only with irq=1, poll worker
+(1 s safety poll in IRQ mode). isp_ipc_stop() frees the IRQ first, then
+cancels the worker.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../media/platform/apple/isp-t7000/isp-ipc.c  | 114 ++++++++++++++++++
+ 1 file changed, 114 insertions(+)
+
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-ipc.c b/drivers/media/platform/apple/isp-t7000/isp-ipc.c
+index ae471bbcb..9661b97ed 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-ipc.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-ipc.c
+@@ -348,3 +348,117 @@ static void isp_poll_fn(struct work_struct *work)
+ 		schedule_delayed_work(&isp->poll_work,
+ 				      msecs_to_jiffies(isp_poll_interval(isp)));
+ }
++
++static struct isp_chan *isp_chan_find(struct t7000_isp *isp, const char *name)
++{
++	u32 i;
++
++	for (i = 0; i < isp->nchans; i++)
++		if (!strcmp(isp->chans[i].name, name))
++			return &isp->chans[i];
++	return NULL;
++}
++
++static void isp_ring_log(struct t7000_isp *isp, struct isp_chan *c)
++{
++	u32 i, pend = 0, zero = 0, *m;
++
++	for (i = 0; i < c->num; i++) {
++		m = isp_slot(c, i);
++		if (!(READ_ONCE(m[0]) & 1))
++			pend++;
++		if (!READ_ONCE(m[0]) && !READ_ONCE(m[1]) && !READ_ONCE(m[2]))
++			zero++;
++	}
++	m = isp_slot(c, 0);
++	dev_info(isp->dev, "ring '%s' type %u src %u: slot0 %08x %08x %08x, %u/%u slots bit0=0, %u all-zero\n",
++		 c->name, c->type, c->src, READ_ONCE(m[0]), READ_ONCE(m[1]),
++		 READ_ONCE(m[2]), pend, c->num, zero);
++}
++
++/* Stage 7: name the channels, enable the mailbox, start IRQ and/or poller. */
++int isp_stage_mbox(struct t7000_isp *isp)
++{
++	static const char *const names[] = {
++		"SHAREDMALLOC", "TERMINAL", "BUF_H2T", "BUF_T2H", "IO", "IO_T2H", "DEBUG",
++	};
++	struct isp_chan **ptr[] = {
++		&isp->sm, &isp->tm, &isp->bh, &isp->bt, &isp->io, &isp->it, &isp->dg,
++	};
++	u32 i;
++	int ret, n;
++
++	for (i = 0; i < ARRAY_SIZE(names); i++) {
++		*ptr[i] = isp_chan_find(isp, names[i]);
++		if (*ptr[i])
++			dev_info(isp->dev, "channel %-12s = #%td (type %u src %u num %u)\n",
++				 names[i], *ptr[i] - isp->chans, (*ptr[i])->type,
++				 (*ptr[i])->src, (*ptr[i])->num);
++		else
++			dev_warn(isp->dev, "channel %-12s missing from the table\n", names[i]);
++	}
++	if (!isp->io || !isp->sm || !isp->tm) {
++		dev_err(isp->dev, "IO, SHAREDMALLOC and TERMINAL are required\n");
++		return -ENODEV;
++	}
++	if (isp->io->type != CHAN_CMD || isp->sm->type != CHAN_REPLY ||
++	    isp->tm->type == CHAN_CMD) {
++		dev_err(isp->dev, "unexpected types: IO %u (want 0) SHAREDMALLOC %u (want 1) TERMINAL %u (want 2)\n",
++			isp->io->type, isp->sm->type, isp->tm->type);
++		return -EIO;
++	}
++	if (isp->tm->type != CHAN_REPORT)
++		dev_warn(isp->dev, "TERMINAL is type %u, not 2: replying to it like a request ring\n",
++			 isp->tm->type);
++	for (i = 0; i < isp->nchans; i++)
++		isp_ring_log(isp, &isp->chans[i]);
++	if (isp->cmd_off + ISP_CMD_BUF_SIZE > isp->ipc->size) {
++		dev_err(isp->dev, "command buffer outside the IPC pool\n");
++		return -EIO;
++	}
++
++	dev_info(isp->dev, "mbox before enable: pending 0x%08x enable 0x%08x\n",
++		 isp_rd(isp, ISP_MBOX_PENDING), isp_rd(isp, ISP_MBOX_ENABLE));
++	isp_wr(isp, ISP_MBOX_ENABLE, 0xf);
++	dev_info(isp->dev, "mbox enable +0x40104 = 0xf (readback 0x%08x), pending 0x%08x\n",
++		 isp_rd(isp, ISP_MBOX_ENABLE), isp_rd(isp, ISP_MBOX_PENDING));
++	isp->fw_up = true;	/* from here on, unwind tries STOP + POWER_DOWN */
++
++	if (isp_irq_en) {
++		ret = isp_irq_setup(isp);
++		if (ret)
++			return ret;
++	}
++	INIT_DELAYED_WORK(&isp->poll_work, isp_poll_fn);
++	isp->poll_init = true;
++	WRITE_ONCE(isp->poll_on, true);
++	n = isp_service(isp);
++	dev_info(isp->dev, "initial service pass: %d message(s); %s, poll every %u ms\n", n,
++		 isp->irq >= 0 ? "IRQ mode" : "poll mode", isp_poll_interval(isp));
++	schedule_delayed_work(&isp->poll_work, msecs_to_jiffies(isp_poll_interval(isp)));
++	return 0;
++}
++
++/* Called without isp->lock: the IRQ thread and the worker take it. IRQ first. */
++void isp_ipc_stop(struct t7000_isp *isp)
++{
++	u32 i;
++
++	if (isp->irq >= 0) {
++		free_irq(isp->irq, isp);
++		irq_dispose_mapping(isp->irq);
++		dev_info(isp->dev, "IRQ %d freed after %d interrupt(s)\n", isp->irq,
++			 atomic_read(&isp->irq_count));
++		isp->irq = -1;
++	}
++	if (isp->poll_init) {
++		WRITE_ONCE(isp->poll_on, false);
++		cancel_delayed_work_sync(&isp->poll_work);
++		isp->poll_init = false;
++		dev_info(isp->dev, "poll worker stopped\n");
++	}
++	for (i = 0; i < isp->nchans; i++)
++		if (isp->chans[i].msgs)
++			dev_info(isp->dev, "ring '%s': %lu message(s)\n", isp->chans[i].name,
++				 isp->chans[i].msgs);
++}

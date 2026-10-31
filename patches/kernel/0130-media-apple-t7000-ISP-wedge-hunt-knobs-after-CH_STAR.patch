@@ -1,0 +1,534 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 20:45:27 +0000
+Subject: [PATCH 130/138] media: apple: t7000 ISP: wedge hunt knobs after
+ CH_START
+
+H2/H2b wedge the whole SoC within ~50 ms of a successful CH_START (last
+traced write = the routine mailbox ack 0xc050c, written 22x before in the
+same run). Static RE of the DART kext points at the dart-isp SMMU block:
+iOS setTranslationEnable (0x7fe35a8 -> 0x7fe361c) sets SMMU+0xc
+byte[sid] |= 0x80 right after the DART TCR and never writes SMMU TTBRs;
+we leave it 0, so the pipeline DMA is likely not translated.
+
+- SMMU fault check on every DART fault check (SMMU+0x10 bit 31, logged
+  with +0x14/+0x18/+0x1c, acked with status & 0x0c00006c like iOS);
+  not fatal for the IO channel. Default on (reads only, plus the ack).
+- smmu_en=1: save the old SMMU+0xc, verify the enable bits stuck, and
+  restore it before the DART tables are torn down.
+- DART log: fix the diag(+0x20)/fetch(+0x30) labels (they were
+  swapped), add DART/SMMU bypass (+0x2c) and the SMMU error status.
+- trace=1: print buffered fw TERMINAL lines after every command (they
+  were printed only after the START ioctl, so a wedge lost all of them).
+- dart_ios=1: DART diag 0x100, fetch 0xe0303, bypass 0, SMMU bypass 0,
+  as the iOS DART restore does (restored at fini).
+- quiet_ms=N: after CH_START no ISP register access for N ms (IRQ
+  masked, no mailbox ack, no doorbell), DRAM-only TERMINAL drain and a
+  heartbeat line every 10 ms: splits an async wedge from an AP access.
+- stream_nobufs=1: CH_START without posting frame/meta buffers.
+- canary=1: before CH_START, log which RAM pages sit at canary_base +
+  the frame/RAW IOVAs (where a bypassed DMA would land) and watch their
+  hashes during quiet_ms. Reads only, NOMAP memory skipped.
+
+All new knobs default off. Not tested on hardware.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../media/platform/apple/isp-t7000/isp-dart.c |  85 ++++++++-
+ .../media/platform/apple/isp-t7000/isp-ipc.c  | 170 +++++++++++++++++-
+ .../media/platform/apple/isp-t7000/isp-main.c |  19 ++
+ .../media/platform/apple/isp-t7000/isp-scfg.c |   9 +
+ .../platform/apple/isp-t7000/isp-stream.c     |   2 +
+ drivers/media/platform/apple/isp-t7000/isp.h  |  44 ++++-
+ 6 files changed, 316 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-dart.c b/drivers/media/platform/apple/isp-t7000/isp-dart.c
+index 84cbf6390..758361b66 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-dart.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-dart.c
+@@ -26,10 +26,12 @@ void isp_dart_log(struct t7000_isp *isp, const char *when)
+ 	u32 s[16];
+ 	int i;
+ 
+-	dev_info(isp->dev, "dart %s: fetch-cfg %08x err-reflector %08x diag %08x; smmu stream-en %08x +0x20 %08x err-reflector %08x\n",
+-		 when, dart_rd(isp, DART_FETCH_CFG), dart_rd(isp, DART_ERR_REFLECT),
+-		 dart_rd(isp, DART_DIAG_CFG), isp_rd(isp, ISP_SMMU + SMMU_STREAM_EN),
+-		 isp_rd(isp, ISP_SMMU + 0x20), isp_rd(isp, ISP_SMMU + SMMU_ERR_REFLECT));
++	dev_info(isp->dev, "dart %s: diag(+0x20) %08x err-reflector %08x bypass(+0x2c) %08x fetch(+0x30) %08x; smmu stream-en %08x err %08x diag %08x err-reflector %08x bypass %08x\n",
++		 when, dart_rd(isp, DART_DIAG_CFG), dart_rd(isp, DART_ERR_REFLECT),
++		 dart_rd(isp, DART_BYPASS), dart_rd(isp, DART_FETCH_CFG),
++		 isp_rd(isp, ISP_SMMU + SMMU_STREAM_EN), isp_rd(isp, ISP_SMMU + SMMU_ERROR),
++		 isp_rd(isp, ISP_SMMU + SMMU_DIAG), isp_rd(isp, ISP_SMMU + SMMU_ERR_REFLECT),
++		 isp_rd(isp, ISP_SMMU + SMMU_BYPASS));
+ 	dev_info(isp->dev, "dart %s: cmd %08x tcr %08x err %08x erraddr %08x ttbr0 %08x %08x %08x %08x\n",
+ 		 when, dart_rd(isp, DART_STREAM_CMD), dart_rd(isp, DART_TCR),
+ 		 dart_rd(isp, DART_ERROR), dart_rd(isp, DART_ERROR_ADDR),
+@@ -42,9 +44,33 @@ void isp_dart_log(struct t7000_isp *isp, const char *when)
+ 		 s[10], s[11], s[12], s[13], s[14], s[15]);
+ }
+ 
++/*
++ * SMMU fault (iOS 0x7fe27e8: SMMU+0x10 bit 31; ack 0x7fe46c4: write back status &
++ * 0x0c00006c). Logged and acked only: a reflected pipeline fault does not stop the fw,
++ * so it does not mark the IO channel dead like a DART fault does.
++ */
++bool isp_smmu_fault(struct t7000_isp *isp)
++{
++	u32 err = isp_rd(isp, ISP_SMMU + SMMU_ERROR);
++
++	if (!(err & BIT(31)))
++		return false;
++	isp->smmu_faults++;
++	if (isp->smmu_err_logged++ < 5)
++		dev_err(isp->dev, "SMMU fault #%lu: status 0x%08x axi-req0 0x%08x axi-req1 0x%08x addr 0x%08x (config 0x%08x)\n",
++			isp->smmu_faults, err, isp_rd(isp, ISP_SMMU + SMMU_ERR_AXI0),
++			isp_rd(isp, ISP_SMMU + SMMU_ERR_AXI1), isp_rd(isp, ISP_SMMU + SMMU_ERR_ADDR),
++			isp_rd(isp, ISP_SMMU + SMMU_STREAM_EN));
++	isp_wr(isp, ISP_SMMU + SMMU_ERROR, err & SMMU_ERR_ACK);
++	return true;
++}
++
+ bool isp_dart_fault(struct t7000_isp *isp)
+ {
+-	u32 err = dart_rd(isp, DART_ERROR);
++	u32 err;
++
++	isp_smmu_fault(isp);
++	err = dart_rd(isp, DART_ERROR);
+ 
+ 	if (!(err & DART_ERROR_FLAG))
+ 		return false;
+@@ -121,13 +147,40 @@ int isp_dart_init(struct t7000_isp *isp)
+ 	}
+ 	dart_wr(isp, DART_TCR, (tcr & ~m) | (0x80808080U & m));
+ 	isp->dart_on = true;
++	if (isp_dart_ios) {
++		/* iOS restore 0x7fe62ec/0x7fe6394/0x7fe64cc: fetch, diag, bypass (absent = 0) */
++		isp->dart_old_diag = dart_rd(isp, DART_DIAG_CFG);
++		isp->dart_old_fetch = dart_rd(isp, DART_FETCH_CFG);
++		isp->dart_old_bypass = dart_rd(isp, DART_BYPASS);
++		isp->smmu_old_bypass = isp_rd(isp, ISP_SMMU + SMMU_BYPASS);
++		dart_wr(isp, DART_FETCH_CFG, ISP_DART_FETCH_IOS);
++		dart_wr(isp, DART_DIAG_CFG, ISP_DART_DIAG_IOS);
++		dart_wr(isp, DART_BYPASS, 0);
++		isp_wr(isp, ISP_SMMU + SMMU_DIAG, 0);
++		isp_wr(isp, ISP_SMMU + SMMU_BYPASS, 0);
++		isp->dart_ios_set = true;
++		dev_info(isp->dev, "dart_ios: dart diag 0x%08x fetch 0x%08x bypass 0x%08x (was %08x %08x %08x), smmu bypass 0x%08x (was %08x)\n",
++			 dart_rd(isp, DART_DIAG_CFG), dart_rd(isp, DART_FETCH_CFG),
++			 dart_rd(isp, DART_BYPASS), isp->dart_old_diag, isp->dart_old_fetch,
++			 isp->dart_old_bypass, isp_rd(isp, ISP_SMMU + SMMU_BYPASS),
++			 isp->smmu_old_bypass);
++	}
+ 	isp_dart_flush(isp);
+ 	if (isp_smmu_en) {
+-		u32 v = isp_rd(isp, ISP_SMMU + 0xc);
++		/*
++		 * iOS setTranslationEnable(sid, true) = DART TCR, then SMMU CONFIG byte[sid]
++		 * |= 0x80 (0x7fe361c) and a read-back check of the 0x80 bits. Without it the
++		 * SMMU clients (the pipeline DMA, [A]) are not translated.
++		 */
++		u32 v = isp_rd(isp, ISP_SMMU + SMMU_STREAM_EN);
+ 
+-		isp_wr(isp, ISP_SMMU + 0xc, v | (0x80808080U & m));
+-		dev_info(isp->dev, "smmu_en: SMMU+0xc 0x%08x -> 0x%08x\n", v,
+-			 isp_rd(isp, ISP_SMMU + 0xc));
++		isp->smmu_old_cfg = v;
++		isp->smmu_set = true;
++		isp_wr(isp, ISP_SMMU + SMMU_STREAM_EN, v | (0x80808080U & m));
++		v = isp_rd(isp, ISP_SMMU + SMMU_STREAM_EN);
++		dev_info(isp->dev, "smmu_en: SMMU+0xc 0x%08x -> 0x%08x%s\n", isp->smmu_old_cfg, v,
++			 (v & 0x80808080U & m) == (0x80808080U & m) ? "" :
++			 " (!!! enable bits did not stick: iOS treats that as fatal)");
+ 	}
+ 	isp->iova_next = isp_fw_iova;
+ 	dev_info(isp->dev, "dart: L1 at %pad, sids 0x%x, old tcr 0x%08x, old err 0x%08x\n",
+@@ -142,6 +195,13 @@ void isp_dart_fini(struct t7000_isp *isp)
+ 	int sid, i;
+ 
+ 	isp_dart_fault(isp);
++	if (isp->smmu_faults)
++		dev_info(isp->dev, "smmu: %lu fault(s) this boot\n", isp->smmu_faults);
++	if (isp->smmu_set) {
++		/* SMMU translation off before the DART tables go away */
++		isp_wr(isp, ISP_SMMU + SMMU_STREAM_EN, isp->smmu_old_cfg);
++		isp->smmu_set = false;
++	}
+ 	dart_wr(isp, DART_TCR, dart_rd(isp, DART_TCR) & ~tcr_mask());
+ 	for (sid = 0; sid < 4; sid++)
+ 		if (isp_dart_sids & BIT(sid))
+@@ -152,6 +212,13 @@ void isp_dart_fini(struct t7000_isp *isp)
+ 		dart_wr(isp, DART_ERR_REFLECT, isp->dart_old_reflect);
+ 		isp_wr(isp, ISP_SMMU + SMMU_ERR_REFLECT, isp->smmu_old_reflect);
+ 	}
++	if (isp->dart_ios_set) {
++		dart_wr(isp, DART_FETCH_CFG, isp->dart_old_fetch);
++		dart_wr(isp, DART_DIAG_CFG, isp->dart_old_diag);
++		dart_wr(isp, DART_BYPASS, isp->dart_old_bypass);
++		isp_wr(isp, ISP_SMMU + SMMU_BYPASS, isp->smmu_old_bypass);
++		isp->dart_ios_set = false;
++	}
+ 	isp->dart_on = false;
+ 	dev_info(isp->dev, "dart: translation disabled\n");
+ }
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-ipc.c b/drivers/media/platform/apple/isp-t7000/isp-ipc.c
+index 455067f50..424834695 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-ipc.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-ipc.c
+@@ -18,6 +18,7 @@
+ #include <linux/irq.h>
+ #include <linux/irqdomain.h>
+ #include <linux/jiffies.h>
++#include <linux/mm.h>
+ #include <linux/of.h>
+ #include <linux/of_irq.h>
+ #include <linux/platform_device.h>
+@@ -330,10 +331,177 @@ int isp_cmd_send(struct t7000_isp *isp, void *pkt, u32 insize, u32 outsize,
+ 	dev_info(isp->dev, "cmd #%u opcode 0x%04x: done after %u ms, word0 0x%08x w1 0x%x w2 0x%x, status 0x%04x\n",
+ 		 seq, op, jiffies_to_msecs(jiffies - start), w0, READ_ONCE(m[1]),
+ 		 READ_ONCE(m[2]), ((u16 *)buf)[3]);
+-	isp_service(isp);
++	if (isp->skip_final_service)
++		dev_info(isp->dev, "cmd #%u: no service pass after it (quiet_ms window follows)\n", seq);
++	else
++		isp_service(isp);
++	/*
++	 * fwlog lines are otherwise printed only after the whole START ioctl returns, so a
++	 * wedge inside START loses all of them (H2/H2b "no fw text"). Under trace the
++	 * extra printing time does not matter: print them per command.
++	 */
++	if (READ_ONCE(isp_trace))
++		isp_term_flush(isp);
+ 	return 0;
+ }
+ 
++/*
++ * canary=1 (wedge hunt): the SMMU passes untranslated addresses through while its
++ * CONFIG byte is 0, and its bypass register reads 0x08080808 = the DRAM base 0x8_0000_0000
++ * [A, re/CAMERA-WEDGE.md]. Pipeline DMA to IOVA X would then hit PA canary_base + X.
++ * Name what lives there (printed before CH_START, so it survives a wedge) and watch a
++ * hash of each page during quiet_ms. Reads only.
++ */
++static u64 isp_canary_hash(u64 pa)
++{
++	unsigned long pfn = PHYS_PFN(pa);
++	const u64 *p;
++	u64 h = 0;
++	int i;
++
++	/* arm64: NOMAP memory has a struct page but no linear mapping */
++	if (!pfn_valid(pfn) || !pfn_is_map_memory(pfn))
++		return 0;
++	p = page_address(pfn_to_page(pfn));
++	for (i = 0; i < PAGE_SIZE / 8; i++)
++		h = (h ^ READ_ONCE(p[i])) * 0x100000001b3ULL;
++	return h;
++}
++
++static void isp_canary_add(struct t7000_isp *isp, u32 iova, const char *what)
++{
++	u64 pa = isp_canary_base + iova;
++	unsigned long pfn = PHYS_PFN(pa);
++	unsigned int i = isp->ncanary;
++	struct page *pg;
++
++	if (i >= ISP_CANARIES)
++		return;
++	isp->canary_pa[i] = pa;
++	isp->canary_what[i] = what;
++	isp->ncanary++;
++	if (!pfn_valid(pfn)) {
++		dev_info(isp->dev, "canary %u (%s): iova 0x%08x -> PA 0x%llx: no struct page (not RAM / hole)\n",
++			 i, what, iova, pa);
++		return;
++	}
++	pg = pfn_to_page(pfn);
++	isp->canary_sum[i] = isp_canary_hash(pa);
++	dev_info(isp->dev, "canary %u (%s): iova 0x%08x -> PA 0x%llx: %s refcount %d reserved %d slab %d lru %d buddy %d flags %pGp, hash %016llx\n",
++		 i, what, iova, pa, pfn_is_map_memory(pfn) ? "RAM" : "NOMAP RAM (not watched)",
++		 page_ref_count(pg), PageReserved(pg), PageSlab(pg), PageLRU(pg),
++		 PageBuddy(pg), &pg->flags, isp->canary_sum[i]);
++}
++
++/* Before CH_START: FRM0, MTA0 and where the fw's 'RAW0' alloc will go (next IOVA). */
++void isp_canary_arm(struct t7000_isp *isp)
++{
++	struct isp_stream *st = &isp->st;
++	u32 next = isp->iova_next;	/* the next surface (guard page already included) */
++
++	isp->ncanary = 0;
++	if (!READ_ONCE(isp_canary))
++		return;
++	dev_info(isp->dev, "canary: base 0x%llx; kernel text PA %pa (printk), data PA %pa (jiffies), memstart 0x%llx\n",
++		 isp_canary_base, &(phys_addr_t){ __pa_symbol(_printk) },
++		 &(phys_addr_t){ __pa_symbol(&jiffies) }, (u64)memstart_addr);
++	if (st->buf[0].surf)
++		isp_canary_add(isp, st->buf[0].surf->iova, "FRM0");
++	if (st->meta[0].surf)
++		isp_canary_add(isp, st->meta[0].surf->iova, "MTA0");
++	isp_canary_add(isp, next, "RAW0 start?");
++	isp_canary_add(isp, next + SZ_4M, "RAW0 +4M?");
++	isp_canary_add(isp, next + SZ_8M, "RAW0 +8M?");
++	isp_canary_add(isp, next + SZ_8M + SZ_4M, "RAW0 +12M?");
++}
++
++static void isp_canary_check(struct t7000_isp *isp, unsigned int ms)
++{
++	unsigned int i;
++	u64 h;
++
++	for (i = 0; i < isp->ncanary; i++) {
++		if (!isp->canary_sum[i])
++			continue;
++		h = isp_canary_hash(isp->canary_pa[i]);
++		if (h == isp->canary_sum[i])
++			continue;
++		isp->canary_hits++;
++		dev_info(isp->dev, "canary %u (%s) PA 0x%llx CHANGED at +%u ms: hash %016llx -> %016llx\n",
++			 i, isp->canary_what[i], isp->canary_pa[i], ms, isp->canary_sum[i], h);
++		isp->canary_sum[i] = h;
++	}
++}
++
++/* fw->host request slots waiting for us (DRAM peek, not answered) */
++static int isp_pending_requests(struct t7000_isp *isp, u32 *bt)
++{
++	int n = 0;
++	u32 i, w0;
++
++	*bt = 0;
++	for (i = 0; i < isp->nchans; i++) {
++		struct isp_chan *c = &isp->chans[i];
++
++		if (!c->ring || c->type != CHAN_REPLY)
++			continue;
++		w0 = READ_ONCE(isp_slot(c, c->idx)[0]);
++		if (w0 & 1 || (!w0 && !READ_ONCE(isp_slot(c, c->idx)[1])))
++			continue;
++		n++;
++		if (c == isp->bt)
++			*bt = w0;
++	}
++	return n;
++}
++
++/*
++ * quiet_ms (wedge hunt): right after CH_START completes, touch no ISP register for @ms:
++ * the IRQ line is masked, no mailbox ack, no doorbell, no DART/SMMU read. Only DRAM:
++ * the TERMINAL ring (type 2: consumed by a DRAM write, no doorbell) is drained and
++ * printed, the other fw->host rings are only peeked. One heartbeat line per 10 ms.
++ * Heartbeats that stop inside the window = an async wedge (fw / pipeline DMA); a
++ * window that completes and a wedge at the first access after it = the AP access
++ * (ISP window stuck). Called with isp->lock held (the poll worker waits on it).
++ */
++void isp_quiet_window(struct t7000_isp *isp, uint ms)
++{
++	unsigned long start = jiffies, end;
++	unsigned int beat = 0, el;
++	bool masked = false;
++	u32 bt;
++	int req;
++
++	ms = min(ms, 10000U);
++	if (isp->irq >= 0) {
++		disable_irq_nosync(isp->irq);	/* not disable_irq(): the thread may wait on isp->lock */
++		masked = true;
++	}
++	dev_info(isp->dev, "quiet: %u ms without any ISP register access (IRQ %s)\n", ms,
++		 masked ? "masked" : "not in use");
++	end = start + msecs_to_jiffies(ms);
++	while (time_before(jiffies, end)) {
++		int lines = 0;
++
++		if (isp->tm && isp->tm->ring && isp->tm->type == CHAN_REPORT)
++			lines = isp_drain(isp, isp->tm);
++		isp_term_flush(isp);
++		req = isp_pending_requests(isp, &bt);
++		el = jiffies_to_msecs(jiffies - start);
++		dev_info(isp->dev, "quiet +%u ms: beat %u, fw lines %d, requests waiting %d%s\n",
++			 el, beat, lines, req, bt ? " (BUF_T2H: frame list posted)" : "");
++		if (!(beat % 5))
++			isp_canary_check(isp, el);
++		beat++;
++		msleep(10);
++	}
++	isp_canary_check(isp, jiffies_to_msecs(jiffies - start));
++	dev_info(isp->dev, "quiet: window over after %u ms (%lu canary change(s)), resuming ISP access\n",
++		 jiffies_to_msecs(jiffies - start), isp->canary_hits);
++	if (masked)
++		enable_irq(isp->irq);
++}
++
+ /* Hard half: ack the mailbox (as the kext ISR does) and hand off to the thread. */
+ static irqreturn_t isp_irq_hard(int irq, void *data)
+ {
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-main.c b/drivers/media/platform/apple/isp-t7000/isp-main.c
+index 0778e9f2e..83a00067f 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-main.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-main.c
+@@ -142,6 +142,23 @@ module_param_named(dart_reflector, isp_dart_reflector, int, 0444);
+ MODULE_PARM_DESC(dart_reflector, "1 = program the DART + SMMU error reflector (+0x24 = 0x20ffff000 >> 12, ADT error-reflector) like iOS, so a faulting ISP DMA completes harmlessly instead of wedging the fabric");
+ int isp_dart_alias;
+ module_param_named(dart_alias, isp_dart_alias, int, 0444);
++
++/* wedge hunt after CH_START (re/CAMERA-WEDGE.md H6+), all default off */
++uint isp_quiet_ms;
++module_param_named(quiet_ms, isp_quiet_ms, uint, 0644);
++MODULE_PARM_DESC(quiet_ms, "N > 0: after CH_START, N ms (max 10000) with no ISP register access at all (IRQ masked, no mailbox ack/doorbell), only a heartbeat line every 10 ms + fw TERMINAL lines");
++int isp_stream_nobufs;
++module_param_named(stream_nobufs, isp_stream_nobufs, int, 0644);
++MODULE_PARM_DESC(stream_nobufs, "1 = CH_START without posting any frame/meta buffer (only the fw's own SHAREDMALLOC buffers get DMA)");
++int isp_dart_ios;
++module_param_named(dart_ios, isp_dart_ios, int, 0444);
++MODULE_PARM_DESC(dart_ios, "1 = also program DART diag(+0x20)=0x100, fetch(+0x30)=0xe0303, bypass(+0x2c)=0 and SMMU bypass(+0x2c)=0 like the iOS DART restore");
++int isp_canary;
++module_param_named(canary, isp_canary, int, 0644);
++MODULE_PARM_DESC(canary, "1 = before CH_START log which RAM pages sit at canary_base + the frame/RAW IOVAs (where an untranslated DMA would land), and watch them during quiet_ms");
++unsigned long long isp_canary_base = 0x800000000ULL;
++module_param_named(canary_base, isp_canary_base, ullong, 0444);
++MODULE_PARM_DESC(canary_base, "PA an untranslated (SMMU bypass) IOVA is assumed to be offset by (default 0x8_0000_0000 = DRAM base, SMMU+0x2c reset 0x08080808)");
+ MODULE_PARM_DESC(dart_alias, "1 = also point TTBR index 1 (IOVA 1-2 GB) at the same L1, so fw addresses 0x4xxxxxxx alias 0x0xxxxxxx (test knob)");
+ 
+ static struct t7000_isp *the_isp;
+@@ -299,6 +316,8 @@ static int __init isp_init(void)
+ 	dev_info(isp->dev, "load: stage=%d dry_run=%d irq=%d sens=%d smmu_en=%d fw_iova=0x%x dart_sids=0x%x platform_id=0x%x\n",
+ 		 stage, isp_dry_run, isp_irq_en, isp_sens, isp_smmu_en,
+ 		 isp_fw_iova, isp_dart_sids, isp_platform_id);
++	dev_info(isp->dev, "load: wedge knobs: dart_ios=%d quiet_ms=%u stream_nobufs=%d canary=%d canary_base=0x%llx (build n61-isp-wedge)\n",
++		 isp_dart_ios, isp_quiet_ms, isp_stream_nobufs, isp_canary, isp_canary_base);
+ 
+ 	ret = -ENOMEM;
+ 	isp->pmgr = ioremap_np(PMGR_PS_PHYS, PMGR_PS_SIZE);
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-scfg.c b/drivers/media/platform/apple/isp-t7000/isp-scfg.c
+index e82382ab1..5613c4dcc 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-scfg.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-scfg.c
+@@ -262,6 +262,7 @@ int isp_stream_start(struct t7000_isp *isp, u32 camera)
+ 	struct isp_stream *st = &isp->st;
+ 	struct isp_cmd_output_config oc = { .h.opcode = CISP_CMD_CH_OUTPUT_CONFIG_SET };
+ 	u32 want;
++	uint quiet;
+ 	u8 *buf;
+ 	int ret;
+ 
+@@ -343,7 +344,15 @@ int isp_stream_start(struct t7000_isp *isp, u32 camera)
+ 		goto out;
+ 	}
+ 	isp_stream_kick(isp);		/* every buffer is FREE: one or two lists on BUF_H2T */
++	if (READ_ONCE(isp_stream_nobufs))
++		dev_info(isp->dev, "stream_nobufs=1: CH_START with no buffer posted (only fw-allocated DMA, e.g. 'RAW0')\n");
++	isp_canary_arm(isp);		/* canary=1: before CH_START, so it is logged even if the SoC wedges */
++	quiet = READ_ONCE(isp_quiet_ms);
++	isp->skip_final_service = quiet != 0;
+ 	ret = isp_ch_simple(isp, "CH_START", CISP_CMD_CH_START, st->ch, 0xc, 0, 0, true);
++	isp->skip_final_service = false;
++	if (!ret && quiet)
++		isp_quiet_window(isp, quiet);
+ 	if (ret) {
+ 		isp_stream_stop(isp);
+ 		goto out;
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-stream.c b/drivers/media/platform/apple/isp-t7000/isp-stream.c
+index 3b143c9d2..b0bb13752 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-stream.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-stream.c
+@@ -109,6 +109,8 @@ void isp_stream_kick(struct t7000_isp *isp)
+ 
+ 	if (READ_ONCE(isp_stream_nostart))
+ 		return;		/* debug: configure only, never hand buffers to the fw */
++	if (READ_ONCE(isp_stream_nobufs))
++		return;		/* wedge hunt: CH_START with no frame/meta buffer posted */
+ 	for (round = 0; round < 4 && st->on && !st->stopping; round++) {
+ 		n = 0;
+ 		spin_lock(&st->frame_lock);
+diff --git a/drivers/media/platform/apple/isp-t7000/isp.h b/drivers/media/platform/apple/isp-t7000/isp.h
+index 05629f66e..dc9e0d5dc 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp.h
++++ b/drivers/media/platform/apple/isp-t7000/isp.h
+@@ -76,11 +76,30 @@
+ #define DART_ERROR_FLAG		BIT(31)
+ #define DART_ERROR_ADDR		0x1c
+ #define DART_TTBR(sid, i)	(0x40 + 0x10 * (sid) + 4 * (i))
+-#define DART_FETCH_CFG		0x20		/* iOS: ADT fetch-config (0xe0303) */
++/*
++ * DART kext restore 0x7fe6204: +0x20 = ADT diag-config (0x100), +0x30 = ADT fetch-config
++ * (0xe0303); 0x7fe6448: +0x2c = ADT bypass-address (absent on dart-isp -> 0).
++ */
++#define DART_DIAG_CFG		0x20
+ #define DART_ERR_REFLECT	0x24		/* iOS: ADT error-reflector >> 12 */
+-#define DART_DIAG_CFG		0x30		/* iOS: written on restore */
+-#define SMMU_STREAM_EN		0xc		/* iOS: byte[sid] |= 0x80 */
++#define DART_BYPASS		0x2c
++#define DART_FETCH_CFG		0x30
++#define ISP_DART_DIAG_IOS	0x100		/* ADT dart-isp diag-config */
++#define ISP_DART_FETCH_IOS	0xe0303		/* ADT dart-isp fetch-config */
++/*
++ * SMMU block (+0x24000): names from the DART kext state dump 0x7fe5788. No TTBRs: iOS
++ * never writes any, the block walks the DART's tables [A]. iOS setTranslationEnable
++ * (0x7fe35a8 -> 0x7fe361c) sets CONFIG byte[sid] |= 0x80 right after the DART TCR.
++ */
++#define SMMU_STREAM_EN		0xc		/* SMMU_CONFIG: byte[sid] |= 0x80 */
++#define SMMU_ERROR		0x10		/* SMMU_ERROR_STATUS, bit 31 = fault */
++#define SMMU_ERR_AXI0		0x14
++#define SMMU_ERR_AXI1		0x18
++#define SMMU_ERR_ADDR		0x1c
++#define SMMU_DIAG		0x20
+ #define SMMU_ERR_REFLECT	0x24		/* iOS: error-reflector[1] >> 12 */
++#define SMMU_BYPASS		0x2c		/* reset 0x08080808; iOS: bypass-address[1] = 0 */
++#define SMMU_ERR_ACK		0x0c00006c	/* iOS fault handler 0x7fe46c4: write back status & this */
+ #define ISP_ERR_REFLECTOR	0x20ffff000ULL	/* ADT dart-isp error-reflector: 2 x 0x2_0fff_f000 */
+ #define DART_TTBR_VALID		BIT(31)
+ #define DART_PTE_VALID		0x3		/* A8: tables + leaves need bits 1:0 = 11 */
+@@ -213,6 +232,17 @@ struct t7000_isp {
+ 	/* mini DART */
+ 	bool dart_on;
+ 	u32 dart_old_reflect, smmu_old_reflect;
++	bool smmu_set, dart_ios_set;	/* smmu_en / dart_ios wrote these: restore at fini */
++	u32 smmu_old_cfg, dart_old_diag, dart_old_fetch, dart_old_bypass, smmu_old_bypass;
++	unsigned long smmu_err_logged, smmu_faults;
++
++	/* canary=1: pages at canary_base + IOVA, where an untranslated (bypassed) DMA lands [A] */
++#define ISP_CANARIES		6
++	u64 canary_pa[ISP_CANARIES];
++	u64 canary_sum[ISP_CANARIES];
++	const char *canary_what[ISP_CANARIES];
++	unsigned int ncanary;
++	unsigned long canary_hits;
+ 	u64 *l1;
+ 	dma_addr_t l1_dma;
+ 	u64 *l2[512];
+@@ -235,6 +265,7 @@ struct t7000_isp {
+ 	bool started;		/* START acked */
+ 	bool drain_failed;	/* TLIMIT drains did not reach 0 at the last CPU stop */
+ 	bool io_dead;		/* an IO command timed out: fw not answering */
++	bool skip_final_service;	/* quiet_ms: no service pass right after CH_START */
+ 	u32 cmd_seq;
+ 	int irq;
+ 	atomic_t irq_count;
+@@ -268,6 +299,10 @@ extern uint isp_boot_timeout_ms, isp_cmd_timeout_ms, isp_max_shared_mb;
+ extern int isp_sens_pwr, isp_refclk, isp_extclk_periph, isp_stream_en, isp_stream_dump;
+ extern int isp_keep_on, isp_preset, isp_stream_nostart, isp_dart_reflector, isp_dart_alias;
+ extern uint isp_refclk_cfg, isp_nbufs, isp_out_range, isp_setfile_rear, isp_setfile_front;
++/* wedge hunt (re/CAMERA-WEDGE.md), all default off */
++extern uint isp_quiet_ms;
++extern int isp_stream_nobufs, isp_dart_ios, isp_canary;
++extern unsigned long long isp_canary_base;
+ 
+ /*
+  * trace=1: every ISP-window write (and the PMGR / pin / ref clock writes) is printed
+@@ -310,6 +345,7 @@ int isp_dart_init(struct t7000_isp *isp);
+ void isp_dart_fini(struct t7000_isp *isp);
+ void isp_dart_log(struct t7000_isp *isp, const char *when);
+ bool isp_dart_fault(struct t7000_isp *isp);
++bool isp_smmu_fault(struct t7000_isp *isp);
+ struct isp_surf *isp_surf_alloc(struct t7000_isp *isp, u32 size, u32 tag);
+ void isp_surf_free(struct t7000_isp *isp, struct isp_surf *s);
+ void isp_surf_free_all(struct t7000_isp *isp);
+@@ -339,6 +375,8 @@ void isp_ipc_stop(struct t7000_isp *isp);
+ void isp_fw_shutdown(struct t7000_isp *isp);
+ int isp_cmd_simple(struct t7000_isp *isp, const char *name, void *pkt,
+ 		   u32 insize, u32 outsize, u16 *status);
++void isp_canary_arm(struct t7000_isp *isp);
++void isp_quiet_window(struct t7000_isp *isp, uint ms);
+ 
+ /* isp-sens.c */
+ int isp_sensor_power_on(struct t7000_isp *isp);

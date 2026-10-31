@@ -1,0 +1,41 @@
+#!/bin/bash
+# mkbt - build tools/bt.tgz: BlueZ + dbus + BlueALSA userspace for the phone (Alpine aarch64, musl),
+# stripped to what btup needs and minus everything the initramfs / tools/alsa.tgz already provide.
+# Untar at / on the phone (audioboot does that), then run tools/btup. Verifies the result with bin/btcheck.
+# usage: bin/mkbt   (needs network for the apk downloads; stage lives in var/alpine/bt, gitignored)
+set -e
+cd "$(dirname "$(readlink -f "$0")")/.."
+APK=dl/apk/x/sbin/apk.static
+[ -x $APK ] || { echo "no $APK (run ui/fetch-deps.sh first)"; exit 1; }
+R=var/alpine/bt
+# same Alpine release as tools/alsa.tgz (alsa-lib 1.2.14, mpg123 1.32.10 = v3.22): libasound/libmpg123 come from there, so no clobbering
+# and no ABI skew (v3.24 bluez-alsa plugins need snd_lib_log from alsa-lib 1.2.15). Override: REL=latest-stable bin/mkbt
+REPO=https://dl-cdn.alpinelinux.org/alpine/${REL:-v3.22}
+rm -rf $R; mkdir -p $R
+$APK --arch aarch64 --root $R --initdb --usermode --no-scripts --allow-untrusted \
+	-X $REPO/main -X $REPO/community \
+	add bluez bluez-btmgmt bluez-deprecated bluez-alsa bluez-alsa-utils dbus >/dev/null
+
+BINS="usr/lib/bluetooth/bluetoothd usr/bin/bluetoothctl usr/bin/btmgmt usr/bin/hciconfig usr/bin/hcitool usr/bin/hcidump
+usr/bin/bluealsa usr/bin/bluealsa-aplay usr/bin/bluealsa-cli
+usr/bin/dbus-daemon usr/bin/dbus-send usr/bin/dbus-uuidgen
+usr/lib/alsa-lib/libasound_module_pcm_bluealsa.so usr/lib/alsa-lib/libasound_module_ctl_bluealsa.so"
+# non-ELF payload: configs (dbus policy lets root own org.bluez / org.bluealsa), a few terminfo entries for readline
+DATA="etc/bluetooth/main.conf etc/alsa/conf.d/20-bluealsa.conf
+usr/share/dbus-1/system.conf usr/share/dbus-1/system.d/bluetooth.conf usr/share/dbus-1/system.d/bluealsa.conf
+etc/terminfo/x/xterm etc/terminfo/x/xterm-256color etc/terminfo/l/linux etc/terminfo/v/vt100"
+
+# libs = DT_NEEDED closure minus what initramfs/alsa.tgz already ship (by soname): musl, libasound, libmpg123
+mkdir -p var/alpine/provided
+PROV=var/alpine/provided; rm -rf $PROV; mkdir -p $PROV
+tar xzf tools/alsa.tgz -C $PROV
+mkdir -p $PROV/lib; cp -a $R/lib/ld-musl-aarch64.so.1 $R/lib/libc.musl-aarch64.so.1 $PROV/lib/   # musl is in the initramfs
+LIST=$(mktemp)
+bin/btclosure $R $PROV -- $BINS > $LIST
+for f in $DATA; do echo $f >> $LIST; done
+for f in $(cat $LIST); do [ -e $R/$f ] || [ -L $R/$f ] || { echo "missing $f"; exit 1; }; done
+sort -u $LIST -o $LIST
+tar -C $R --no-recursion --owner=0 --group=0 --numeric-owner -T $LIST -czf tools/bt.tgz.new
+mv tools/bt.tgz.new tools/bt.tgz; rm -f $LIST
+ls -la tools/bt.tgz
+bin/btcheck tools/bt.tgz

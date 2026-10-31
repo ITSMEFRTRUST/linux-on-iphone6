@@ -1,0 +1,26 @@
+#!/usr/bin/env python3
+# run a command on the iPhone (Hoolock initramfs) over USB-net telnet: ph "cmd" [timeout]
+import os, socket, sys, time
+cmd = sys.argv[1]; to = float(sys.argv[2]) if len(sys.argv) > 2 else 8
+s = socket.create_connection((os.environ.get("PHONE_IP", "172.16.43.1"), 23), timeout=5)
+def rd(t):
+    b = b""; s.settimeout(t)
+    try:
+        while True:
+            d = s.recv(65536)
+            if not d: break
+            b += d
+    except socket.timeout: pass
+    # strip telnet IAC negotiation
+    out = bytearray(); i = 0
+    while i < len(b):
+        if b[i] == 255 and i + 2 < len(b): i += 3; continue
+        out.append(b[i]); i += 1
+    return bytes(out)
+rd(1.0)
+s.sendall(b"stty -echo 2>/dev/null; export PS1=''\n"); rd(0.8)
+mark = b"__END__"
+s.sendall(f"{cmd}; echo __E''ND__\n".encode())
+buf = b""; end = time.time() + to
+while time.time() < end and mark not in buf: buf += rd(0.5)
+print(buf.split(mark)[0].decode(errors="replace").replace("\r", "").strip())

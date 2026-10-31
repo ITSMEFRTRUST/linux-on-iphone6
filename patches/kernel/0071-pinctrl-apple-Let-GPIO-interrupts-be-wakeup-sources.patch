@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 23:05:24 +0000
+Subject: [PATCH 071/138] pinctrl: apple: Let GPIO interrupts be wakeup sources
+
+The GPIO irqchip has no irq_set_wake, so enable_irq_wake() fails with
+-ENXIO and gpio-keys aborts system suspend on the "wakeup-source"
+Home and Power buttons. The pin controller needs no setup to wake the
+system from suspend-to-idle (the AIC keeps delivering the bank
+interrupt while the CPUs sit in WFI), so mark the chip
+IRQCHIP_SKIP_SET_WAKE.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/pinctrl/pinctrl-apple-gpio.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/pinctrl/pinctrl-apple-gpio.c b/drivers/pinctrl/pinctrl-apple-gpio.c
+index 6305b96aa..2d132ab51 100644
+--- a/drivers/pinctrl/pinctrl-apple-gpio.c
++++ b/drivers/pinctrl/pinctrl-apple-gpio.c
+@@ -367,7 +367,7 @@ static const struct irq_chip apple_gpio_irqchip = {
+ 	.irq_mask		= apple_gpio_irq_mask,
+ 	.irq_unmask		= apple_gpio_irq_unmask,
+ 	.irq_set_type		= apple_gpio_irq_set_type,
+-	.flags			= IRQCHIP_IMMUTABLE,
++	.flags			= IRQCHIP_IMMUTABLE | IRQCHIP_SKIP_SET_WAKE,
+ 	GPIOCHIP_IRQ_RESOURCE_HELPERS,
+ };
+ 

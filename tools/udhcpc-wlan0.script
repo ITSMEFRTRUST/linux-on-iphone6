@@ -1,0 +1,49 @@
+#!/bin/sh
+# udhcpc lease script for wlan0 (busybox udhcpc env: interface ip mask router dns domain ...), installed as
+# /usr/share/udhcpc/wlan0.script. Default route gets metric 50 so the usb0 link to the PC (172.16.43.x) keeps working.
+# Test hooks: RESOLV_CONF=<file> overrides /etc/resolv.conf.
+PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH
+RESOLV_CONF=${RESOLV_CONF:-/etc/resolv.conf}
+[ -n "$interface" ] || exit 1
+case "$1" in
+deconfig)
+	ip route flush dev $interface 2>/dev/null
+	ip addr flush dev $interface
+	ip link set $interface up
+	;;
+bound|renew)
+	# renew with an unchanged address must not drop it (and the routes) first
+	if ! ip -o -4 addr show dev $interface | grep -q " $ip/"; then
+		ip addr flush dev $interface
+		ip addr add $ip/${mask:-24} ${broadcast:+broadcast $broadcast} dev $interface
+	fi
+	for r in $router; do
+		ip route del default dev $interface metric 50 2>/dev/null
+		ip route add default via $r dev $interface metric 50
+		break
+	done
+	if [ -n "$dns" ]; then
+		# Tailscale MagicDNS (tsup) owns /etc/resolv.conf (nameserver 100.100.100.100) and forwards everything
+		# else to the servers in its backup copy: the DHCP servers go there, so neither side breaks the other
+		R=$RESOLV_CONF
+		B=${RESOLV_CONF%/*}/resolv.pre-tailscale-backup.conf
+		[ -f "$B" ] && grep -q tailscale "$R" 2>/dev/null && R=$B
+		{
+			[ -n "$domain" ] && echo "search $domain"
+			for d in $dns; do echo "nameserver $d"; done
+		} > "$R.new"
+		if cmp -s "$R.new" "$R"; then rm -f "$R.new"; else
+			mv "$R.new" "$R"
+			# tailscaled only reads its backup when its DNS config is rebuilt (netmap/link changes), so a new
+			# network's DNS servers would otherwise stay unused for forwarded names: toggling accept-dns makes it
+			# restore + re-take resolv.conf and re-read the backup now. Backgrounded; only when the servers changed.
+			if [ "$R" = "$B" ] && [ -S /run/tailscale/tailscaled.sock ] && [ -x /data/tailscale/tailscale ]; then
+				( T="/data/tailscale/tailscale --socket=/run/tailscale/tailscaled.sock"
+				  $T set --accept-dns=false && $T set --accept-dns=true ) > /dev/null 2>&1 < /dev/null &
+			fi
+		fi
+	fi
+	echo "$(date +%T) udhcpc: $1 $interface $ip/${mask:-24} gw=${router%% *} dns=$dns" >> /tmp/wifi.log
+	;;
+esac
+exit 0

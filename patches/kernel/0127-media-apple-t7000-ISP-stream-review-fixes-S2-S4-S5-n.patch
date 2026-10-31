@@ -1,0 +1,237 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 02:00:47 +0000
+Subject: [PATCH 127/138] media: apple: t7000 ISP: stream review fixes (S2, S4,
+ S5, nits)
+
+S2: with stream=1 keep_on=0 the load-time power-off runs before
+/dev/isp0 is registered, so no open can race it.
+S4: ref clock bit-30 wait 10 ms -> 200 ms (iOS ~192 ms); warn if busy
+before the write; the restore waits for bit 30 too.
+S5: the first START of a boot sizes the buffers for both cameras (it
+queries the other camera's presets), so rear <-> front on one fd reuses
+them; a START that still needs more allocates a bigger set (the old one
+stays mapped until power-off). INFO.bufsize = real buffer size.
+Nits: stale meta surfaces are only posted when this START has a META
+pool; private_data only set on a successful open.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../media/platform/apple/isp-t7000/isp-cdev.c |  5 +-
+ .../media/platform/apple/isp-t7000/isp-main.c |  9 +--
+ .../media/platform/apple/isp-t7000/isp-scfg.c | 61 +++++++++++++------
+ .../media/platform/apple/isp-t7000/isp-sens.c | 18 +++++-
+ .../platform/apple/isp-t7000/isp-stream.c     |  3 +-
+ 5 files changed, 66 insertions(+), 30 deletions(-)
+
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-cdev.c b/drivers/media/platform/apple/isp-t7000/isp-cdev.c
+index 5c0760a96..afe458421 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-cdev.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-cdev.c
+@@ -34,10 +34,11 @@ static int isp_open(struct inode *inode, struct file *f)
+ 		if (ret)
+ 			isp_teardown(isp);
+ 	}
+-	if (!ret)
++	if (!ret) {
+ 		isp->open_count++;
++		f->private_data = isp;
++	}
+ 	mutex_unlock(&isp_open_lock);
+-	f->private_data = isp;
+ 	return ret;
+ }
+ 
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-main.c b/drivers/media/platform/apple/isp-t7000/isp-main.c
+index 1a30f7d25..6e64a68a8 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-main.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-main.c
+@@ -264,15 +264,16 @@ static int __init isp_init(void)
+ 		goto err_unmap;
+ 	}
+ 	if (isp_stream_en) {
++		/* power off first: /dev/isp0 must not exist while this teardown runs */
++		if (!isp_keep_on) {
++			dev_info(isp->dev, "stream: boot ok; powering the ISP off until /dev/isp0 is opened (keep_on=0)\n");
++			isp_teardown(isp);
++		}
+ 		ret = isp_cdev_init(isp);
+ 		if (ret) {
+ 			isp_teardown(isp);
+ 			goto err_unmap;
+ 		}
+-		if (!isp_keep_on) {
+-			dev_info(isp->dev, "stream: boot ok; powering the ISP off until /dev/isp0 is opened (keep_on=0)\n");
+-			isp_teardown(isp);
+-		}
+ 	}
+ ok:
+ 	dev_info(isp->dev, "loaded, stages done: %d (rmmod unwinds)\n", isp->done);
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-scfg.c b/drivers/media/platform/apple/isp-t7000/isp-scfg.c
+index 9fc155d90..dbb4cf92b 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-scfg.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-scfg.c
+@@ -204,40 +204,47 @@ static void isp_config_meta(struct t7000_isp *isp, u8 *buf)
+ 
+ /*
+  * Frame (+ meta) surfaces and the H2T list area. Surfaces can only be freed after the
+- * ISP is powered off, so they are allocated once per boot and reused by later STARTs
+- * of the same size.
++ * ISP is powered off, so they are allocated once per boot, sized @want (the larger of
++ * the two cameras, see isp_stream_start), and reused by later STARTs. If a START still
++ * needs more, a bigger set is allocated and the old one stays mapped (unused) until
++ * power-off. st->bufsize = the real buffer size = the mmap stride between buffers.
+  */
+-static int isp_alloc_bufs(struct t7000_isp *isp)
++static int isp_alloc_bufs(struct t7000_isp *isp, u32 want)
+ {
+ 	struct isp_stream *st = &isp->st;
+-	u32 n = clamp_t(u32, isp_nbufs, 2, ISP_MAX_BUFS), i;
++	u32 n = clamp_t(u32, isp_nbufs, 2, ISP_MAX_BUFS), i, need = st->bufsize;
++	bool frames, metas;
+ 
+-	if (st->nbufs) {
+-		if (st->buf[0].surf->size == st->bufsize &&
+-		    (!st->meta_size || (st->meta[0].surf && st->meta[0].surf->size >= st->meta_size)))
+-			return 0;
+-		dev_err(isp->dev, "buffers of this boot are 0x%x bytes, preset needs 0x%x: close /dev/isp0 (power cycle) first\n",
+-			st->buf[0].surf->size, st->bufsize);
+-		return -EBUSY;
+-	}
++	frames = !st->nbufs || st->buf[0].surf->size < need;
++	metas = st->meta_size && (frames || !st->meta[0].surf ||
++				  st->meta[0].surf->size < st->meta_size);
++	if (st->nbufs && frames)
++		dev_warn(isp->dev, "buffers of this boot are 0x%x bytes, preset needs 0x%x: allocating a bigger set (the old one is freed at power-off)\n",
++			 st->buf[0].surf->size, need);
+ 	if (!st->lists)
+ 		st->lists = isp_surf_alloc(isp, isp->bh->num * ISP_BUFLIST_SLOT,
+ 					   0x4c465542 /* "BUFL" */);
+ 	if (!st->lists)
+ 		return -ENOMEM;
+-	for (i = 0; i < n; i++) {
+-		st->buf[i].surf = isp_surf_alloc(isp, st->bufsize, 0x304d5246 + (i << 24));
+-		if (!st->buf[i].surf)
+-			return -ENOMEM;
+-		st->buf[i].state = BUF_FREE;
+-		if (!st->meta_size)
+-			continue;
++	if (frames) {
++		st->nbufs = 0;	/* until the new set is complete */
++		for (i = 0; i < n; i++) {
++			st->buf[i].surf = isp_surf_alloc(isp, max(want, need), 0x304d5246 + (i << 24));
++			if (!st->buf[i].surf)
++				return -ENOMEM;
++			st->buf[i].state = BUF_FREE;
++		}
++	} else {
++		n = st->nbufs;
++	}
++	for (i = 0; metas && i < n; i++) {
+ 		st->meta[i].surf = isp_surf_alloc(isp, st->meta_size, 0x3041544d + (i << 24));
+ 		if (!st->meta[i].surf)
+ 			return -ENOMEM;
+ 		st->meta[i].state = BUF_FREE;
+ 	}
+ 	st->nbufs = n;
++	st->bufsize = st->buf[0].surf->size;
+ 	return 0;
+ }
+ 
+@@ -254,6 +261,7 @@ int isp_stream_start(struct t7000_isp *isp, u32 camera)
+ {
+ 	struct isp_stream *st = &isp->st;
+ 	struct isp_cmd_output_config oc = { .h.opcode = CISP_CMD_CH_OUTPUT_CONFIG_SET };
++	u32 want;
+ 	u8 *buf;
+ 	int ret;
+ 
+@@ -268,6 +276,19 @@ int isp_stream_start(struct t7000_isp *isp, u32 camera)
+ 	buf = kzalloc(ISP_POOLGET_SIZE, GFP_KERNEL);
+ 	if (!buf)
+ 		return -ENOMEM;
++	/*
++	 * First START of this boot: size the buffers for the other camera too, so a
++	 * rear <-> front switch on the same fd reuses them (no new allocation).
++	 */
++	want = 0;
++	if (!st->nbufs) {
++		st->ch = !camera;
++		if (!isp_pick_preset(isp, buf))
++			want = st->bufsize;
++		else
++			dev_info(isp->dev, "camera %u not usable: sizing the buffers for camera %u only\n",
++				 !camera, camera);
++	}
+ 	st->ch = camera;
+ 	ret = isp_pick_preset(isp, buf);
+ 	if (ret)
+@@ -310,7 +331,7 @@ int isp_stream_start(struct t7000_isp *isp, u32 camera)
+ 	isp_ch_simple(isp, "SIF_PIXEL_FORMAT_SET", CISP_CMD_CH_SIF_PIXEL_FORMAT_SET, st->ch, 0x14,
+ 		      3 | 1 << 8, 0, false);	/* u8 format 3, u8 type 1 (Asahi) */
+ 	isp_config_meta(isp, buf);
+-	ret = isp_alloc_bufs(isp);
++	ret = isp_alloc_bufs(isp, want);
+ 	if (ret)
+ 		goto out;
+ 	st->seq = 0;
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-sens.c b/drivers/media/platform/apple/isp-t7000/isp-sens.c
+index 2dfbda843..72535f472 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-sens.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-sens.c
+@@ -28,6 +28,7 @@
+ #define REFCLK_PHYS		0x20e010218ULL	/* kRegGroupISPRef0ClkCfg: AppleT7000PMGR 0x8537a38 */
+ #define REFCLK_BUSY		BIT(30)
+ #define REFCLK_KEEP		0xfcffffc0	/* configISPRefClock 0x852b49c */
++#define REFCLK_TIMEOUT_US	200000
+ 
+ #define PIN_AVDD		198
+ #define PIN_SHUT_REAR		190
+@@ -95,10 +96,14 @@ static int isp_refclk_set(struct t7000_isp *isp, int n)
+ 
+ 	isp->refclk_old[n] = old;
+ 	isp->refclk_saved |= BIT(n);
++	if (old & REFCLK_BUSY)
++		dev_warn(isp->dev, "sens_pwr: ref clock %d busy (bit 30) before the write: 0x%08x\n",
++			 n, old);
+ 	writel((old & REFCLK_KEEP) | (isp_refclk_cfg & 0x3f) | ((isp_refclk_cfg >> 6) & 3) << 24, r);
+-	ret = readl_poll_timeout(r, v, !(v & REFCLK_BUSY), 10, 10000);
++	/* iOS waits up to 0x2ee00 (~192 ms) in configISPRefClock */
++	ret = readl_poll_timeout(r, v, !(v & REFCLK_BUSY), 10, REFCLK_TIMEOUT_US);
+ 	dev_info(isp->dev, "sens_pwr: ref clock %d (PMGR +0x%x): 0x%08x -> 0x%08x%s\n", n,
+-		 0x10218 + 4 * n, old, v, ret ? " (TIMEOUT: bit 30 still set after 10 ms)" : "");
++		 0x10218 + 4 * n, old, v, ret ? " (TIMEOUT: bit 30 still set after 200 ms)" : "");
+ 	return ret;
+ }
+ 
+@@ -179,8 +184,15 @@ void isp_sensor_power_off(struct t7000_isp *isp)
+ 		if (isp->extclk_saved & BIT(n))
+ 			writel(isp->extclk_old[n],
+ 			       isp->pinregs + 4 * (n ? PIN_CLK_FRONT : PIN_CLK_REAR));
+-		if (isp->refclk_saved & BIT(n))
++		if (isp->refclk_saved & BIT(n)) {
++			u32 v;
++
+ 			writel(isp->refclk_old[n], isp->refclk + 4 * n);
++			if (readl_poll_timeout(isp->refclk + 4 * n, v, !(v & REFCLK_BUSY), 10,
++					       REFCLK_TIMEOUT_US))
++				dev_warn(isp->dev, "sens_pwr: ref clock %d restore: bit 30 still set (0x%08x)\n",
++					 n, v);
++		}
+ 	}
+ 	isp->extclk_saved = isp->refclk_saved = 0;
+ 	isp_pin_release(isp, 0);
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-stream.c b/drivers/media/platform/apple/isp-t7000/isp-stream.c
+index cf779b9f7..92949b8cf 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-stream.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-stream.c
+@@ -110,7 +110,8 @@ void isp_stream_kick(struct t7000_isp *isp)
+ 		n = 0;
+ 		spin_lock(&st->frame_lock);
+ 		for (i = 0; i < st->nbufs && n < ISP_BUFLIST_MAX; i++) {
+-			if (st->meta[i].surf && st->meta[i].state == BUF_FREE) {
++			/* meta only when this START configured a META pool (stale surfaces stay idle) */
++			if (st->meta_size && st->meta[i].surf && st->meta[i].state == BUF_FREE) {
+ 				pool[n] = ISP_POOL_META;
+ 				idx[n++] = i;
+ 			}

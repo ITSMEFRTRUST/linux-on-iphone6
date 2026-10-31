@@ -1,0 +1,83 @@
+#!/bin/sh
+# audiotest - bring up MCA2 (speaker I2S) on the n61 from userspace and check that frames run.
+# Runs ON THE PHONE (busybox sh) next to /tmp/mem. Push with: bin/push mem audiotest
+# usage: sh /tmp/audiotest PARENT_HZ [stage]     stage: nco | mca | pio | all (default all)
+# Every unknown is an env override, e.g.  FRAME=0x7008 TXCTL=0x20d sh /tmp/audiotest 24000000 mca
+# Register meanings: re/MCA-V1.md. Guessed values are marked "?".
+set -u
+M=/tmp/mem
+PARENT=${1:?usage: audiotest PARENT_HZ [nco|mca|pio|all]}
+STAGE=${2:-all}
+
+MCA=${MCA:-0x20a0a8000}         # MCA2 base
+PMGR=${PMGR:-0x20e020140}       # mca2 power domain
+NCO2=${NCO2:-0x20e013000}       # NCO base 0x20e011000 + 2*0x1000
+RATE=${RATE:-12288000}          # 2 * 48k * 128
+PADS=${PADS:-0x1010}            # 32-16 for tx and rx
+FIFO=${FIFO:-0x007f0004}        # depth-1 <<16 | burst 4
+TXMASK=${TXMASK:-0x1}
+RXMASK=${RXMASK:-0x0}           # no RX for now
+CLKDIV=${CLKDIV:-0x0}           # ? helper not decoded
+FRAME=${FRAME:-0x7000}          # ? slots-1 (8 slots) in [15:12]; width bits unknown
+TXCTL=${TXCTL:-0x109}           # ? enable | slot field 1 <<8 | low nibble 9
+FIFOPORT=${FIFOPORT:-0x20a0aa000}  # ? PIO data port candidate
+NWORDS=${NWORDS:-64}
+
+r() { $M r "$1" | sed 's/^[^:]*: //'; }
+a() { printf '0x%x' $(( $1 + $2 )); }
+st() { echo "status 0x40 = $(r $(a $MCA 0x40))  (b31 frame err, b13 tx ovf, b12 tx unf)"; }
+
+nco() {
+	echo "== NCO2 -> $RATE Hz from $PARENT Hz"
+	# iOS polls CTRL bit30 (busy) before writes; check it once here
+	echo "ctrl before: $(r $NCO2)"
+	if [ -f /tmp/nco.cmd ]; then
+		$M $(cat /tmp/nco.cmd)
+	else
+		echo "no /tmp/nco.cmd - generate on the PC: tools/nco.py $PARENT $RATE > tools/nco.cmd; bin/push nco.cmd"
+		return 1
+	fi
+	$M r $NCO2 5
+}
+
+mca() {
+	echo "== power MCA2"
+	$M w $PMGR 0x20f s 5 r $PMGR
+	echo "== reset"
+	$M w $(a $MCA 0x44) 3 w $(a $MCA 0x48) 1 s 2 r $(a $MCA 0x48)
+	echo "== config"
+	$M w $(a $MCA 0x10) 0 w $(a $MCA 0x1c) 0xd w $(a $MCA 0x30) 0xd \
+	   w $(a $MCA 0x08) $PADS w $(a $MCA 0x20) $FIFO w $(a $MCA 0x34) $FIFO \
+	   w $(a $MCA 0x14) $CLKDIV w $(a $MCA 0x24) $TXMASK w $(a $MCA 0x38) $RXMASK \
+	   w $(a $MCA 0x18) $(printf 0x%x $(( TXCTL & ~1 ))) w $(a $MCA 0x10) 3 \
+	   w $(a $MCA 0x40) 0xb0003000 w $(a $MCA 0x0c) $FRAME
+	st
+	echo "== start TX"
+	$M w $(a $MCA 0x18) $TXCTL w $(a $MCA 0x0c) $(printf 0x%x $(( FRAME | 2 ))) s 20
+	st
+	echo "expect bit12 (TX underflow) = frames are clocking. dump:"
+	$M r $MCA 20
+}
+
+pio() {
+	echo "== PIO: $NWORDS words of square wave to $FIFOPORT"
+	$M w $(a $MCA 0x40) 0xb0003000
+	i=0; args=""
+	while [ $i -lt $NWORDS ]; do
+		if [ $(( (i / 8) % 2 )) -eq 0 ]; then v=0x40004000; else v=0xc000c000; fi
+		args="$args w $FIFOPORT $v"; i=$((i + 1))
+	done
+	$M $args | tail -n 3
+	st
+	echo "TX overflow (b13) = port accepts data faster than it drains -> it IS the FIFO"
+}
+
+stop() { $M w $(a $MCA 0x18) 0 w $(a $MCA 0x44) 0x100 s 2 r $(a $MCA 0x44); }
+
+case $STAGE in
+	nco) nco ;;
+	mca) mca ;;
+	pio) pio ;;
+	stop) stop ;;
+	all) nco && mca && pio ;;
+esac

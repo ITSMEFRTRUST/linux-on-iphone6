@@ -1,0 +1,30 @@
+#!/bin/sh
+# ampon - power the CS35L19 speaker amp by hand (sequence: re/CS35L19.md §3). Runs ON THE PHONE next to /tmp/i2c.
+# usage: sh /tmp/ampon [VOL] | off      VOL = reg 0x10 value: d8 = -20 dB (default), c0 = -32 dB, 00 = 0 dB (LOUD)
+# MCA2 must already be clocking (mcamaster) - the amp is serial-port slave (0x0d = 03).
+# Env: FS=49 (0x08: 48k|DIV2 @12 MHz MCLK; try 09/19 if MCLK_ERR), LOC=20 (0x36 audio slot loc; try 40)
+I="/tmp/i2c 1 40"
+VOL=${1:-d8}; FS=${FS:-49}; LOC=${LOC:-20}
+D=/sys/bus/i2c/devices/1-0040
+if [ "$VOL" = off ]; then
+	$I w 10 19 w 06 80 w 07 fe s 1 w 06 87 s 4
+	echo auto > $D/power/control; exit 0
+fi
+# keep the driver's runtime PM from asserting reset (it owns GPIO 49)
+echo on > $D/power/control; sleep 1
+id=$($I r 01 r 02 r 03 | sed 's/.*=//' | tr '\n' ' ')
+echo "ID: $id (want 35 a1 90)"
+case "$id" in "35 a1 90 ") ;; *) echo "amp not answering - stop"; exit 1;; esac
+$I w 00 99 w 45 3f w 46 05 w 51 ff w 59 0a w 6b 20 w 54 04 w 00 00 >/dev/null
+$I w 00 99 w 66 d0 w 00 00 >/dev/null
+$I w 0a 58 w 0c 0a w 0d 03 w 08 $FS w 0b 2b >/dev/null
+$I w 2d 80 w 2e 80 w 2f 80 w 30 80 w 31 80 w 32 00 w 33 00 w 34 00 w 35 00 >/dev/null
+$I w 36 $LOC w 37 80 w 38 80 >/dev/null
+$I w 10 19 w 06 80 >/dev/null
+$I w 07 f8 w 09 aa w 0f 04 w 11 1c w 0e c4 w 12 70 w 3a 8a w 3b 10 w 3c 73 w 3d 03 >/dev/null
+$I s 10 w 06 00 s 8 >/dev/null
+$I r 15 r 15 r 16 r 16 >/dev/null
+echo "status after power-up (want 00 00; b3 MCLK_ERR, b6 CAL_ERR, b2 AMP_SHORT, b1/0 OTW/OTE):"
+$I r 15 r 16
+$I w 17 5a w 18 40 w 17 00 w 23 6a w 24 80 w 25 30 w 29 14 w 2a 89 w 11 14 >/dev/null
+$I w 10 $VOL r 10

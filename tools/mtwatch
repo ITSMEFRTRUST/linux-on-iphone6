@@ -1,0 +1,20 @@
+#!/bin/sh
+# mtwatch SECS - poll the N61 touch IRQ (GPIO 3, active-low), read whole frames (EB length + data phase);
+# log to /tmp/touch.log. Counter alternates 1/2 after each good frame.
+S="/tmp/spi /dev/spidev0.0 4000000 0"
+n=$(( ${1:-60} * 20 )); c=1; : > /tmp/touch.log
+while [ $n -gt 0 ]; do
+	g=$(/tmp/mem r 20e30000c 1)
+	case "$g" in *[02468ace])
+		r=$($S eb0$c$(printf '%024d' 0)$(printf '%02x' $((0xeb + c)))00)
+		set -- $r
+		if [ "$1" = e1 ] || [ "$1" = e0 ]; then
+			len=$((0x$3$2)); pad=$(( (len + 5) - 5 ))
+			d=$($S eb0${c}01$(printf "%0$((pad * 2))d" 0)$(printf '%02x' $((0xec + c)))00 | tr '\n' ' ')
+			echo "$(cut -d' ' -f1 /proc/uptime) len $len | $d" >> /tmp/touch.log
+			c=$((3 - c))
+		else echo "$(cut -d' ' -f1 /proc/uptime) bad len reply $r" >> /tmp/touch.log; fi;;
+	esac
+	n=$((n - 1)); usleep 50000
+done
+echo done >> /tmp/touch.log

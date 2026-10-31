@@ -1,0 +1,107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 20:38:36 +0000
+Subject: [PATCH 083/138] usb: dwc2: Optionally stay up across system suspend
+ while connected
+
+LOCAL (Hoolock, N61). The only console of the phone is telnet over the
+NCM gadget, and netconsole runs over the same link. dwc2's system
+suspend soft-disconnects the gadget and powers the PHY down, so every
+suspend-to-idle drops the link, the host re-enumerates on resume, and
+nothing printed during resume reaches netconsole until it has.
+
+Add dwc2.suspend_keep (0644): 0 = mainline behaviour; 1 (default) =
+leave the controller and PHY running when a host has the gadget
+addressed and in L0, and suspend as before otherwise (cable out, no
+host); 2 = never suspend the controller. While suspended the dwc2
+interrupt is masked by the IRQ core, so the host sees NAKs; the pending
+interrupt is replayed on resume. The PMGR domains stay on across
+suspend, so no register state is lost.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/usb/dwc2/core.h     |  3 +++
+ drivers/usb/dwc2/platform.c | 35 +++++++++++++++++++++++++++++++++++
+ 2 files changed, 38 insertions(+)
+
+diff --git a/drivers/usb/dwc2/core.h b/drivers/usb/dwc2/core.h
+index 767251aa1..9206e4129 100644
+--- a/drivers/usb/dwc2/core.h
++++ b/drivers/usb/dwc2/core.h
+@@ -876,6 +876,8 @@ struct dwc2_hregs_backup {
+  * @reset_phy_on_wake:	Quirk saying that we should assert PHY reset on a
+  *			remote wakeup.
+  * @phy_off_for_suspend: Status of whether we turned the PHY off at suspend.
++ * @kept_in_suspend:	System suspend left the controller and PHY running
++ *			(platform suspend_keep parameter).
+  * @need_phy_for_wake:	Quirk saying that we should keep the PHY on at
+  *			suspend if we need USB to wake us up.
+  * @frame_number:       Frame number read from the core. For both device
+@@ -1074,6 +1076,7 @@ struct dwc2_hsotg {
+ 	unsigned int reset_phy_on_wake:1;
+ 	unsigned int need_phy_for_wake:1;
+ 	unsigned int phy_off_for_suspend:1;
++	unsigned int kept_in_suspend:1;
+ 	u16 frame_number;
+ 
+ 	struct phy *phy;
+diff --git a/drivers/usb/dwc2/platform.c b/drivers/usb/dwc2/platform.c
+index ef0d73077..76810c8d6 100644
+--- a/drivers/usb/dwc2/platform.c
++++ b/drivers/usb/dwc2/platform.c
+@@ -646,6 +646,29 @@ static int dwc2_driver_probe(struct platform_device *dev)
+ 	return retval;
+ }
+ 
++/*
++ * suspend_keep: 0 = always suspend (soft-disconnect the gadget, PHY off);
++ * 1 = leave the controller and PHY running while a host has the gadget in L0
++ * (a USB console / netconsole survives suspend-to-idle without re-enumerating;
++ * the host just sees NAKs until resume), suspend as usual otherwise;
++ * 2 = never suspend the controller.
++ */
++static int suspend_keep = 1;
++module_param(suspend_keep, int, 0644);
++MODULE_PARM_DESC(suspend_keep,
++		 "System suspend: 0 = power down, 1 = stay up while a host is connected, 2 = always stay up");
++
++static bool dwc2_keep_in_suspend(struct dwc2_hsotg *dwc2)
++{
++	int keep = READ_ONCE(suspend_keep);
++
++	if (keep >= 2)
++		return true;
++
++	return keep == 1 && dwc2_is_device_mode(dwc2) &&
++	       dwc2->lx_state == DWC2_L0 && dwc2->connected;
++}
++
+ static int __maybe_unused dwc2_suspend(struct device *dev)
+ {
+ 	struct dwc2_hsotg *dwc2 = dev_get_drvdata(dev);
+@@ -655,6 +678,13 @@ static int __maybe_unused dwc2_suspend(struct device *dev)
+ 	if (!dwc2->ll_hw_enabled)
+ 		return 0;
+ 
++	dwc2->kept_in_suspend = dwc2_keep_in_suspend(dwc2);
++	if (dwc2->kept_in_suspend) {
++		dev_info(dev, "staying up across suspend (suspend_keep=%d)\n",
++			 READ_ONCE(suspend_keep));
++		return 0;
++	}
++
+ 	is_device_mode = dwc2_is_device_mode(dwc2);
+ 	if (is_device_mode)
+ 		dwc2_hsotg_suspend(dwc2);
+@@ -735,6 +765,11 @@ static int __maybe_unused dwc2_resume(struct device *dev)
+ 	if (!dwc2->ll_hw_enabled)
+ 		return 0;
+ 
++	if (dwc2->kept_in_suspend) {
++		dwc2->kept_in_suspend = false;
++		return 0;
++	}
++
+ 	if (dwc2->phy_off_for_suspend && dwc2->ll_hw_enabled) {
+ 		ret = __dwc2_lowlevel_hw_enable(dwc2);
+ 		if (ret)

@@ -1,0 +1,66 @@
+#!/bin/sh
+# A8 ISP bring-up test (busybox sh, on the phone).
+#   isptest [param=val ...]      insmod apple-isp.ko with these params, show the ISP dmesg
+#   RM=1 isptest [param=val ...] same, then rmmod (unwind) and show the dmesg again
+#   isptest rm                   rmmod apple_isp, show the dmesg
+#   isptest log [N]              last N (default 60) ISP dmesg lines
+#   QUIET=1 isptest …            console loglevel 4 for the run (dmesg itself keeps everything)
+#   fwlog=1 as a module param prints the fw's own TERMINAL lines (ISPCPU:), rate-limited
+# Files (push with: bin/ph "mkdir -p /tmp/isp"; bin/push isp/isptest isp/apple-isp.ko isp/isp-t7000.bin):
+#   KO=/tmp/isp/apple-isp.ko  FW=/tmp/isp/isp-t7000.bin -> /lib/firmware/apple/isp-t7000.bin
+# Examples: isptest dry_run=1 ; isptest stage=1 ; RM=1 isptest stage=2
+# Stream (stage 10): isptest stage=9 stream=1 irq=1 ; /tmp/isp/ispcat -n 60 ; isptest rm
+KO=${KO:-/tmp/isp/apple-isp.ko}
+FW=${FW:-/tmp/isp/isp-t7000.bin}
+N=${N:-60}
+MARK=""	# /dev/kmsg marker of this run: the log starts there (dmesg is never cleared)
+# this module's lines + the kernel lines that matter in a bad run (IRQ storm, oops, SError, DART)
+PAT='apple-isp|isptest-run|nobody cared|Disabling IRQ|WARNING|BUG|Oops|SError|Unable to handle|Internal error|Kernel panic|Call trace|lockup|hung|blocked for more|dart'
+log() {
+	if [ -n "$MARK" ]; then dmesg | sed -n "/$MARK/,\$p"; else dmesg; fi |
+		grep -E "$PAT" | tail -n "${1:-$N}"
+}
+# QUIET=1: console loglevel 4 during the run (fbcon renders fewer lines), restored after
+OLDLVL=""
+quiet() { [ "$QUIET" = 1 ] && OLDLVL=$(cut -f1 /proc/sys/kernel/printk) && dmesg -n 4; }
+unquiet() { [ -n "$OLDLVL" ] && dmesg -n "$OLDLVL"; }
+loaded() { grep -q '^apple_isp ' /proc/modules; }
+case "$1" in
+log) log "${2:-$N}"; exit 0 ;;
+rm)
+	loaded || { echo "apple_isp is not loaded"; exit 1; }
+	rmmod apple_isp; echo "rmmod rc=$?"; log 40; exit 0 ;;
+esac
+if loaded; then
+	echo "apple_isp is already loaded: run 'isptest rm' first"; exit 1
+fi
+[ -f "$KO" ] || { echo "missing $KO"; exit 1; }
+if [ ! -f /lib/firmware/apple/isp-t7000.bin ]; then
+	if [ -f "$FW" ]; then
+		mkdir -p /lib/firmware/apple && cp "$FW" /lib/firmware/apple/isp-t7000.bin &&
+			echo "installed $FW -> /lib/firmware/apple/isp-t7000.bin"
+	else
+		echo "warning: no firmware ($FW); stage >= 3 and dry_run will report request_firmware -2"
+	fi
+fi
+# stream test: Apple setfiles (tuning, optional) pushed as /tmp/isp/isp_*_01XX.dat
+for sf in "$(dirname "$KO")"/isp_*_01XX.dat; do
+	[ -f "$sf" ] || continue
+	b=$(basename "$sf")
+	[ -f "/lib/firmware/apple/$b" ] || { mkdir -p /lib/firmware/apple && cp "$sf" "/lib/firmware/apple/$b" &&
+		echo "installed $sf -> /lib/firmware/apple/$b"; }
+done
+echo "insmod $KO $*"
+MARK="isptest-run-$$-$(date +%s)"
+echo "$MARK $*" > /dev/kmsg 2>/dev/null || MARK=""
+quiet
+insmod "$KO" "$@"
+echo "insmod rc=$?"
+unquiet
+log
+if [ "$RM" = 1 ] && loaded; then
+	sleep 1
+	rmmod apple_isp
+	echo "rmmod rc=$?"
+	log 40
+fi

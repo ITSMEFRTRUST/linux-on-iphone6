@@ -1,0 +1,128 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 02:25:20 +0000
+Subject: [PATCH 129/138] media: apple: t7000 ISP: program the DART/SMMU error
+ reflector like iOS
+
+H2 wedged the SoC ~50 ms after CH_START (pipeline DMA start), right
+after a SHAREDMALLOC of 12.8 MB. iOS AppleS5L8960XDART writes
+DART+0x24 and SMMU+0x24 = error-reflector >> 12 (ADT dart-isp
+error-reflector = 2 x 0x2_0fff_f000) on every restore (DART kext
+0x7fe627c / 0x7fe63c4); a translation fault then completes to that sink
+page. We never wrote it, so the first faulting pipeline transaction had
+nowhere to go. dart_reflector=1 (default) programs both and restores the
+old values at DART off; the DART log now also prints +0x20/+0x24/+0x30
+and SMMU +0xc/+0x20/+0x24. dart_alias=1 (test knob) maps IOVA 1-2 GB
+(TTBR index 1) to the same L1, for fw addresses 0x4xxxxxxx.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../media/platform/apple/isp-t7000/isp-dart.c | 22 ++++++++++++++++++-
+ .../media/platform/apple/isp-t7000/isp-main.c |  7 ++++++
+ drivers/media/platform/apple/isp-t7000/isp.h  |  9 +++++++-
+ 3 files changed, 36 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-dart.c b/drivers/media/platform/apple/isp-t7000/isp-dart.c
+index 7f40045f1..84cbf6390 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-dart.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-dart.c
+@@ -26,6 +26,10 @@ void isp_dart_log(struct t7000_isp *isp, const char *when)
+ 	u32 s[16];
+ 	int i;
+ 
++	dev_info(isp->dev, "dart %s: fetch-cfg %08x err-reflector %08x diag %08x; smmu stream-en %08x +0x20 %08x err-reflector %08x\n",
++		 when, dart_rd(isp, DART_FETCH_CFG), dart_rd(isp, DART_ERR_REFLECT),
++		 dart_rd(isp, DART_DIAG_CFG), isp_rd(isp, ISP_SMMU + SMMU_STREAM_EN),
++		 isp_rd(isp, ISP_SMMU + 0x20), isp_rd(isp, ISP_SMMU + SMMU_ERR_REFLECT));
+ 	dev_info(isp->dev, "dart %s: cmd %08x tcr %08x err %08x erraddr %08x ttbr0 %08x %08x %08x %08x\n",
+ 		 when, dart_rd(isp, DART_STREAM_CMD), dart_rd(isp, DART_TCR),
+ 		 dart_rd(isp, DART_ERROR), dart_rd(isp, DART_ERROR_ADDR),
+@@ -96,12 +100,24 @@ int isp_dart_init(struct t7000_isp *isp)
+ 	dart_wr(isp, DART_TCR, tcr & ~m);
+ 	err = dart_rd(isp, DART_ERROR);
+ 	dart_wr(isp, DART_ERROR, err);
++	/*
++	 * iOS AppleS5L8960XDART restore (DART kext 0x7fe627c, 0x7fe63c4): DART+0x24 and
++	 * SMMU+0x24 = error-reflector >> 12. A translation fault then completes to that
++	 * sink page instead of going nowhere (= a fabric wedge).
++	 */
++	isp->dart_old_reflect = dart_rd(isp, DART_ERR_REFLECT);
++	isp->smmu_old_reflect = isp_rd(isp, ISP_SMMU + SMMU_ERR_REFLECT);
++	if (isp_dart_reflector) {
++		dart_wr(isp, DART_ERR_REFLECT, (u32)(ISP_ERR_REFLECTOR >> 12));
++		isp_wr(isp, ISP_SMMU + SMMU_ERR_REFLECT, (u32)(ISP_ERR_REFLECTOR >> 12));
++	}
+ 	for (sid = 0; sid < 4; sid++) {
+ 		if (!(isp_dart_sids & BIT(sid)))
+ 			continue;
+ 		dart_wr(isp, DART_TTBR(sid, 0), DART_TTBR_VALID | (u32)(isp->l1_dma >> 12));
+ 		for (i = 1; i < 4; i++)
+-			dart_wr(isp, DART_TTBR(sid, i), 0);
++			dart_wr(isp, DART_TTBR(sid, i), i == 1 && isp_dart_alias ?
++				DART_TTBR_VALID | (u32)(isp->l1_dma >> 12) : 0);
+ 	}
+ 	dart_wr(isp, DART_TCR, (tcr & ~m) | (0x80808080U & m));
+ 	isp->dart_on = true;
+@@ -132,6 +148,10 @@ void isp_dart_fini(struct t7000_isp *isp)
+ 			for (i = 0; i < 4; i++)
+ 				dart_wr(isp, DART_TTBR(sid, i), 0);
+ 	isp_dart_flush(isp);	/* still dart_on: drop any cached translation */
++	if (isp_dart_reflector) {
++		dart_wr(isp, DART_ERR_REFLECT, isp->dart_old_reflect);
++		isp_wr(isp, ISP_SMMU + SMMU_ERR_REFLECT, isp->smmu_old_reflect);
++	}
+ 	isp->dart_on = false;
+ 	dev_info(isp->dev, "dart: translation disabled\n");
+ }
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-main.c b/drivers/media/platform/apple/isp-t7000/isp-main.c
+index d3a054724..0778e9f2e 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-main.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-main.c
+@@ -137,6 +137,13 @@ void isp_trace_mark(struct t7000_isp *isp, const char *fmt, ...)
+ 		msleep(50);
+ }
+ 
++int isp_dart_reflector = 1;
++module_param_named(dart_reflector, isp_dart_reflector, int, 0444);
++MODULE_PARM_DESC(dart_reflector, "1 = program the DART + SMMU error reflector (+0x24 = 0x20ffff000 >> 12, ADT error-reflector) like iOS, so a faulting ISP DMA completes harmlessly instead of wedging the fabric");
++int isp_dart_alias;
++module_param_named(dart_alias, isp_dart_alias, int, 0444);
++MODULE_PARM_DESC(dart_alias, "1 = also point TTBR index 1 (IOVA 1-2 GB) at the same L1, so fw addresses 0x4xxxxxxx alias 0x0xxxxxxx (test knob)");
++
+ static struct t7000_isp *the_isp;
+ 
+ static int isp_stage_power(struct t7000_isp *isp)
+diff --git a/drivers/media/platform/apple/isp-t7000/isp.h b/drivers/media/platform/apple/isp-t7000/isp.h
+index e3ef1c67a..05629f66e 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp.h
++++ b/drivers/media/platform/apple/isp-t7000/isp.h
+@@ -76,6 +76,12 @@
+ #define DART_ERROR_FLAG		BIT(31)
+ #define DART_ERROR_ADDR		0x1c
+ #define DART_TTBR(sid, i)	(0x40 + 0x10 * (sid) + 4 * (i))
++#define DART_FETCH_CFG		0x20		/* iOS: ADT fetch-config (0xe0303) */
++#define DART_ERR_REFLECT	0x24		/* iOS: ADT error-reflector >> 12 */
++#define DART_DIAG_CFG		0x30		/* iOS: written on restore */
++#define SMMU_STREAM_EN		0xc		/* iOS: byte[sid] |= 0x80 */
++#define SMMU_ERR_REFLECT	0x24		/* iOS: error-reflector[1] >> 12 */
++#define ISP_ERR_REFLECTOR	0x20ffff000ULL	/* ADT dart-isp error-reflector: 2 x 0x2_0fff_f000 */
+ #define DART_TTBR_VALID		BIT(31)
+ #define DART_PTE_VALID		0x3		/* A8: tables + leaves need bits 1:0 = 11 */
+ #define DART_PTE_PA		GENMASK_ULL(35, 12)
+@@ -206,6 +212,7 @@ struct t7000_isp {
+ 
+ 	/* mini DART */
+ 	bool dart_on;
++	u32 dart_old_reflect, smmu_old_reflect;
+ 	u64 *l1;
+ 	dma_addr_t l1_dma;
+ 	u64 *l2[512];
+@@ -259,7 +266,7 @@ extern int isp_dry_run, isp_irq_en, isp_sens, isp_smmu_en, isp_graceful, isp_fwl
+ extern uint isp_fw_iova, isp_dart_sids, isp_platform_id, isp_poll_ms;
+ extern uint isp_boot_timeout_ms, isp_cmd_timeout_ms, isp_max_shared_mb;
+ extern int isp_sens_pwr, isp_refclk, isp_extclk_periph, isp_stream_en, isp_stream_dump;
+-extern int isp_keep_on, isp_preset, isp_stream_nostart;
++extern int isp_keep_on, isp_preset, isp_stream_nostart, isp_dart_reflector, isp_dart_alias;
+ extern uint isp_refclk_cfg, isp_nbufs, isp_out_range, isp_setfile_rear, isp_setfile_front;
+ 
+ /*

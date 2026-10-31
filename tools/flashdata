@@ -1,0 +1,76 @@
+#!/bin/sh
+# flashdata - Linux side of the phone's writable data area: an ext4 living in the extents of
+# /private/var/linux/disk.img, a file iOS preallocated for us (tools/ios-l2p, bin/iosdisk).
+# Nothing outside those extents is ever written: asp.ko only accepts writes inside its windows.
+# /etc/flashdata.conf (baked into the blob via var/extra-rd/etc/):
+#   EXTENTS="devoff:len ..."   bytes, relative to the APFS container partition (asp0n1p1)
+#   UUID=...                   ext4 UUID, written after `flashdata mkfs`; mount refuses any other fs
+# usage: flashdata hash        sha256 of the first + last MiB of each extent (read-only, any asp load)
+#        flashdata load        (re)load asp.ko writable inside the extents only
+#        flashdata mkfs        create the ext4 (refuses if UUID is set and found on disk)
+#        flashdata mount [dir] e2fsck + mount (default /data)
+CONF=/etc/flashdata.conf
+[ -f $CONF ] && . $CONF
+[ -n "$EXTENTS" ] || { echo "flashdata: no EXTENTS in $CONF"; exit 1; }
+DEV=/dev/asp0n1p1
+MAP=/dev/mapper/odata
+fs_uuid() { tune2fs -l $MAP 2>/dev/null | sed -n 's/^Filesystem UUID: *//p'; }
+# the container partition's byte offset is needed before asp is loaded (it can't be reloaded),
+# so it's fixed here (GPT LBA 6 x 4 KiB) and checked against sysfs right after the load
+PART=${PART:-24576}
+
+hash() {
+	for e in $EXTENTS; do
+		off=${e%:*}; len=${e#*:}
+		c=256; [ $len -lt 1048576 ] && c=$((len / 4096))
+		h=$(dd if=$DEV bs=4096 skip=$((off / 4096)) count=$c 2>/dev/null | sha256sum | cut -c1-64)
+		t=$(dd if=$DEV bs=4096 skip=$(((off + len) / 4096 - c)) count=$c 2>/dev/null | sha256sum | cut -c1-64)
+		echo "$off $len $h $t"
+	done
+}
+
+load() {
+	p=$PART; s=; l=
+	for e in $EXTENTS; do
+		s=$s${s:+,}$((p + ${e%:*})); l=$l${l:+,}${e#*:}
+	done
+	[ -e $MAP ] && dmsetup remove odata
+	grep -q "^asp " /proc/modules && { echo "flashdata: asp already loaded (no rmmod) - reboot to reload"; exit 1; }
+	insmod /lib/modules/asp.ko allow_write=1 write_start=$s write_len=$l || exit 1
+	for i in $(seq 300); do [ -b $DEV ] && break; usleep 100000; done
+	[ -b $DEV ] || { echo "flashdata: $DEV never appeared"; exit 1; }
+	[ $(( $(cat /sys/block/asp0n1/asp0n1p1/start) * 512 )) -eq $p ] || { echo "flashdata: partition start != $p, not mapping"; exit 1; }
+	# linear map of the extents, in 512-byte sectors relative to the partition
+	pos=0; tab=
+	for e in $EXTENTS; do
+		n=$((${e#*:} / 512))
+		tab="$tab$pos $n linear $DEV $((${e%:*} / 512))
+"
+		pos=$((pos + n))
+	done
+	printf %s "$tab" | dmsetup create odata || exit 1
+	echo "flashdata: $MAP = $((pos / 2048)) MiB"
+}
+
+case "$1" in
+hash) hash ;;
+load) load ;;
+mkfs)
+	[ -b $MAP ] || load
+	if [ -n "$UUID" ] && [ "$(fs_uuid)" = "$UUID" ] && [ -z "$FORCE" ]; then
+		echo "flashdata: ext4 $UUID already there (FORCE=1 to wipe)"; exit 1
+	fi
+	mke2fs -q -F -t ext4 -E nodiscard,lazy_itable_init=0,lazy_journal_init=0 -m 0 -L orchard $MAP || exit 1
+	sync
+	echo "UUID=$(fs_uuid)"
+	;;
+mount)
+	dir=${2:-/data}
+	[ -b $MAP ] || load
+	[ -n "$UUID" ] || { echo "flashdata: no UUID in $CONF, run mkfs first"; exit 1; }
+	[ "$(fs_uuid)" = "$UUID" ] || { echo "flashdata: UUID mismatch, not mounting"; exit 1; }
+	e2fsck -p $MAP
+	mkdir -p $dir && mount -t ext4 -o noatime $MAP $dir && echo "flashdata: mounted on $dir"
+	;;
+*) sed -n '2,15p' $0 ;;
+esac

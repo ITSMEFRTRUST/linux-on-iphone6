@@ -1,0 +1,284 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 03:02:04 +0000
+Subject: [PATCH 067/138] drm: adp: t7000: hand over from simpledrm last, kill
+ IRQ storms
+
+Probe used to remove simpledrm before the vram mapping, gen_pool, modeset
+init, request_irq and drm_dev_register: any later failure left the phone
+with no display driver at all. Do every fallible step first, register,
+and only then remove simpledrm (aperture_remove_conflicting_devices()
+cannot fail). A failed probe now always leaves simpledrm in place.
+
+The IRQ storm guard only masked non-VBI sources in ADP_IRQ_EN, which
+does nothing for a stuck VBI bit, a source the enable mask does not
+gate, or a line asserted with a zero status. Count every invocation in
+a 100 ms window; past 200 mask all but VBI as before, past 1000 mask
+the block, disable_irq_nosync() the line and complete vblanks/flips
+from a 60 Hz hrtimer so nothing waits on timeouts afterwards.
+
+Also never follow a DART table pointer outside A8 DRAM (a cacheable
+read of unclaimed MMIO can hang), and add two test parameters:
+test_fail=1 fails the probe at its last step, test_noack=1 never acks
+the status so the storm guard can be exercised.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/gpu/drm/adp/adp-t7000.c | 167 +++++++++++++++++++++++++-------
+ 1 file changed, 134 insertions(+), 33 deletions(-)
+
+diff --git a/drivers/gpu/drm/adp/adp-t7000.c b/drivers/gpu/drm/adp/adp-t7000.c
+index c87833d80..c42f509a5 100644
+--- a/drivers/gpu/drm/adp/adp-t7000.c
++++ b/drivers/gpu/drm/adp/adp-t7000.c
+@@ -22,6 +22,7 @@
+ #include <linux/aperture.h>
+ #include <linux/bitfield.h>
+ #include <linux/genalloc.h>
++#include <linux/hrtimer.h>
+ #include <linux/interrupt.h>
+ #include <linux/io.h>
+ #include <linux/irqdomain.h>
+@@ -100,6 +101,20 @@
+ 
+ #define ADP_PITCH_ALIGN		64
+ 
++/* DRAM window on A8 (1 GB at 0x800000000): DART table pointers outside it are never followed */
++#define T7000_DRAM_BASE		0x800000000ULL
++#define T7000_DRAM_SIZE		SZ_1G
++
++/*
++ * IRQ storm guard, per window: normal traffic is ~6 VBI + ~6 packet-done (+ per-frame error bits) per
++ * 100 ms. Past STORM_MASK every source but VBI is masked in ADP_IRQ_EN; past STORM_KILL (status stuck
++ * after the W1C ack, a source the enable mask doesn't gate, or the line asserted with status 0) the AIC
++ * line is disabled for good and an hrtimer stands in for the vblank interrupt.
++ */
++#define ADPT_STORM_WINDOW	(HZ / 10 ?: 1)
++#define ADPT_STORM_MASK		200
++#define ADPT_STORM_KILL		1000
++
+ static bool standalone;
+ module_param(standalone, bool, 0444);
+ MODULE_PARM_DESC(standalone, "test mode: create the device without a DT node (hard-coded A8 addresses)");
+@@ -115,6 +130,12 @@ MODULE_PARM_DESC(verify_dart, "walk iBoot's dart-disp0 tables and only use the l
+ static bool force;
+ module_param(force, bool, 0444);
+ MODULE_PARM_DESC(force, "probe even if the iBoot pipe state looks unexpected");
++static bool test_fail;
++module_param(test_fail, bool, 0444);
++MODULE_PARM_DESC(test_fail, "test: fail the probe at its last step, after all setup (simpledrm must stay)");
++static bool test_noack;
++module_param(test_noack, bool, 0444);
++MODULE_PARM_DESC(test_noack, "test: never ack ADP IRQs (forces a storm on the first enabled bit, exercises the guard)");
+ 
+ struct adpt {
+ 	struct drm_device drm;
+@@ -147,6 +168,9 @@ struct adpt {
+ 	struct drm_pending_vblank_event *event;
+ 	unsigned long storm_jiffies;
+ 	unsigned int storm_count;
++	bool irq_dead;		/* storm guard disabled the line; vbl_timer fakes vblanks */
++	struct hrtimer vbl_timer;
++	ktime_t vbl_period;
+ };
+ 
+ #define to_adpt(x) container_of(x, struct adpt, drm)
+@@ -268,38 +292,16 @@ static void adpt_irq_en(struct adpt *adp, u32 set, u32 clear)
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&adp->irq_lock, flags);
++	if (adp->irq_dead)
++		set = 0;	/* the line is off for good: keep the block quiet too */
+ 	writel((readl(adp->adp + ADP_IRQ_EN) & ~clear) | set, adp->adp + ADP_IRQ_EN);
+ 	spin_unlock_irqrestore(&adp->irq_lock, flags);
+ }
+ 
+-static irqreturn_t adpt_irq(int irq, void *arg)
++/* vblank accounting + flip completion for status bits @st (from the IRQ or from vbl_timer) */
++static void adpt_handle_events(struct adpt *adp, u32 st)
+ {
+-	struct adpt *adp = arg;
+ 	struct drm_crtc *crtc = &adp->crtc;
+-	u32 st;
+-
+-	st = readl(adp->adp + ADP_IRQ_STATUS);
+-	if (!st)
+-		return IRQ_NONE;
+-	writel(st, adp->adp + ADP_IRQ_STATUS);	/* W1C, as iOS does */
+-
+-	if (time_after(jiffies, adp->storm_jiffies + HZ)) {
+-		adp->storm_jiffies = jiffies;
+-		adp->storm_count = 0;
+-	}
+-	if (++adp->storm_count > 1000) {
+-		/* never let a stuck status bit take the phone down: keep VBI only */
+-		adpt_irq_en(adp, 0, (u32)~ADP_IRQ_VBI);
+-		drm_err_ratelimited(&adp->drm, "IRQ storm, status %08x: masked all but VBI\n", st);
+-	}
+-
+-	if (st & ADP_IRQ_ERRORS)
+-		drm_err_ratelimited(&adp->drm, "ADP error status %08x%s%s%s%s%s\n", st,
+-				    st & ADP_IRQ_UNDERRUN ? " underrun" : "",
+-				    st & ADP_IRQ_PKT_MISSED ? " packet-missed" : "",
+-				    st & ADP_IRQ_PF_ALIGN ? " fifo-align" : "",
+-				    st & ADP_IRQ_PF_OVER ? " fifo-overflow" : "",
+-				    st & ADP_IRQ_RDERR ? " read-error" : "");
+ 
+ 	if (st & ADP_IRQ_VBI)
+ 		drm_crtc_handle_vblank(crtc);
+@@ -321,7 +323,78 @@ static irqreturn_t adpt_irq(int irq, void *arg)
+ 		}
+ 	}
+ 	spin_unlock(&adp->drm.event_lock);
++}
++
++/* stand-in for IRQ 103 once the storm guard killed it: flips still complete, nothing waits for timeouts */
++static enum hrtimer_restart adpt_vbl_timer(struct hrtimer *t)
++{
++	struct adpt *adp = container_of(t, struct adpt, vbl_timer);
++
++	adpt_handle_events(adp, ADP_IRQ_VBI | ADP_IRQ_PKT_DONE);
++	hrtimer_forward_now(t, adp->vbl_period);
++	return HRTIMER_RESTART;
++}
++
++static void adpt_vbl_timer_cancel(void *arg)
++{
++	hrtimer_cancel(&((struct adpt *)arg)->vbl_timer);
++}
++
++/* true when the guard decided to stop taking this interrupt */
++static bool adpt_storm_guard(struct adpt *adp, u32 st)
++{
++	if (adp->irq_dead)
++		return true;
++	if (time_after(jiffies, adp->storm_jiffies + ADPT_STORM_WINDOW)) {
++		adp->storm_jiffies = jiffies;
++		adp->storm_count = 0;
++	}
++	adp->storm_count++;
++	if (adp->storm_count == ADPT_STORM_MASK + 1) {
++		/* a stuck non-VBI status bit: keep VBI only (flips fall back to the VBI watchdog) */
++		adpt_irq_en(adp, 0, (u32)~ADP_IRQ_VBI);
++		drm_err_ratelimited(&adp->drm, "IRQ storm, status %08x: masked all but VBI\n", st);
++	}
++	if (adp->storm_count <= ADPT_STORM_KILL)
++		return false;
++
++	/*
++	 * Still storming with only VBI enabled (or nothing we can mask): never let it take the phone
++	 * down. Mask the block, turn the AIC line off and fake vblanks from a timer from now on.
++	 */
++	adp->irq_dead = true;
++	adpt_irq_en(adp, 0, ~0u);
++	disable_irq_nosync(adp->irq);
++	hrtimer_start(&adp->vbl_timer, adp->vbl_period, HRTIMER_MODE_REL_HARD);
++	drm_err_ratelimited(&adp->drm,
++			    "IRQ %d storm (%u in %u ms, status %08x): line disabled, timer vblank from now on\n",
++			    adp->irq, adp->storm_count, jiffies_to_msecs(ADPT_STORM_WINDOW), st);
++	return true;
++}
++
++static irqreturn_t adpt_irq(int irq, void *arg)
++{
++	struct adpt *adp = arg;
++	u32 st;
++
++	st = readl(adp->adp + ADP_IRQ_STATUS);
++	/* counted before the !st check: a line asserted with a zero status is a storm too */
++	if (adpt_storm_guard(adp, st))
++		return IRQ_HANDLED;
++	if (!st)
++		return IRQ_NONE;
++	if (!test_noack)
++		writel(st, adp->adp + ADP_IRQ_STATUS);	/* W1C, as iOS does */
++
++	if (st & ADP_IRQ_ERRORS)
++		drm_err_ratelimited(&adp->drm, "ADP error status %08x%s%s%s%s%s\n", st,
++				    st & ADP_IRQ_UNDERRUN ? " underrun" : "",
++				    st & ADP_IRQ_PKT_MISSED ? " packet-missed" : "",
++				    st & ADP_IRQ_PF_ALIGN ? " fifo-align" : "",
++				    st & ADP_IRQ_PF_OVER ? " fifo-overflow" : "",
++				    st & ADP_IRQ_RDERR ? " read-error" : "");
+ 
++	adpt_handle_events(adp, st);
+ 	return IRQ_HANDLED;
+ }
+ 
+@@ -665,6 +738,11 @@ static int adpt_get_vram(struct adpt *adp, struct device *dev)
+ /* map one iBoot DART table page; NULL ends the usable part (table inside vram, or unmappable) */
+ static u64 *adpt_map_table(struct adpt *adp, phys_addr_t pa)
+ {
++	/* a cacheable read of a junk PA (unclaimed MMIO) can hang the bus: only ever follow DRAM */
++	if (pa < T7000_DRAM_BASE || pa + SZ_4K > T7000_DRAM_BASE + T7000_DRAM_SIZE) {
++		drm_err(&adp->drm, "DART table pointer %pa is outside DRAM: usable part ends there\n", &pa);
++		return NULL;
++	}
+ 	if (pa >= adp->vram_phys && pa < adp->vram_phys + adp->vram_size) {
+ 		drm_warn(&adp->drm, "DART table %pa lies inside vram: usable part ends there\n", &pa);
+ 		return NULL;
+@@ -824,11 +902,11 @@ static int adpt_probe(struct platform_device *pdev)
+ 		return dev_err_probe(dev, -ENODEV, "less than two frames of vram are DART-mapped\n");
+ 	adp->vram_size = usable;
+ 
+-	/* simpledrm scans the same vram: remove it (our power domain references keep the pipe on) */
+-	ret = aperture_remove_conflicting_devices(adp->vram_phys, adp->vram_size, adpt_driver.name);
+-	if (ret)
+-		return ret;
+-
++	/*
++	 * Everything that can fail happens before simpledrm is removed, so a refused or failed probe
++	 * always leaves the boot display (and Orchard's fallback path) intact. simpledrm keeps scanning
++	 * vram+0 meanwhile; nothing below writes vram or the pipe's layer registers.
++	 */
+ 	adp->vram = memremap(adp->vram_phys, adp->vram_size, MEMREMAP_WC);
+ 	if (!adp->vram)
+ 		return -ENOMEM;
+@@ -853,7 +931,15 @@ static int adpt_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		return ret;
+ 
+-	writel(readl(adp->adp + ADP_IRQ_STATUS), adp->adp + ADP_IRQ_STATUS);
++	adp->vbl_period = ns_to_ktime(NSEC_PER_SEC / (drm_mode_vrefresh(&adp->mode) ?: 60));
++	hrtimer_setup(&adp->vbl_timer, adpt_vbl_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_HARD);
++	/* devm runs in reverse: free_irq first, then this, so the timer can't be restarted after it */
++	ret = devm_add_action_or_reset(dev, adpt_vbl_timer_cancel, adp);
++	if (ret)
++		return ret;
++
++	if (!test_noack)
++		writel(readl(adp->adp + ADP_IRQ_STATUS), adp->adp + ADP_IRQ_STATUS);
+ 	ret = devm_request_irq(dev, adp->irq, adpt_irq, 0, "adp-t7000", adp);
+ 	if (ret)
+ 		return ret;
+@@ -861,7 +947,21 @@ static int adpt_probe(struct platform_device *pdev)
+ 	adpt_irq_en(adp, fifo_sync ? ADP_IRQ_PKT_DONE : 0, ADP_IRQ_VBI);
+ 
+ 	platform_set_drvdata(pdev, adp);
+-	return drm_dev_register(&adp->drm, 0);
++	ret = test_fail ? -EAGAIN : drm_dev_register(&adp->drm, 0);
++	if (ret) {
++		writel(adp->irq_en_orig, adp->adp + ADP_IRQ_EN);
++		return dev_err_probe(dev, ret, "%s; simpledrm left in place\n",
++				     test_fail ? "test_fail=1" : "drm_dev_register failed");
++	}
++
++	/*
++	 * Point of no return, and it cannot fail (aperture_remove_conflicting_devices() always returns
++	 * 0): unbind simpledrm, which scans the same vram. Our power domain links keep the pipe on.
++	 * Registering first is fine here: no fbdev, and nothing touches the hardware until a client's
++	 * first commit (Orchard starts after the 48-display hook has returned).
++	 */
++	aperture_remove_conflicting_devices(adp->vram_phys, adp->vram_size, adpt_driver.name);
++	return 0;
+ }
+ 
+ static void adpt_remove(struct platform_device *pdev)
+@@ -870,6 +970,7 @@ static void adpt_remove(struct platform_device *pdev)
+ 
+ 	drm_dev_unplug(&adp->drm);
+ 	drm_atomic_helper_shutdown(&adp->drm);
++	hrtimer_cancel(&adp->vbl_timer);	/* no-op unless the storm guard started it */
+ 	/* back to iBoot's register state; the image there is whatever was last drawn into vram+0 */
+ 	writel(adp->boot.stride, adp->adp + PIPE(0) + PIPE_STRIDE);
+ 	writel(adp->boot.base, adp->adp + PIPE(0) + PIPE_BASE);

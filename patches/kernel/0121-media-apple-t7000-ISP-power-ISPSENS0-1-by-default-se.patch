@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 23:37:54 +0000
+Subject: [PATCH 121/138] media: apple: t7000 ISP: power ISPSENS0/1 by default
+ (sens=1)
+
+Review S2: ADT isp power-gates = ISP, ISPSENS0, ISPSENS1, ISP-FAST and
+kext EnableISPClocksAndPower (0x845cfb4) always enables the first three.
+With them gated the fw could touch a gated sensor-interface block from
+stage 4 on. Order stays media -> isp -> sens0 -> sens1, unwind reverse;
+sens=0 keeps the old ISP-only behaviour.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/media/platform/apple/isp-t7000/isp-main.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-main.c b/drivers/media/platform/apple/isp-t7000/isp-main.c
+index d97ec8bc1..e81db4133 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-main.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-main.c
+@@ -29,9 +29,9 @@ MODULE_PARM_DESC(dry_run, "1 = only read + log registers (ISP window only if alr
+ int isp_irq_en;
+ module_param_named(irq, isp_irq_en, int, 0444);
+ MODULE_PARM_DESC(irq, "1 = use AIC IRQ 91 for the mailbox (default: poll)");
+-int isp_sens;
++int isp_sens = 1;
+ module_param_named(sens, isp_sens, int, 0444);
+-MODULE_PARM_DESC(sens, "1 = also power ps_ispsens0/1 (iOS does; default off)");
++MODULE_PARM_DESC(sens, "1 = also power ps_ispsens0/1 like the kext EnableISPClocksAndPower (default); 0 = ISP only");
+ int isp_smmu_en;
+ module_param_named(smmu_en, isp_smmu_en, int, 0444);
+ MODULE_PARM_DESC(smmu_en, "1 = also set SMMU+0xc byte[sid] |= 0x80 like iOS (default: SMMU read-only)");

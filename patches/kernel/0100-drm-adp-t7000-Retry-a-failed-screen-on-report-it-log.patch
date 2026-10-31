@@ -1,0 +1,403 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 02:38:30 +0000
+Subject: [PATCH 100/138] drm: adp: t7000: Retry a failed screen on, report it,
+ log the transitions
+
+atomic_enable cannot fail, so when the layer packet or the panel wake
+of a CRTC on failed, DPMS on still returned 0: userspace lit the
+backlight over a black screen and nothing tried again until the next
+off/on. Now the CRTC enable path schedules a background retry of the
+on steps (100 ms doubling to 2 s, for as long as the CRTC stays on,
+never against a deliberate debugfs off) and a new sysfs file,
+display_state on the platform device (/sys/class/drm/cardN/device/),
+says "bad" while the CRTC is on but the layer or the panel is not, so
+userspace can hold the backlight off and re-check.
+
+Every CRTC off/on that the deep path acts on is now one info line
+("display off #N: scanout off, panel asleep, 45 ms" / "display on #N:
+151 ms"), so the netconsole shows the timeline next to the key presses.
+The deep_off black-screen wedge of the 2026-10-21 DFU session left no
+kernel line at all, which made it impossible to tell the display path
+from the input path.
+
+New parameter deep_panel (0644, default 1): with 0, deep_off stops the
+vram fetch but leaves the panel awake behind backlight 0, to split the
+layer-off from the panel sleep on hardware. Defaults (deep_off=0,
+panel_sleep=0) behave as before apart from the sysfs file.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/gpu/drm/adp/adp-t7000.c | 212 ++++++++++++++++++++++++++++----
+ 1 file changed, 186 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/gpu/drm/adp/adp-t7000.c b/drivers/gpu/drm/adp/adp-t7000.c
+index 477802a9a..5d7194e0a 100644
+--- a/drivers/gpu/drm/adp/adp-t7000.c
++++ b/drivers/gpu/drm/adp/adp-t7000.c
+@@ -20,8 +20,9 @@
+  *
+  * Screen off (CRTC off = DPMS off / ACTIVE=0): panel_sleep=1 sends the panel to sleep; deep_off=1
+  * first stops the pipe's vram fetch (no layer, ADP IRQs masked) the way iOS does, then sleeps the
+- * panel. The timing generator and the DSI link keep running in both cases. debugfs "panel" and
+- * "power" run the same sequences without DRM master.
++ * panel (unless deep_panel=0). The timing generator and the DSI link keep running in both cases.
++ * debugfs "panel" and "power" run the same sequences without DRM master. A CRTC on whose layer
++ * packet or panel wake fails is retried in the background; sysfs display_state says "bad" meanwhile.
+  */
+ 
+ #include <linux/aperture.h>
+@@ -206,7 +207,10 @@ module_param(panel_sleep, bool, 0644);
+ MODULE_PARM_DESC(panel_sleep, "CRTC off (DPMS off / ACTIVE=0) also puts the panel to sleep: DCS display off + sleep in (default: off)");
+ static bool deep_off;
+ module_param(deep_off, bool, 0644);
+-MODULE_PARM_DESC(deep_off, "CRTC off also stops the pipe's vram fetch (no layer, ADP IRQs masked) before the panel sleep; implies panel_sleep (default: off)");
++MODULE_PARM_DESC(deep_off, "CRTC off also stops the pipe's vram fetch (no layer, ADP IRQs masked) before the panel sleep; implies panel_sleep unless deep_panel=0 (default: off)");
++static bool deep_panel = true;
++module_param(deep_panel, bool, 0644);
++MODULE_PARM_DESC(deep_panel, "deep_off also puts the panel to sleep (default: on; 0 = layer off only, the panel stays awake behind backlight 0)");
+ 
+ struct adpt {
+ 	struct drm_device drm;
+@@ -274,6 +278,19 @@ struct adpt {
+ 	bool storm_killed;	/* the storm guard gave up on the line: permanent */
+ 	bool stall_irq_off;	/* adpt_pipe_stalled() did disable_irq() */
+ 	u32 irq_en_stall;	/* ADP_IRQ_EN when the stall was declared */
++
++	/*
++	 * CRTC on but the screen isn't (the layer packet or the panel wake failed): atomic_enable can't
++	 * return an error, so the heal work keeps retrying while the CRTC stays on, and display_state
++	 * (sysfs) tells userspace, which must not light the backlight over a black screen meanwhile.
++	 */
++	bool crtc_on;		/* between atomic_enable and atomic_disable (panel_lock) */
++	bool dbg_off;		/* debugfs "power off" switched the screen off on purpose: no healing */
++	struct delayed_work heal;
++	unsigned int heal_tries;
++	unsigned int n_off, n_on, n_fail;	/* CRTC off/on transitions, failed CRTC ons */
++	int last_err;		/* first failing step of the last on/off: 0, or -errno */
++	const char *last_step;	/* which step that was */
+ };
+ 
+ #define to_adpt(x) container_of(x, struct adpt, drm)
+@@ -610,6 +627,15 @@ static void adpt_vbl_wd_cancel(void *arg)
+ 
+ /* ---------------------------------------------------------------- panel: DCS over the DSI host */
+ 
++/* the first step of the current display off/on that failed, for display_state (caller holds panel_lock) */
++static void adpt_fail(struct adpt *adp, const char *step, int err)
++{
++	if (!adp->last_err) {
++		adp->last_err = err ?: -EIO;
++		adp->last_step = step;
++	}
++}
++
+ /* one DCS short write without parameter, on virtual channel 0 */
+ static int adpt_dcs(struct adpt *adp, u8 cmd)
+ {
+@@ -638,14 +664,17 @@ static void adpt_panel_sleep_locked(struct adpt *adp)
+ {
+ 	if (!adp->dsi || adp->panel_asleep)
+ 		return;
+-	if (!adpt_dcs(adp, MIPI_DCS_SET_DISPLAY_OFF)) {
+-		msleep(20);	/* a frame */
+-		if (!adpt_dcs(adp, MIPI_DCS_ENTER_SLEEP_MODE)) {
+-			adp->panel_asleep = true;
+-			adp->panel_sleep_at = ktime_get();
+-		} else {
+-			adpt_dcs(adp, MIPI_DCS_SET_DISPLAY_ON);
+-		}
++	if (adpt_dcs(adp, MIPI_DCS_SET_DISPLAY_OFF)) {
++		adpt_fail(adp, "panel sleep", -EIO);
++		return;
++	}
++	msleep(20);	/* a frame */
++	if (!adpt_dcs(adp, MIPI_DCS_ENTER_SLEEP_MODE)) {
++		adp->panel_asleep = true;
++		adp->panel_sleep_at = ktime_get();
++	} else {
++		adpt_fail(adp, "panel sleep", -EIO);
++		adpt_dcs(adp, MIPI_DCS_SET_DISPLAY_ON);
+ 	}
+ }
+ 
+@@ -663,8 +692,10 @@ static void adpt_panel_wake_locked(struct adpt *adp)
+ 		if (!adpt_dcs(adp, MIPI_DCS_SET_DISPLAY_ON))
+ 			adp->panel_asleep = false;
+ 	}
+-	if (adp->panel_asleep)
++	if (adp->panel_asleep) {
++		adpt_fail(adp, "panel wake", -EIO);
+ 		drm_err(&adp->drm, "panel did not take the wake-up commands\n");
++	}
+ }
+ 
+ /* iOS's idle test (ADPParamFIFODriver @0xfffffff0088e7670): level 0x1040[12:0] == 0, ParmSt != 2 (and <= 5) */
+@@ -793,6 +824,7 @@ static void adpt_scanout_off_locked(struct adpt *adp)
+ 	if (ret) {
+ 		/* layer untouched: unmask again and leave the pipe scanning */
+ 		adpt_irq_en(adp, adp->irq_en_off, 0);
++		adpt_fail(adp, "layer off", ret);
+ 		drm_warn(&adp->drm, "scanout off skipped: layer packet not applied (%d)\n", ret);
+ 		return;
+ 	}
+@@ -822,6 +854,7 @@ static void adpt_scanout_on_locked(struct adpt *adp)
+ 		 * Still off (a direct write is what kills the pipe): stay in the off state, so the next
+ 		 * CRTC on or debugfs "power on" tries again. The screen is black meanwhile.
+ 		 */
++		adpt_fail(adp, "layer on", ret);
+ 		drm_err(&adp->drm, "scanout on failed: layer packet not applied (%d), screen stays black\n", ret);
+ 		return;
+ 	}
+@@ -832,13 +865,21 @@ static void adpt_scanout_on_locked(struct adpt *adp)
+ 	adp->scanout_off = false;
+ }
+ 
++/* CRTC on and everything this driver switched off is back (no DSI: the panel can't be asleep) */
++static bool adpt_on_ok_locked(struct adpt *adp)
++{
++	return !adp->scanout_off && !adp->panel_asleep;
++}
++
+ /*
+- * Screen off, in iOS's order: scanout off (deep), then the panel. @deep / @force come from debugfs;
+- * the CRTC disable path passes false/false and the module parameters decide.
++ * Screen off, in iOS's order: scanout off (deep), then the panel (unless deep_panel=0). @deep / @force
++ * come from debugfs (@force = a deliberate off there: no healing until the next on); the CRTC disable
++ * path passes false/false and the module parameters decide.
+  */
+ static void adpt_display_off(struct adpt *adp, bool deep, bool force)
+ {
+-	bool sleep;
++	ktime_t t0 = ktime_get();
++	bool sleep, acted = false;
+ 	int idx;
+ 
+ 	mutex_lock(&adp->panel_lock);
+@@ -846,34 +887,137 @@ static void adpt_display_off(struct adpt *adp, bool deep, bool force)
+ 		goto out;
+ 	if (!force)
+ 		deep = READ_ONCE(deep_off);
+-	sleep = force || deep || READ_ONCE(panel_sleep);
++	sleep = force || READ_ONCE(panel_sleep) || (deep && READ_ONCE(deep_panel));
+ 	if (!drm_dev_enter(&adp->drm, &idx))
+ 		goto out;
+-	if (deep)
++	adp->dbg_off = force;
++	adp->last_err = 0;
++	adp->last_step = NULL;
++	if (deep) {
+ 		adpt_scanout_off_locked(adp);
+-	if (sleep)
++		acted = true;
++	}
++	if (sleep) {
+ 		adpt_panel_sleep_locked(adp);
++		acted = true;
++	}
+ 	drm_dev_exit(idx);
++	/* one line per real transition: the netconsole timeline next to the key presses */
++	if (!force && acted)
++		drm_info(&adp->drm, "display off #%u: scanout %s, panel %s, %lld ms%s%s\n", ++adp->n_off,
++			 adp->scanout_off ? "off" : "ON",
++			 adp->panel_asleep ? "asleep" : adp->dsi ? "AWAKE" : "(no DSI)",
++			 ktime_ms_delta(ktime_get(), t0), adp->last_step ? "; failed: " : "", adp->last_step ?: "");
+ out:
+ 	mutex_unlock(&adp->panel_lock);
+ }
+ 
+-/* undo whatever adpt_display_off() did (no-op otherwise): layer back first, then panel wake */
+-static void adpt_display_on(struct adpt *adp, bool scanout)
++/*
++ * Undo whatever adpt_display_off() did (no-op otherwise): layer back first, then panel wake. @crtc: the
++ * CRTC enable path. If a step fails there the CRTC is on but the screen isn't; the heal work retries in
++ * the background and display_state reports "bad" until it is fixed.
++ */
++static void adpt_display_on(struct adpt *adp, bool scanout, bool crtc)
+ {
++	ktime_t t0 = ktime_get();
++	bool was_off;
+ 	int idx;
+ 
+ 	mutex_lock(&adp->panel_lock);
++	if (crtc) {
++		adp->crtc_on = true;
++		adp->heal_tries = 0;
++	}
++	if (scanout || crtc)	/* a whole on (debugfs "panel wake" alone keeps a deliberate layer off) */
++		adp->dbg_off = false;
+ 	if (!drm_dev_enter(&adp->drm, &idx))
+ 		goto out;
++	was_off = adp->scanout_off || adp->panel_asleep;
++	adp->last_err = 0;
++	adp->last_step = NULL;
+ 	if (scanout)
+ 		adpt_scanout_on_locked(adp);
+ 	adpt_panel_wake_locked(adp);
+ 	drm_dev_exit(idx);
++	if (!crtc || !was_off)
++		goto out;
++	adp->n_on++;
++	if (adpt_on_ok_locked(adp)) {
++		drm_info(&adp->drm, "display on #%u: %lld ms\n", adp->n_on, ktime_ms_delta(ktime_get(), t0));
++	} else {
++		adp->n_fail++;
++		drm_err(&adp->drm, "display on #%u FAILED at %s (%d) after %lld ms: scanout %s, panel %s; retrying\n",
++			adp->n_on, adp->last_step ?: "?", adp->last_err, ktime_ms_delta(ktime_get(), t0),
++			adp->scanout_off ? "off" : "on", adp->panel_asleep ? "asleep" : "awake");
++		if (!adp->panel_keep)
++			mod_delayed_work(system_freezable_wq, &adp->heal, msecs_to_jiffies(100));
++	}
+ out:
+ 	mutex_unlock(&adp->panel_lock);
+ }
+ 
++/* CRTC on but the screen isn't: retry the on steps, 100 ms doubling to 2 s, for as long as the CRTC stays on */
++static void adpt_heal_work(struct work_struct *work)
++{
++	struct adpt *adp = container_of(to_delayed_work(work), struct adpt, heal);
++	unsigned int tries;
++	bool ok;
++	int idx;
++
++	mutex_lock(&adp->panel_lock);
++	if (!adp->crtc_on || adp->dbg_off || adp->panel_keep || adpt_on_ok_locked(adp)) {
++		mutex_unlock(&adp->panel_lock);
++		return;
++	}
++	if (drm_dev_enter(&adp->drm, &idx)) {
++		adp->last_err = 0;
++		adp->last_step = NULL;
++		adpt_scanout_on_locked(adp);
++		adpt_panel_wake_locked(adp);
++		drm_dev_exit(idx);
++	}
++	ok = adpt_on_ok_locked(adp);
++	tries = ++adp->heal_tries;
++	mutex_unlock(&adp->panel_lock);
++	if (ok) {
++		drm_info(&adp->drm, "display on after %u background retr%s\n", tries, tries == 1 ? "y" : "ies");
++		return;
++	}
++	drm_err_ratelimited(&adp->drm, "display still not on after %u retries\n", tries);
++	queue_delayed_work(system_freezable_wq, &adp->heal, msecs_to_jiffies(min(100U << min(tries, 5U), 2000U)));
++}
++
++static void adpt_heal_cancel(void *arg)
++{
++	cancel_delayed_work_sync(&((struct adpt *)arg)->heal);
++}
++
++/*
++ * sysfs display_state (the platform device, i.e. /sys/class/drm/cardN/device/): first word "ok", or
++ * "bad" while the CRTC is on but the layer or the panel isn't (userspace keeps the backlight off then).
++ */
++static ssize_t display_state_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct adpt *adp = dev_get_drvdata(dev);
++	ssize_t len;
++
++	mutex_lock(&adp->panel_lock);
++	len = sysfs_emit(buf, "%s crtc %s scanout %s panel %s%s; on %u off %u failed %u heal %u; last %s %d\n",
++			 adp->crtc_on && !adp->dbg_off && !adpt_on_ok_locked(adp) ? "bad" : "ok",
++			 adp->crtc_on ? "on" : "off", adp->scanout_off ? "off" : "on",
++			 !adp->dsi ? "nodsi" : adp->panel_asleep ? "asleep" : "awake",
++			 adp->stalled ? " STALLED" : adp->irq_dead ? " IRQ-OFF" : "",
++			 adp->n_on, adp->n_off, adp->n_fail, adp->heal_tries, adp->last_step ?: "-", adp->last_err);
++	mutex_unlock(&adp->panel_lock);
++	return len;
++}
++static DEVICE_ATTR_RO(display_state);
++
++static void adpt_remove_state_file(void *arg)
++{
++	device_remove_file(arg, &dev_attr_display_state);
++}
++
+ /* debugfs "panel": read the state, write "sleep" / "wake" (a test path that needs no DRM master) */
+ static int adpt_panel_show(struct seq_file *m, void *unused)
+ {
+@@ -898,7 +1042,7 @@ static ssize_t adpt_panel_write(struct file *file, const char __user *ubuf, size
+ 	if (sysfs_streq(buf, "sleep"))
+ 		adpt_display_off(adp, false, true);
+ 	else if (sysfs_streq(buf, "wake"))
+-		adpt_display_on(adp, false);
++		adpt_display_on(adp, false, false);
+ 	else
+ 		return -EINVAL;
+ 	return len;
+@@ -1013,7 +1157,7 @@ static int adpt_power_set(struct adpt *adp, enum adpt_dbg_op op)
+ 		if (!ret && op == ADPT_OP_OFF)
+ 			adpt_display_off(adp, true, true);
+ 		else if (!ret && op == ADPT_OP_ON)
+-			adpt_display_on(adp, true);
++			adpt_display_on(adp, true, false);
+ 		else if (!ret)
+ 			ret = adpt_fifo_test(adp, op == ADPT_OP_FIFO_SAME);
+ 	}
+@@ -1221,8 +1365,8 @@ static enum drm_mode_status adpt_crtc_mode_valid(struct drm_crtc *crtc, const st
+ 
+ static void adpt_crtc_atomic_enable(struct drm_crtc *crtc, struct drm_atomic_commit *state)
+ {
+-	drm_crtc_vblank_on(crtc);			/* first: the layer write is timed by the VBI */
+-	adpt_display_on(to_adpt(crtc->dev), true);	/* no-op unless this driver turned it off */
++	drm_crtc_vblank_on(crtc);			/* first: the layer packet needs the IRQ */
++	adpt_display_on(to_adpt(crtc->dev), true, true);	/* no-op unless this driver turned it off */
+ }
+ 
+ static void adpt_crtc_atomic_disable(struct drm_crtc *crtc, struct drm_atomic_commit *state)
+@@ -1230,6 +1374,12 @@ static void adpt_crtc_atomic_disable(struct drm_crtc *crtc, struct drm_atomic_co
+ 	struct adpt *adp = to_adpt(crtc->dev);
+ 	unsigned long flags;
+ 
++	/* no background retry of an on from here (the work takes panel_lock, never the modeset locks) */
++	mutex_lock(&adp->panel_lock);
++	adp->crtc_on = false;
++	mutex_unlock(&adp->panel_lock);
++	cancel_delayed_work_sync(&adp->heal);
++
+ 	/* a flip still waiting for its vblank would never complete once VBI is off */
+ 	spin_lock_irqsave(&crtc->dev->event_lock, flags);
+ 	if (adp->event) {
+@@ -1717,6 +1867,10 @@ static int adpt_probe(struct platform_device *pdev)
+ 		return ret;
+ 	init_waitqueue_head(&adp->layer_wq);
+ 	INIT_DELAYED_WORK(&adp->vbl_wd, adpt_vbl_wd);
++	INIT_DELAYED_WORK(&adp->heal, adpt_heal_work);
++	ret = devm_add_action_or_reset(dev, adpt_heal_cancel, adp);
++	if (ret)
++		return ret;
+ 	/* before the timer cancel above runs: the watchdog may start the timer */
+ 	ret = devm_add_action_or_reset(dev, adpt_vbl_wd_cancel, adp);
+ 	if (ret)
+@@ -1748,6 +1902,10 @@ static int adpt_probe(struct platform_device *pdev)
+ 	debugfs_create_file("panel", 0600, adp->drm.debugfs_root, adp, &adpt_panel_fops);
+ 	debugfs_create_file("power", 0600, adp->drm.debugfs_root, adp, &adpt_power_fops);
+ 	debugfs_create_file("stall", 0600, adp->drm.debugfs_root, adp, &adpt_stall_fops);
++	/* past the point of no return: without the file userspace just can't check the on state */
++	if (device_create_file(dev, &dev_attr_display_state) ||
++	    devm_add_action_or_reset(dev, adpt_remove_state_file, dev))
++		dev_warn(dev, "no display_state file\n");
+ 	return 0;
+ }
+ 
+@@ -1757,7 +1915,8 @@ static void adpt_remove(struct platform_device *pdev)
+ 
+ 	/* leave the pipe and the panel as iBoot did: scanning out, awake */
+ 	adp->panel_keep = true;
+-	adpt_display_on(adp, true);
++	adpt_display_on(adp, true, false);
++	cancel_delayed_work_sync(&adp->heal);
+ 	drm_dev_unplug(&adp->drm);
+ 	drm_atomic_helper_shutdown(&adp->drm);
+ 	WRITE_ONCE(adp->vbl_on, false);
+@@ -1777,7 +1936,8 @@ static void adpt_shutdown(struct platform_device *pdev)
+ 
+ 	if (adp) {
+ 		adp->panel_keep = true;
+-		adpt_display_on(adp, true);
++		adpt_display_on(adp, true, false);
++		cancel_delayed_work_sync(&adp->heal);
+ 		drm_atomic_helper_shutdown(&adp->drm);
+ 	}
+ }

@@ -1,0 +1,33 @@
+#!/bin/sh
+# wifi-action - wpa_cli action script (wpa_cli -a), installed as /usr/sbin/wifi-action. $1 = iface, $2 = event.
+# CONNECTED -> (re)start udhcpc on wlan0 (lease script /usr/share/udhcpc/wlan0.script); DISCONNECTED -> stop it, flush wlan0.
+PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH
+IF=$1; EV=$2
+[ "$IF" = wlan0 ] || exit 0
+PIDF=/var/run/udhcpc.$IF.pid
+log() { echo "$(date +%T) wifi-action: $*" >> /tmp/wifi.log; }
+
+stop_dhcp() {
+	if [ -f $PIDF ]; then
+		p=$(cat $PIDF 2>/dev/null)
+		[ -n "$p" ] && kill $p 2>/dev/null
+		i=0
+		while [ -n "$p" ] && [ -d /proc/$p ] && [ $i -lt 10 ]; do usleep 100000; i=$((i + 1)); done
+		[ -n "$p" ] && [ -d /proc/$p ] && kill -9 $p 2>/dev/null
+		rm -f $PIDF
+	fi
+}
+
+case "$EV" in
+CONNECTED)
+	log "CONNECTED, starting udhcpc"
+	stop_dhcp
+	udhcpc -i $IF -b -p $PIDF -s /usr/share/udhcpc/wlan0.script >> /tmp/wifi.log 2>&1
+	;;
+DISCONNECTED)
+	log "DISCONNECTED"
+	stop_dhcp
+	ip addr flush dev $IF
+	;;
+esac
+exit 0

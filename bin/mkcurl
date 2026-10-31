@@ -1,0 +1,65 @@
+#!/bin/bash
+# mkcurl - build tools/net.tgz: a static aarch64 (musl) curl for Orchard's internet apps (Web, Weather).
+# curl is built from source against Alpine's static OpenSSL + zlib (fetched with apk.static into
+# var/apps-net/root), so the tarball has no shared-library dependencies at all.
+#   usr/bin/curl                         HTTPS client (src/net.c runs it; never -k)
+#   usr/share/orchard/cacert.pem         fallback CA bundle (Alpine ca-certificates-bundle), used only when
+#                                        /etc/ssl/certs/ca-certificates.crt is missing on the phone
+# Untar at / on the phone (or bake into the blob). Override: CURLV=8.x.y REL=v3.22 bin/mkcurl
+# usage: bin/mkcurl   (needs network; stage lives in var/apps-net, gitignored)
+set -e
+cd "$(dirname "$0")/.."
+TOP=$PWD
+APK=$TOP/dl/apk/x/sbin/apk.static
+[ -x "$APK" ] || { echo "no apk.static (run ui/fetch-deps.sh first)"; exit 1; }
+CURLV=${CURLV:-8.22.0}
+REPO=https://dl-cdn.alpinelinux.org/alpine/${REL:-latest-stable}
+S=$TOP/var/apps-net
+R=$S/root
+mkdir -p $S
+
+# 1. sysroot: musl + compiler-rt + static OpenSSL/zlib + the CA bundle
+if [ ! -f $R/usr/lib/libssl.a ]; then
+	rm -rf $R; mkdir -p $R
+	$APK --arch aarch64 --root $R --initdb --usermode --no-scripts --allow-untrusted -X $REPO/main \
+		add musl-dev compiler-rt linux-headers openssl-dev openssl-libs-static zlib-dev zlib-static \
+		ca-certificates-bundle >/dev/null
+fi
+RES=$(find $R/usr/lib/llvm*/lib/clang -mindepth 1 -maxdepth 1 -type d | head -1)	# clang resource dir (compiler-rt)
+[ -d "$RES" ] || { echo "no compiler-rt in $R"; exit 1; }
+
+# 2. curl source
+T=$S/curl-$CURLV.tar.xz
+if [ ! -f $T ]; then
+	curl -fsSL -o $T.part https://curl.se/download/curl-$CURLV.tar.xz
+	mv $T.part $T
+fi
+B=$S/build-$CURLV
+if [ ! -x $B/src/curl ]; then
+	rm -rf $B; mkdir -p $B
+	tar xJf $T -C $B --strip-components=1
+	CC="clang --target=aarch64-linux-musl --sysroot=$R -resource-dir=$RES"
+	(cd $B && CC="$CC" CFLAGS="-Os -mcpu=apple-a8 -ffunction-sections -fdata-sections" \
+		LDFLAGS="-static -fuse-ld=lld -rtlib=compiler-rt -Wl,--gc-sections" \
+		PKG_CONFIG_LIBDIR=$R/usr/lib/pkgconfig PKG_CONFIG_SYSROOT_DIR=$R \
+		./configure --host=aarch64-linux-musl --build=x86_64-pc-linux-gnu \
+		--disable-shared --enable-static --with-openssl=$R/usr --with-zlib=$R/usr \
+		--with-ca-bundle=/etc/ssl/certs/ca-certificates.crt --without-ca-path \
+		--without-libpsl --without-libidn2 --without-brotli --without-zstd --without-nghttp2 \
+		--without-libssh2 --without-librtmp --without-gssapi --disable-ldap --disable-ldaps \
+		--disable-rtsp --disable-dict --disable-telnet --disable-tftp --disable-pop3 --disable-imap \
+		--disable-smtp --disable-gopher --disable-mqtt --disable-smb --disable-manual --disable-docs \
+		--enable-ipv6 --enable-threaded-resolver >$S/configure.log 2>&1) ||
+		{ tail -30 $S/configure.log; exit 1; }
+	make -C $B -j"$(nproc)" curl_LDFLAGS=-all-static >$S/make.log 2>&1 || { tail -30 $S/make.log; exit 1; }
+fi
+
+# 3. package
+P=$S/pkg; rm -rf $P; mkdir -p $P/usr/bin $P/usr/share/orchard
+llvm-strip -o $P/usr/bin/curl $B/src/curl
+cp $R/etc/ssl/certs/ca-certificates.crt $P/usr/share/orchard/cacert.pem
+file $P/usr/bin/curl | grep -q 'statically linked' || { echo "curl is not static"; file $P/usr/bin/curl; exit 1; }
+tar -C $P --owner=0 --group=0 --numeric-owner -czf tools/net.tgz.new usr
+mv tools/net.tgz.new tools/net.tgz
+ls -la tools/net.tgz
+tar tvzf tools/net.tgz | grep -v '/$'

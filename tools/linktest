@@ -1,0 +1,27 @@
+#!/bin/sh
+# linktest - MCA2 TX bring-up in iOS order + SIO-fw wrapper/shim start writes (re/SIO-PROTOCOL.md "Shim link")
+M=/tmp/mem; A=0x20a0a8; S=0x20a0a9
+diag() { echo "-- $1"; $M r ${S}018 r ${A}040 r 0x20a001060 r 0x20a001098 r 0x20a000004 3 r 0x20a100008 3 | grep -v "^w"; }
+$M w ${A}018 0 w ${S}010 0 w ${S}014 0 >/dev/null
+$M w 0x20e020140 0x20f $(cat /tmp/nco.cmd) w 0x20a002008 0x58 >/dev/null
+# wrapper init as fw boot
+$M w 0x20a001000 ffffffff w 0x20a001004 ffffffff w 0x20a001080 ffffffff w 0x20a001084 ffffffff \
+   w 0x20a001040 0 w 0x20a001044 0 w 0x20a100004 03000102 w 0x20a100800 118 >/dev/null
+# MCA reset + early regs
+$M w ${A}044 3 w ${A}048 1 s 2 w ${A}010 0 w ${A}01c d w ${A}030 d >/dev/null
+# shim program
+$M w 0x20a001008 8000 w ${S}014 0 w ${S}010 0 r 0x20a000000 r 0x20a000000 \
+   w ${S}000 ${XFER:-21} w ${S}008 00330000 w ${S}00c ac w ${S}004 0 w ${S}010 1 | grep "20a000000:"
+# rest of MCA config (master)
+$M w ${A}008 1010 w ${A}020 ${TXFIFO:-00170018} w ${A}034 00030004 w ${A}014 0 w ${A}024 1 w ${A}038 f \
+   w ${A}018 208 w ${A}02c 10a w ${A}010 1 w ${A}040 b0003000 w ${A}00c 0f107005 >/dev/null
+$M w 0x20a00301c 00181818 w 0x20a003008 00180202 w 0x20a003044 11 >/dev/null
+# prefill full FIFO
+i=0; args=""; while [ $i -lt 51 ]; do args="$args w $(printf 0x%x $((0x20a0aa000 + (i % 8) * 4))) 0"; i=$((i+1)); done
+$M $args >/dev/null
+diag prefilled
+# start: shim start writes, then MCA
+$M w ${S}00c ac w 0x20a001010 8000 w 0x20a001014 8000 w ${S}014 1 >/dev/null
+$M w ${A}018 209 w ${A}00c 0f107007 s 5 >/dev/null
+diag "started +5ms"
+$M s 20 >/dev/null; diag "+25ms"

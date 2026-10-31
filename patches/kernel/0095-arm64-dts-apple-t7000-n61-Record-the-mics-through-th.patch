@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 23:04:12 +0000
+Subject: [PATCH 095/138] arm64: dts: apple: t7000-n61: Record the mics through
+ the codec ASP on MCA0
+
+Add the MCA0 node (0x20a0a0000, IRQ 169, NCO 0, ps_mca0) and a third
+card link, hw:0,2: MCA0 (I2S master) to the CS42L67 ASP, as iOS wires
+it (ADT mca0/audio-codec, i2sR aud0 -> pin0). MCA0's shim FIFOs sit at
+offset 0x100 of the SRAM pools, after MCA2's.
+
+Untested on hardware.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ arch/arm64/boot/dts/apple/t7000-n61.dts | 30 +++++++++++++++++++++++--
+ arch/arm64/boot/dts/apple/t7000.dtsi    | 14 ++++++++++++
+ 2 files changed, 42 insertions(+), 2 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/apple/t7000-n61.dts b/arch/arm64/boot/dts/apple/t7000-n61.dts
+index 9a4bd80e0..5f360f67e 100644
+--- a/arch/arm64/boot/dts/apple/t7000-n61.dts
++++ b/arch/arm64/boot/dts/apple/t7000-n61.dts
+@@ -91,12 +91,38 @@ codec_cpu: cpu {
+ 			};
+ 
+ 			codec {
+-				sound-dai = <&headset_codec>;
++				sound-dai = <&headset_codec 0>;
++			};
++		};
++
++		/*
++		 * hw:0,2: the mics as iOS records them, codec ASP (I2S, 2 x
++		 * 16-bit) on MCA0 / pin0, MCA0 the clock master. The codec's
++		 * MCLK stays MCA0's pad 0.
++		 */
++		simple-audio-card,dai-link@2 {
++			reg = <2>;
++			format = "i2s";
++			bitclock-master = <&mic_cpu>;
++			frame-master = <&mic_cpu>;
++
++			mic_cpu: cpu {
++				sound-dai = <&mca0 1>;
++			};
++
++			codec {
++				sound-dai = <&headset_codec 1>;
+ 			};
+ 		};
+ 	};
+ };
+ 
++&mca0 {
++	/* MCA2 uses bytes 0-0xcb of both shim SRAM pools */
++	apple,shim-sram-offset = <0x100>;
++	status = "okay";
++};
++
+ &mca2 {
+ 	status = "okay";
+ };
+@@ -239,7 +265,7 @@ headset_codec: codec@0 {
+ 		clock-names = "mclk";
+ 		cirrus,xsp-tx-slot = <4>;
+ 		cirrus,xsp-rx-slot = <0>;
+-		#sound-dai-cells = <0>;
++		#sound-dai-cells = <1>;
+ 	};
+ };
+ 
+diff --git a/arch/arm64/boot/dts/apple/t7000.dtsi b/arch/arm64/boot/dts/apple/t7000.dtsi
+index 5bdc4f28c..72b063976 100644
+--- a/arch/arm64/boot/dts/apple/t7000.dtsi
++++ b/arch/arm64/boot/dts/apple/t7000.dtsi
+@@ -280,6 +280,20 @@ serial8: serial@20a0e0000 {
+ 			status = "disabled";
+ 		};
+ 
++		mca0: i2s@20a0a0000 {
++			compatible = "apple,t7000-mca";
++			reg = <0x2 0x0a0a0000 0x0 0x4000>,
++			      <0x2 0x0a000000 0x0 0x4000>,
++			      <0x2 0x0a100000 0x0 0x1000>;
++			reg-names = "mca", "wrapper", "shim1";
++			interrupt-parent = <&aic>;
++			interrupts = <AIC_IRQ 169 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&nco 0>;
++			power-domains = <&ps_mca0>;
++			#sound-dai-cells = <1>;
++			status = "disabled";
++		};
++
+ 		mca2: i2s@20a0a8000 {
+ 			compatible = "apple,t7000-mca";
+ 			reg = <0x2 0x0a0a8000 0x0 0x4000>,

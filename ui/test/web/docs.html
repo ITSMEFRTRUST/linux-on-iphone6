@@ -1,0 +1,23 @@
+<!doctype html><html><head><meta charset="utf-8"><title>lv_spangroup — LVGL docs</title></head><body>
+<nav role="navigation"><ul><li><a href="/intro">Introduction</a></li><li><a href="/widgets">Widgets</a></li><li><a href="/widgets/label">Label</a></li><li><a href="/widgets/span">Span</a></li><li><a href="/styles">Styles</a></li><li><a href="/api">API</a></li></ul></nav>
+<main>
+<h1>Span (lv_spangroup)</h1>
+<p>A spangroup is an object used to display rich text. Unlike a <code>lv_label</code>, it can show text with <b>different fonts</b>, colors and sizes in one object.</p>
+<h2>Overview</h2>
+<p>Spans are added with <code>lv_spangroup_add_span()</code> and styled through <code>lv_span_get_style()</code>. Call <code>lv_spangroup_refresh()</code> once you are done.</p>
+<h3>Modes</h3>
+<dl><dt>LV_SPAN_MODE_FIXED</dt><dd>Fixed object size.</dd><dt>LV_SPAN_MODE_EXPAND</dt><dd>Expand the object size to the text size but stay on a single line.</dd><dt>LV_SPAN_MODE_BREAK</dt><dd>Keep the width, break lines that are too long and auto-expand height.</dd></dl>
+<h2>Example</h2>
+<pre>lv_obj_t *sg = lv_spangroup_create(lv_screen_active());
+lv_span_t *s = lv_spangroup_add_span(sg);
+lv_span_set_text(s, "Hello, world");
+lv_spangroup_refresh(sg);</pre>
+<div class="note"><p><b>Note:</b> a very long span in BREAK mode is laid out on every refresh; keep paragraphs short on slow CPUs.</p></div>
+<h2>API</h2>
+<table><tr><th>Function</th><th>Description</th></tr>
+<tr><td><code>lv_spangroup_create</code></td><td>Create a spangroup object.</td></tr>
+<tr><td><code>lv_spangroup_add_span</code></td><td>Add a new span.</td></tr>
+<tr><td><code>lv_spangroup_set_mode</code></td><td>Set the mode of the spangroup.</td></tr></table>
+<h4>See also</h4>
+<ul><li><a href="/widgets/label">Label</a></li><li><a href="/widgets/textarea">Text area</a></li></ul>
+</main></body></html>

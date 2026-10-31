@@ -1,0 +1,358 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 02:07:33 +0000
+Subject: [PATCH 128/138] media: apple: t7000 ISP: trace=1 hang hunting, never
+ gate ps_isp with transactions outstanding
+
+trace=1 prints every ISP-window, PMGR, pin and ref clock write before
+it happens and sleeps 50 ms (task context), trace=2 adds the reads;
+markers for open/ioctl/release, every IO command, H2T posts, T2H
+messages, teardown steps and boot stages. With the console on tty0 the
+last line names the access that hung. Writable at runtime.
+
+The SoC hung on the first stream run (open -> re-boot -> START -> frame
+-> close). New hazard on that path: tearing down an ISP whose pipeline
+was streaming. If the TLIMIT drains (+0x44/+0x68) still read non-zero
+after 100 ms + another 1 s, the CPU stop now sets drain_failed and the
+teardown leaves ps_isp/ps_media ON (memory leaked on purpose) instead of
+power-gating a block with outstanding transactions; later boots refuse.
+
+stream_nostart=1: START configures the channel but posts no buffers
+and sends no CH_START (no frame DMA), to split the path.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../media/platform/apple/isp-t7000/isp-boot.c |  9 +++-
+ .../media/platform/apple/isp-t7000/isp-cdev.c |  3 ++
+ .../media/platform/apple/isp-t7000/isp-ipc.c  |  1 +
+ .../media/platform/apple/isp-t7000/isp-main.c | 54 ++++++++++++++++++-
+ .../media/platform/apple/isp-t7000/isp-pwr.c  |  2 +
+ .../media/platform/apple/isp-t7000/isp-scfg.c |  4 ++
+ .../media/platform/apple/isp-t7000/isp-sens.c | 19 ++++++-
+ .../platform/apple/isp-t7000/isp-stream.c     |  4 ++
+ drivers/media/platform/apple/isp-t7000/isp.h  | 17 +++++-
+ 9 files changed, 107 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-boot.c b/drivers/media/platform/apple/isp-t7000/isp-boot.c
+index d00234615..64aeef2d4 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-boot.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-boot.c
+@@ -180,8 +180,13 @@ void isp_cpu_stop(struct t7000_isp *isp)
+ 	for (i = 0; i < ARRAY_SIZE(isp_tlimit); i++)
+ 		isp_wr(isp, isp_tlimit[i], 0);
+ 	/* kext ISP_deInit always waits up to 100 ms per drain, fault or not */
+-	__isp_wait(isp, ISP_TLIMIT0_OUT, ~0U, 0, 100, "TLIMIT0 drain (+0x44 == 0)", false);
+-	__isp_wait(isp, ISP_TLIMIT1_OUT, ~0U, 0, 100, "TLIMIT1 drain (+0x68 == 0)", false);
++	if (__isp_wait(isp, ISP_TLIMIT0_OUT, ~0U, 0, 100, "TLIMIT0 drain (+0x44 == 0)", false) ||
++	    __isp_wait(isp, ISP_TLIMIT1_OUT, ~0U, 0, 100, "TLIMIT1 drain (+0x68 == 0)", false)) {
++		/* one more chance: a streaming pipeline may need longer than iOS's 100 ms */
++		if (__isp_wait(isp, ISP_TLIMIT0_OUT, ~0U, 0, 1000, "TLIMIT0 drain, 2nd try", false) ||
++		    __isp_wait(isp, ISP_TLIMIT1_OUT, ~0U, 0, 1000, "TLIMIT1 drain, 2nd try", false))
++			isp->drain_failed = true;
++	}
+ 	isp->cpu_started = false;
+ 	isp_log_window(isp, "after CPU stop");
+ }
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-cdev.c b/drivers/media/platform/apple/isp-t7000/isp-cdev.c
+index afe458421..8d4c6e624 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-cdev.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-cdev.c
+@@ -28,6 +28,7 @@ static int isp_open(struct inode *inode, struct file *f)
+ 	int ret = 0;
+ 
+ 	mutex_lock(&isp_open_lock);
++	isp_trace_mark(isp, "open (count %d, stages done %d)", isp->open_count, isp->done);
+ 	if (isp->open_count == 0 && isp->done < ISP_FULL_STAGE) {
+ 		dev_info(isp->dev, "/dev/isp0 opened: booting the ISP\n");
+ 		ret = isp_boot(isp, ISP_FULL_STAGE);
+@@ -47,6 +48,7 @@ static int isp_release(struct inode *inode, struct file *f)
+ 	struct t7000_isp *isp = f->private_data;
+ 
+ 	mutex_lock(&isp_open_lock);
++	isp_trace_mark(isp, "release (count %d)", isp->open_count);
+ 	if (--isp->open_count == 0) {
+ 		mutex_lock(&isp->lock);
+ 		isp_stream_stop(isp);
+@@ -69,6 +71,7 @@ static long isp_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
+ 	u32 v;
+ 	long ret;
+ 
++	isp_trace_mark(isp, "ioctl 0x%x", cmd);
+ 	switch (cmd) {
+ 	case ISP_IOC_INFO:
+ 		memset(&info, 0, sizeof(info));
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-ipc.c b/drivers/media/platform/apple/isp-t7000/isp-ipc.c
+index 4e0bf467d..455067f50 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-ipc.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-ipc.c
+@@ -284,6 +284,7 @@ int isp_cmd_send(struct t7000_isp *isp, void *pkt, u32 insize, u32 outsize,
+ 	rel = isp_rel(isp->ipc->iova + isp->cmd_off);	/* 64-byte aligned: bit0 = 0 */
+ 	memset(buf, 0, max(insize, outsize));
+ 	memcpy(buf, pkt, insize);
++	isp_trace_mark(isp, "cmd #%u opcode 0x%04x -> IO slot %u", seq, op, slot);
+ 	WRITE_ONCE(m[1], insize);
+ 	WRITE_ONCE(m[2], outsize);
+ 	dma_wmb();
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-main.c b/drivers/media/platform/apple/isp-t7000/isp-main.c
+index 6e64a68a8..d3a054724 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-main.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-main.c
+@@ -16,6 +16,7 @@
+  * stream=1 (with stage=9) adds /dev/isp0 (isp-cdev.c): the ISP is powered off again
+  * after the boot test unless keep_on=1, booted on open and powered off on last close.
+  */
++#include <linux/delay.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/module.h>
+ #include <linux/platform_device.h>
+@@ -103,6 +104,39 @@ uint isp_setfile_front = 0x1421;
+ module_param_named(setfile_front, isp_setfile_front, uint, 0644);
+ MODULE_PARM_DESC(setfile_front, "IMX190 module setfile (0x1421/0x1422, 0 = none)");
+ 
++int isp_trace;
++module_param_named(trace, isp_trace, int, 0644);
++MODULE_PARM_DESC(trace, "1 = print every register write before it happens + msleep(50) (hang hunting, console on tty0); 2 = also reads");
++int isp_stream_nostart;
++module_param_named(stream_nostart, isp_stream_nostart, int, 0644);
++MODULE_PARM_DESC(stream_nostart, "1 = ISP_IOC_START configures everything but does not post buffers or send CH_START (no frame DMA)");
++
++void isp_trace_io(struct t7000_isp *isp, char rw, const char *blk, u64 phys, u32 val)
++{
++	if (rw == 'W')
++		dev_info(isp->dev, "T W %s 0x%09llx = 0x%08x\n", blk, phys, val);
++	else
++		dev_info(isp->dev, "T R %s 0x%09llx\n", blk, phys);
++	if (in_task() && preemptible())
++		msleep(50);
++}
++
++void isp_trace_mark(struct t7000_isp *isp, const char *fmt, ...)
++{
++	struct va_format vaf;
++	va_list args;
++
++	if (!READ_ONCE(isp_trace))
++		return;
++	va_start(args, fmt);
++	vaf.fmt = fmt;
++	vaf.va = &args;
++	dev_info(isp->dev, "T: %pV\n", &vaf);
++	va_end(args);
++	if (in_task() && preemptible())
++		msleep(50);
++}
++
+ static struct t7000_isp *the_isp;
+ 
+ static int isp_stage_power(struct t7000_isp *isp)
+@@ -136,12 +170,25 @@ void isp_teardown(struct t7000_isp *isp)
+ 	mutex_lock(&isp->lock);
+ 	if (isp->fw_up && isp_graceful)
+ 		isp_fw_shutdown(isp);
++	isp_trace_mark(isp, "teardown: CPU stop");
+ 	if (isp->cpu_started)
+ 		isp_cpu_stop(isp);
++	isp_trace_mark(isp, "teardown: sensor power off");
+ 	isp_sensor_power_off(isp);
+ 	if (isp->dart_on)
+ 		isp_dart_fini(isp);
+-	if (isp_power_off(isp) && (isp->l1 || !list_empty(&isp->surfs))) {
++	if (isp->drain_failed) {
++		/*
++		 * Outstanding ISP transactions: gating ps_isp now can wedge the fabric
++		 * (the whole SoC). Leave the ISP powered and leak its memory instead.
++		 */
++		dev_err(isp->dev, "!!! TLIMIT drains did not reach 0: NOT powering ps_isp/ps_media off, LEAKING all ISP memory; reboot before the next test !!!\n");
++		isp->on_media = isp->on_isp = isp->on_sens0 = isp->on_sens1 = false;
++		INIT_LIST_HEAD(&isp->surfs);
++		isp->fw = isp->ipc = isp->heap = NULL;
++		isp->l1 = NULL;
++		memset(isp->l2, 0, sizeof(isp->l2));
++	} else if (isp_power_off(isp) && (isp->l1 || !list_empty(&isp->surfs))) {
+ 		/*
+ 		 * ps_isp did not gate: the ISP (and its DART) may still be live, so
+ 		 * every page it could reach stays allocated. Leaked on purpose.
+@@ -178,6 +225,11 @@ int isp_boot(struct t7000_isp *isp, int upto)
+ 
+ 	for (n = isp->done + 1; n <= upto; n++) {
+ 		dev_info(isp->dev, "stage %d: start\n", n);
++		isp_trace_mark(isp, "stage %d", n);
++		if (isp->drain_failed) {
++			dev_err(isp->dev, "an earlier CPU stop left transactions outstanding: refusing to boot\n");
++			return -EBUSY;
++		}
+ 		if (n > 1 && isp->isp_was_on) {
+ 			dev_err(isp->dev, "ps_isp was already on at load: someone else owns it, refusing writes\n");
+ 			return -EBUSY;
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-pwr.c b/drivers/media/platform/apple/isp-t7000/isp-pwr.c
+index c85fcbcc0..0fe8bfdff 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-pwr.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-pwr.c
+@@ -36,6 +36,8 @@ static int ps_set(struct t7000_isp *isp, u32 off, const char *name, u32 state)
+ 
+ 	v &= ~(PS_AUTO_ENABLE | PS_FLAGS | PS_TARGET);
+ 	v |= FIELD_PREP(PS_TARGET, state);
++	if (unlikely(READ_ONCE(isp_trace)))
++		isp_trace_io(isp, 'W', "PMGR", PMGR_PS_PHYS + off, v);
+ 	writel(v, isp->pmgr + off);
+ 	ret = readl_poll_timeout(isp->pmgr + off, v,
+ 				 FIELD_GET(PS_ACTUAL, v) == state, 10, 100000);
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-scfg.c b/drivers/media/platform/apple/isp-t7000/isp-scfg.c
+index dbb4cf92b..e82382ab1 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-scfg.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-scfg.c
+@@ -338,6 +338,10 @@ int isp_stream_start(struct t7000_isp *isp, u32 camera)
+ 	st->nready = 0;
+ 	st->stopping = false;
+ 	st->on = true;
++	if (READ_ONCE(isp_stream_nostart)) {
++		dev_info(isp->dev, "stream_nostart=1: configured, no buffers posted, no CH_START\n");
++		goto out;
++	}
+ 	isp_stream_kick(isp);		/* every buffer is FREE: one or two lists on BUF_H2T */
+ 	ret = isp_ch_simple(isp, "CH_START", CISP_CMD_CH_START, st->ch, 0xc, 0, 0, true);
+ 	if (ret) {
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-sens.c b/drivers/media/platform/apple/isp-t7000/isp-sens.c
+index 72535f472..5c4a6692c 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-sens.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-sens.c
+@@ -76,7 +76,10 @@ static int isp_gpio_base(struct t7000_isp *isp)
+ 
+ static int isp_pin_out(struct t7000_isp *isp, int idx, int pin, const char *name)
+ {
+-	int ret = gpio_request_one(isp->gpio_base + pin, GPIOF_OUT_INIT_HIGH, name);
++	int ret;
++
++	isp_trace_mark(isp, "gpio %d (%s) := 1", pin, name);
++	ret = gpio_request_one(isp->gpio_base + pin, GPIOF_OUT_INIT_HIGH, name);
+ 
+ 	if (ret) {
+ 		dev_err(isp->dev, "sens_pwr: gpio %d (%s) request failed: %d\n", pin, name, ret);
+@@ -99,7 +102,10 @@ static int isp_refclk_set(struct t7000_isp *isp, int n)
+ 	if (old & REFCLK_BUSY)
+ 		dev_warn(isp->dev, "sens_pwr: ref clock %d busy (bit 30) before the write: 0x%08x\n",
+ 			 n, old);
+-	writel((old & REFCLK_KEEP) | (isp_refclk_cfg & 0x3f) | ((isp_refclk_cfg >> 6) & 3) << 24, r);
++	v = (old & REFCLK_KEEP) | (isp_refclk_cfg & 0x3f) | ((isp_refclk_cfg >> 6) & 3) << 24;
++	if (unlikely(READ_ONCE(isp_trace)))
++		isp_trace_io(isp, 'W', "REFCLK", REFCLK_PHYS + 4 * n, v);
++	writel(v, r);
+ 	/* iOS waits up to 0x2ee00 (~192 ms) in configISPRefClock */
+ 	ret = readl_poll_timeout(r, v, !(v & REFCLK_BUSY), 10, REFCLK_TIMEOUT_US);
+ 	dev_info(isp->dev, "sens_pwr: ref clock %d (PMGR +0x%x): 0x%08x -> 0x%08x%s\n", n,
+@@ -114,6 +120,9 @@ static void isp_extclk_set(struct t7000_isp *isp, int n, int pin)
+ 
+ 	isp->extclk_old[n] = old;
+ 	isp->extclk_saved |= BIT(n);
++	if (unlikely(READ_ONCE(isp_trace)))
++		isp_trace_io(isp, 'W', "PIN", PINCTRL_PHYS + 4 * pin,
++			     (old & ~PIN_PERIPH) | FIELD_PREP(PIN_PERIPH, isp_extclk_periph));
+ 	writel((old & ~PIN_PERIPH) | FIELD_PREP(PIN_PERIPH, isp_extclk_periph), r);
+ 	dev_info(isp->dev, "sens_pwr: extclk pin %d: 0x%08x -> 0x%08x (periph %d)\n", pin, old,
+ 		 readl(r), isp_extclk_periph);
+@@ -166,6 +175,7 @@ static void isp_pin_release(struct t7000_isp *isp, int idx)
+ {
+ 	if (!isp->gpio_on[idx])
+ 		return;
++	isp_trace_mark(isp, "gpio %d := 0", isp->gpio_on[idx]);
+ 	gpio_set_value(isp->gpio_base + isp->gpio_on[idx], 0);
+ 	gpio_free(isp->gpio_base + isp->gpio_on[idx]);
+ 	isp->gpio_on[idx] = 0;
+@@ -181,12 +191,17 @@ void isp_sensor_power_off(struct t7000_isp *isp)
+ 	isp_pin_release(isp, 2);
+ 	isp_pin_release(isp, 1);
+ 	for (n = 1; n >= 0; n--) {
++		if (isp->extclk_saved & BIT(n) && READ_ONCE(isp_trace))
++			isp_trace_io(isp, 'W', "PIN", PINCTRL_PHYS + 4 * (n ? PIN_CLK_FRONT : PIN_CLK_REAR),
++				     isp->extclk_old[n]);
+ 		if (isp->extclk_saved & BIT(n))
+ 			writel(isp->extclk_old[n],
+ 			       isp->pinregs + 4 * (n ? PIN_CLK_FRONT : PIN_CLK_REAR));
+ 		if (isp->refclk_saved & BIT(n)) {
+ 			u32 v;
+ 
++			if (READ_ONCE(isp_trace))
++				isp_trace_io(isp, 'W', "REFCLK", REFCLK_PHYS + 4 * n, isp->refclk_old[n]);
+ 			writel(isp->refclk_old[n], isp->refclk + 4 * n);
+ 			if (readl_poll_timeout(isp->refclk + 4 * n, v, !(v & REFCLK_BUSY), 10,
+ 					       REFCLK_TIMEOUT_US))
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-stream.c b/drivers/media/platform/apple/isp-t7000/isp-stream.c
+index 92949b8cf..3b143c9d2 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-stream.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-stream.c
+@@ -72,6 +72,7 @@ static int isp_h2t_post(struct t7000_isp *isp, u32 n, const u32 *pool, const u32
+ 
+ 	if (!c || !st->lists || !n)
+ 		return -ENODEV;
++	isp_trace_mark(isp, "H2T post: %u buffer(s), first pool %u idx %u", n, pool[0], idx[0]);
+ 	slot = c->idx;
+ 	m = (u32 *)(c->ring + slot * ISP_MSG_SIZE);
+ 	if (!(READ_ONCE(m[0]) & 1)) {
+@@ -106,6 +107,8 @@ void isp_stream_kick(struct t7000_isp *isp)
+ 	struct isp_stream *st = &isp->st;
+ 	u32 pool[ISP_BUFLIST_MAX], idx[ISP_BUFLIST_MAX], n, i, round;
+ 
++	if (READ_ONCE(isp_stream_nostart))
++		return;		/* debug: configure only, never hand buffers to the fw */
+ 	for (round = 0; round < 4 && st->on && !st->stopping; round++) {
+ 		n = 0;
+ 		spin_lock(&st->frame_lock);
+@@ -228,6 +231,7 @@ u32 isp_bt_handle(struct t7000_isp *isp, u32 w0, u32 w1, u32 w2)
+ 	const struct isp_bl *bl;
+ 
+ 	st->t2h_msgs++;
++	isp_trace_mark(isp, "T2H: %08x %08x %08x", w0, w1, w2);
+ 	if (!(w2 & ISP_H2T_LIST)) {
+ 		dev_warn_ratelimited(isp->dev, "T2H: single-buffer message %08x %08x %08x ignored\n",
+ 				     w0, w1, w2);
+diff --git a/drivers/media/platform/apple/isp-t7000/isp.h b/drivers/media/platform/apple/isp-t7000/isp.h
+index aa8ecd3c5..e3ef1c67a 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp.h
++++ b/drivers/media/platform/apple/isp-t7000/isp.h
+@@ -226,6 +226,7 @@ struct t7000_isp {
+ 	struct delayed_work poll_work;
+ 	bool poll_init, poll_on;
+ 	bool started;		/* START acked */
++	bool drain_failed;	/* TLIMIT drains did not reach 0 at the last CPU stop */
+ 	bool io_dead;		/* an IO command timed out: fw not answering */
+ 	u32 cmd_seq;
+ 	int irq;
+@@ -258,16 +259,29 @@ extern int isp_dry_run, isp_irq_en, isp_sens, isp_smmu_en, isp_graceful, isp_fwl
+ extern uint isp_fw_iova, isp_dart_sids, isp_platform_id, isp_poll_ms;
+ extern uint isp_boot_timeout_ms, isp_cmd_timeout_ms, isp_max_shared_mb;
+ extern int isp_sens_pwr, isp_refclk, isp_extclk_periph, isp_stream_en, isp_stream_dump;
+-extern int isp_keep_on, isp_preset;
++extern int isp_keep_on, isp_preset, isp_stream_nostart;
+ extern uint isp_refclk_cfg, isp_nbufs, isp_out_range, isp_setfile_rear, isp_setfile_front;
+ 
++/*
++ * trace=1: every ISP-window write (and the PMGR / pin / ref clock writes) is printed
++ * BEFORE it happens, followed by msleep(50) in task context, so with the console on
++ * tty0 the last line on screen names the access that hung. trace=2 adds the reads.
++ */
++extern int isp_trace;
++void isp_trace_io(struct t7000_isp *isp, char rw, const char *blk, u64 phys, u32 val);
++void isp_trace_mark(struct t7000_isp *isp, const char *fmt, ...) __printf(2, 3);
++
+ static inline u32 isp_rd(struct t7000_isp *isp, u32 off)
+ {
++	if (unlikely(READ_ONCE(isp_trace) >= 2))
++		isp_trace_io(isp, 'R', "ISP", ISP_PHYS_BASE + off, 0);
+ 	return readl(isp->regs + off);
+ }
+ 
+ static inline void isp_wr(struct t7000_isp *isp, u32 off, u32 val)
+ {
++	if (unlikely(READ_ONCE(isp_trace)))
++		isp_trace_io(isp, 'W', "ISP", ISP_PHYS_BASE + off, val);
+ 	writel(val, isp->regs + off);
+ }
+ 
+@@ -298,6 +312,7 @@ struct isp_surf *isp_surf_find(struct t7000_isp *isp, u32 iova);
+ /* isp-boot.c */
+ int isp_wait(struct t7000_isp *isp, u32 off, u32 mask, u32 want, uint ms,
+ 	     const char *what);
++bool isp_cpu_drained(struct t7000_isp *isp);
+ void isp_fw_peek(struct t7000_isp *isp);
+ int isp_stage_fw(struct t7000_isp *isp);
+ int isp_stage_cpu(struct t7000_isp *isp);

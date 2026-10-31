@@ -1,0 +1,143 @@
+#!/bin/sh
+# wifiup - Wi-Fi (BCM4345 over the A8 PCIe driver) control on the phone. Installed as /usr/sbin/wifiup (bin/mkblob).
+#   wifiup on      load the module chain if wlan0 is missing, link up, power save on (unless $D/nopowersave), start
+#                  wpa_supplicant + wpa_cli (-> wifi-action runs udhcpc on CONNECTED). Removes the "off" flag.
+#   wifiup off     touch the "off" flag, stop wpa_cli / wpa_supplicant / udhcpc (by PID), flush wlan0, link down
+#                  (modules stay loaded).
+#   wifiup boot    what rd/etc/hl-rd.d/45-wifi.sh calls: "on" unless the off flag exists (then only load the modules).
+#   wifiup status  one-line summary.
+# State dir $D = /data/wifi when /data is mounted (persistent: off flag, wpa_supplicant.conf with the saved networks),
+# else /tmp/wifi. Log: /tmp/wifi.log. Never pkill -f: every kill is by PID.
+PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH
+IF=wlan0
+M=/lib/modules/pcie
+LOG=/tmp/wifi.log
+CTL=/var/run/wpa_supplicant
+if mountpoint -q /data 2>/dev/null; then D=/data/wifi; else D=/tmp/wifi; fi
+
+log() { echo "$(date +%T) wifiup: $*" >> "$LOG"; echo "wifiup: $*"; }
+
+# stop_pids PID...: SIGTERM, wait up to 2 s, then SIGKILL
+stop_pids() {
+	[ $# -gt 0 ] || return 0
+	kill "$@" 2>/dev/null
+	i=0
+	while [ $i -lt 10 ]; do
+		alive=
+		for p in "$@"; do [ -d "/proc/$p" ] && alive=1; done
+		[ -n "$alive" ] || return 0
+		usleep 200000; i=$((i + 1))
+	done
+	kill -9 "$@" 2>/dev/null
+}
+
+# stop_dhcp: the udhcpc that wifi-action started for wlan0 (its pid file)
+stop_dhcp() {
+	if [ -f /var/run/udhcpc.$IF.pid ]; then
+		stop_pids $(cat /var/run/udhcpc.$IF.pid 2>/dev/null)
+		rm -f /var/run/udhcpc.$IF.pid
+	fi
+}
+
+# load_modules: insmod chain, skipped for modules already loaded; waits <= 15 s for wlan0
+load_modules() {
+	[ -d /sys/class/net/$IF ] && return 0
+	[ -d $M ] || { log "no $M (kernel without the PCIe modules)"; return 1; }
+	# brcmfmac pulls brcmfmac-wcc via request_module(): the shim insmods it from $M
+	[ -x $M/modprobe ] && echo $M/modprobe > /proc/sys/kernel/modprobe
+	# A8 DART descriptor layout (tables+leaves bits 1:0 = 0b11, no subpage range); kernels built before
+	# bf3201a68 default to 3 -> NO PTE faults and "dongle is not responding"
+	P=/sys/module/io_pgtable_dart/parameters/s5l_fmt
+	[ -w $P ] && echo 5 > $P
+	for m in pci-host-common pcie-apple apple-dart brcmutil brcmfmac; do
+		n=$(echo "$m" | tr - _)
+		grep -q "^$n " /proc/modules && continue
+		out=$(insmod $M/$m.ko 2>&1) || {
+			grep -q "^$n " /proc/modules || { log "insmod $m failed: $out"; return 1; }
+		}
+		log "loaded $m"
+	done
+	i=0
+	while [ ! -d /sys/class/net/$IF ] && [ $i -lt 30 ]; do usleep 500000; i=$((i + 1)); done
+	[ -d /sys/class/net/$IF ] || { log "no $IF after 15 s (dmesg | grep brcmf)"; return 1; }
+	log "$IF present"
+}
+
+start_daemons() {
+	mkdir -p "$D" /var /run $CTL /usr/share/udhcpc
+	[ -e /var/run ] || ln -s /run /var/run
+	mkdir -p $CTL
+	[ -f "$D/wpa_supplicant.conf" ] || printf 'ctrl_interface=%s\nupdate_config=1\ncountry=US\n' $CTL > "$D/wpa_supplicant.conf"
+	# 9>&-: the daemons must not inherit the flock fd
+	if [ -z "$(pidof wpa_supplicant)" ]; then
+		wpa_supplicant -B -i $IF -c "$D/wpa_supplicant.conf" -P /var/run/wpa_supplicant.pid >> "$LOG" 2>&1 9>&- \
+			|| { log "wpa_supplicant FAILED"; return 1; }
+		log "wpa_supplicant started"
+	fi
+	if [ -z "$(pidof wpa_cli)" ]; then
+		i=0
+		while [ ! -S $CTL/$IF ] && [ $i -lt 20 ]; do usleep 250000; i=$((i + 1)); done
+		wpa_cli -B -i $IF -a /usr/sbin/wifi-action >> "$LOG" 2>&1 9>&- || { log "wpa_cli FAILED"; return 1; }
+		log "wpa_cli started"
+	fi
+}
+
+do_on() {
+	mkdir -p "$D"; rm -f "$D/off"
+	load_modules || return 1
+	ip link set $IF up || { log "ip link set $IF up failed"; return 1; }
+	# Wi-Fi power save (brcmfmac PM_FAST: the radio dozes between beacons). CFG80211_DEFAULT_PS=y already asks for
+	# it; this makes it explicit (cfg80211 keeps it across reconnects / link down-up). $D/nopowersave = leave it off.
+	[ -e "$D/nopowersave" ] || iw dev $IF set power_save on 2>/dev/null || log "iw power_save on failed"
+	start_daemons
+}
+
+do_off() {
+	mkdir -p "$D"; touch "$D/off"
+	stop_pids $(pidof wpa_cli)
+	stop_dhcp
+	stop_pids $(pidof wpa_supplicant)
+	rm -f /var/run/wpa_supplicant.pid $CTL/$IF
+	if [ -d /sys/class/net/$IF ]; then
+		ip addr flush dev $IF
+		ip link set $IF down
+	fi
+	log "off"
+}
+
+do_boot() {
+	if [ -e "$D/off" ]; then
+		log "boot: off flag set, modules only"
+		load_modules
+	else
+		do_on
+	fi
+}
+
+do_status() {
+	if [ -e "$D/off" ]; then st=off; else st=on; fi
+	if [ ! -d /sys/class/net/$IF ]; then echo "wifi $st: no $IF (modules not loaded)"; return 0; fi
+	link=$(cat /sys/class/net/$IF/operstate 2>/dev/null)
+	flags=$(cat /sys/class/net/$IF/flags 2>/dev/null)
+	[ $((${flags:-0} & 1)) -eq 1 ] && admin=up || admin=down
+	ssid=; wst=
+	if [ -S $CTL/$IF ]; then
+		s=$(wpa_cli -i $IF status 2>/dev/null)
+		wst=$(echo "$s" | sed -n 's/^wpa_state=//p')
+		ssid=$(echo "$s" | sed -n 's/^ssid=//p')
+	fi
+	addr=$(ip -o -4 addr show dev $IF 2>/dev/null | sed -n 's/.* inet \([0-9.]*\)\/.*/\1/p' | head -n 1)
+	ps=$(iw dev $IF get power_save 2>/dev/null | sed -n 's/.*: *//p')
+	echo "wifi $st: $IF $admin/$link wpa=${wst:--} ssid=${ssid:--} ip=${addr:--} ps=${ps:--}"
+}
+
+# one command at a time (boot hook vs UI); the fd is closed for the daemons above
+mkdir -p /tmp
+exec 9> /tmp/wifi.lock
+case "$1" in
+status) do_status ;;
+on|off|boot)
+	flock 9
+	do_$1 ;;
+*) echo "usage: wifiup on|off|boot|status" >&2; exit 2 ;;
+esac

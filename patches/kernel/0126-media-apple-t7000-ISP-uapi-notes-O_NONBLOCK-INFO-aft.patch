@@ -1,0 +1,85 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 01:54:19 +0000
+Subject: [PATCH 126/138] media: apple: t7000 ISP: uapi notes (O_NONBLOCK, INFO
+ after START, ioctl letter), out_range knob
+
+ISP_UAPI_VERSION alias so the header matches Orchard's copy (identical
+ABI: isp_info 60 bytes, isp_frame 24 bytes, same ioctl numbers).
+OUTPUT_CONFIG_SET +0x14 is logged by the fw as 'range': make it a
+module parameter (default 1 as before).
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/media/platform/apple/isp-t7000/isp-main.c | 3 +++
+ drivers/media/platform/apple/isp-t7000/isp-scfg.c | 3 ++-
+ drivers/media/platform/apple/isp-t7000/isp.h      | 2 +-
+ include/uapi/linux/apple-isp-t7000.h              | 7 ++++++-
+ 4 files changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-main.c b/drivers/media/platform/apple/isp-t7000/isp-main.c
+index a8d14a2a9..1a30f7d25 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-main.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-main.c
+@@ -90,6 +90,9 @@ MODULE_PARM_DESC(keep_on, "stream=1: 1 = keep the ISP booted when /dev/isp0 is c
+ int isp_preset = -1;
+ module_param_named(preset, isp_preset, int, 0644);
+ MODULE_PARM_DESC(preset, "sensor preset to stream (-1 = smallest output >= 640x480)");
++uint isp_out_range = 1;
++module_param_named(out_range, isp_out_range, uint, 0644);
++MODULE_PARM_DESC(out_range, "OUTPUT_CONFIG_SET +0x14, logged by the fw as 'range' (Asahi: colorspace 1 = REC709)");
+ uint isp_nbufs = 4;
+ module_param_named(nbufs, isp_nbufs, uint, 0444);
+ MODULE_PARM_DESC(nbufs, "frame buffers (2..8)");
+diff --git a/drivers/media/platform/apple/isp-t7000/isp-scfg.c b/drivers/media/platform/apple/isp-t7000/isp-scfg.c
+index e80765e46..9fc155d90 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp-scfg.c
++++ b/drivers/media/platform/apple/isp-t7000/isp-scfg.c
+@@ -294,7 +294,8 @@ int isp_stream_start(struct t7000_isp *isp, u32 camera)
+ 	oc.chan = st->ch;
+ 	oc.width = st->width;
+ 	oc.height = st->height;
+-	oc.colorspace = 1;		/* REC709 (Asahi) */
++	/* fw 0x1b99c logs this field as "range" ("format = %d, range %d"): Asahi calls it colorspace */
++	oc.colorspace = isp_out_range;
+ 	oc.format = 0;			/* 2-plane YUV 4:2:0 = NV12 (fw 0x162b8) */
+ 	oc.strides[0] = st->stride;
+ 	oc.strides[1] = st->stride;
+diff --git a/drivers/media/platform/apple/isp-t7000/isp.h b/drivers/media/platform/apple/isp-t7000/isp.h
+index 4f92f63c8..aa8ecd3c5 100644
+--- a/drivers/media/platform/apple/isp-t7000/isp.h
++++ b/drivers/media/platform/apple/isp-t7000/isp.h
+@@ -259,7 +259,7 @@ extern uint isp_fw_iova, isp_dart_sids, isp_platform_id, isp_poll_ms;
+ extern uint isp_boot_timeout_ms, isp_cmd_timeout_ms, isp_max_shared_mb;
+ extern int isp_sens_pwr, isp_refclk, isp_extclk_periph, isp_stream_en, isp_stream_dump;
+ extern int isp_keep_on, isp_preset;
+-extern uint isp_refclk_cfg, isp_nbufs, isp_setfile_rear, isp_setfile_front;
++extern uint isp_refclk_cfg, isp_nbufs, isp_out_range, isp_setfile_rear, isp_setfile_front;
+ 
+ static inline u32 isp_rd(struct t7000_isp *isp, u32 off)
+ {
+diff --git a/include/uapi/linux/apple-isp-t7000.h b/include/uapi/linux/apple-isp-t7000.h
+index 4de9da48d..1744ef12a 100644
+--- a/include/uapi/linux/apple-isp-t7000.h
++++ b/include/uapi/linux/apple-isp-t7000.h
+@@ -12,7 +12,11 @@
+  *   ioctl(fd, ISP_IOC_STOP);  close(fd);     last close powers the sensor/ISP down (keep_on=0)
+  *
+  * Userspace may hold at most nbufs - 1 buffers; beyond that the driver recycles the
+- * oldest one it handed out.
++ * oldest one it handed out. O_NONBLOCK: read() returns -EAGAIN when no frame is ready.
++ * INFO reports the format of the camera started last (re-read + remap after each START).
++ *
++ * Upstreaming TODO: ioctl letter 'I' collides with ISDN in
++ * Documentation/userspace-api/ioctl/ioctl-number.rst; pick a free range before posting.
+  */
+ #ifndef _UAPI_LINUX_APPLE_ISP_T7000_H
+ #define _UAPI_LINUX_APPLE_ISP_T7000_H
+@@ -21,6 +25,7 @@
+ #include <linux/types.h>
+ 
+ #define ISP_INFO_VERSION	1
++#define ISP_UAPI_VERSION	ISP_INFO_VERSION	/* name used by Orchard's copy (ui/src/isp_uapi.h) */
+ 
+ struct isp_info {
+ 	__u32 version;		/* ISP_INFO_VERSION */

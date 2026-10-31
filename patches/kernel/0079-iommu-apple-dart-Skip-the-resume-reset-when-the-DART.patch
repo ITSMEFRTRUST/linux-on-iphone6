@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 20:36:37 +0000
+Subject: [PATCH 079/138] iommu: apple-dart: Skip the resume reset when the
+ DART kept its state
+
+apple_dart_resume() always resets the DART and then writes the saved
+TCR/TTBR values back. That is needed when the power domain went down,
+but on T7000 the PMGR domains now stay on across system suspend, so the
+registers still hold exactly what suspend saved. The reset then only
+opens a window with translation disabled, and a DMA from a device that
+was left running during suspend-to-idle (the BCM4345 PCIe function is
+kept in D0) faults in it. Without a programmed error reflector a
+faulting DMA can wedge the fabric on this SoC.
+
+Compare the live registers with the saved ones and skip the reset when
+they all match. apple_dart.resume_reset=1 restores the unconditional
+reset.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/iommu/apple-dart.c | 32 ++++++++++++++++++++++++++++++++
+ 1 file changed, 32 insertions(+)
+
+diff --git a/drivers/iommu/apple-dart.c b/drivers/iommu/apple-dart.c
+index 2d6c4aecb..2f54a9cc7 100644
+--- a/drivers/iommu/apple-dart.c
++++ b/drivers/iommu/apple-dart.c
+@@ -1580,12 +1580,44 @@ static __maybe_unused int apple_dart_suspend(struct device *dev)
+ 	return 0;
+ }
+ 
++/*
++ * A DART whose power domain stayed on across suspend still holds the saved
++ * configuration. Resetting it anyway disables translation for a moment, and a
++ * DMA from a device that was left running (PCIe Wi-Fi kept in D0 on T7000)
++ * faults in that window. Only reset when the state is really gone, unless
++ * resume_reset=1 asks for the old unconditional reset.
++ */
++static bool resume_reset;
++module_param(resume_reset, bool, 0644);
++MODULE_PARM_DESC(resume_reset, "Always reset the DART on resume, even if it kept its state");
++
++static __maybe_unused bool apple_dart_state_retained(struct apple_dart *dart)
++{
++	unsigned int sid, idx;
++
++	for (sid = 0; sid < dart->num_streams; sid++) {
++		if (dart->hw->read_tcr(dart, sid) != dart->save_tcr[sid])
++			return false;
++		for (idx = 0; idx < dart->hw->ttbr_count; idx++)
++			if (readl(dart->regs + DART_TTBR(dart, sid, idx)) !=
++			    dart->save_ttbr[sid][idx])
++				return false;
++	}
++
++	return true;
++}
++
+ static __maybe_unused int apple_dart_resume(struct device *dev)
+ {
+ 	struct apple_dart *dart = dev_get_drvdata(dev);
+ 	unsigned int sid, idx;
+ 	int ret;
+ 
++	if (!READ_ONCE(resume_reset) && apple_dart_state_retained(dart)) {
++		dev_dbg(dev, "state retained across suspend, no reset\n");
++		return 0;
++	}
++
+ 	ret = apple_dart_hw_reset(dart);
+ 	if (ret) {
+ 		dev_err(dev, "Failed to reset DART on resume\n");

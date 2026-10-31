@@ -1,0 +1,601 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 02:35:15 +0000
+Subject: [PATCH 103/138] irqchip: Add a driver for the Apple PMIC event
+ interrupts
+
+The D2186 PMU keeps its events at 0x50..0x5c (cleared by reading them,
+which is all iOS does to "clear events"), the current levels at
+0x60..0x6d and one mask bit per event at 0x70..0x7c (1 = masked, iOS
+masks all at start). Event 3 is VBUS detect, 24..44 are the PMU GPIO
+inputs and 88 is the RTC alarm. Layout from the iOS 12 AppleD2186PMU
+driver; the PMU line goes to AP GPIO 106, active low.
+
+Expose the events as a nested threaded irq domain. Everything is masked
+at probe and only events with a user get unmasked. Across system sleep
+only wake enabled events stay unmasked, like iOS before sleep; events of
+other users that arrive meanwhile are delivered on resume.
+
+The driver must not take the system down with it: a storm (more than
+100 runs a second, or 20 runs in a row without an event) or 10 I2C errors
+in a row switch the parent interrupt off with one message. The domain is
+registered even when the parent interrupt is missing or disabled with
+irq_apple_pmic.enable=0, so the users of the events still probe. A
+debugfs file shows the masks, status registers and event counts.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/irqchip/Kconfig          |  12 +
+ drivers/irqchip/Makefile         |   1 +
+ drivers/irqchip/irq-apple-pmic.c | 527 +++++++++++++++++++++++++++++++
+ 3 files changed, 540 insertions(+)
+ create mode 100644 drivers/irqchip/irq-apple-pmic.c
+
+diff --git a/drivers/irqchip/Kconfig b/drivers/irqchip/Kconfig
+index 20b77fbc5..188ab73aa 100644
+--- a/drivers/irqchip/Kconfig
++++ b/drivers/irqchip/Kconfig
+@@ -811,6 +811,18 @@ config APPLE_AIC
+ 	  Support for the Apple Interrupt Controller found on Apple Silicon SoCs,
+ 	  such as the M1.
+ 
++config APPLE_PMIC_IRQ
++	bool "Apple PMIC interrupt controller"
++	depends on ARCH_APPLE || COMPILE_TEST
++	depends on MFD_SIMPLE_MFD_I2C && OF
++	select IRQ_DOMAIN
++	default ARCH_APPLE
++	help
++	  Support for the event interrupts of the Dialog based PMICs of
++	  Apple A8 devices, such as the D2186 of the iPhone 6. They carry
++	  the RTC alarm, VBUS detect and the PMIC GPIO inputs (Wi-Fi and
++	  Bluetooth host wake), and can wake the system from suspend.
++
+ config MCHP_EIC
+ 	bool "Microchip External Interrupt Controller"
+ 	depends on ARCH_AT91 || COMPILE_TEST
+diff --git a/drivers/irqchip/Makefile b/drivers/irqchip/Makefile
+index ab33cccd8..60ec9cbf7 100644
+--- a/drivers/irqchip/Makefile
++++ b/drivers/irqchip/Makefile
+@@ -132,6 +132,7 @@ obj-$(CONFIG_MACH_REALTEK_RTL)		+= irq-realtek-rtl.o
+ obj-$(CONFIG_WPCM450_AIC)		+= irq-wpcm450-aic.o
+ obj-$(CONFIG_IRQ_IDT3243X)		+= irq-idt3243x.o
+ obj-$(CONFIG_APPLE_AIC)			+= irq-apple-aic.o
++obj-$(CONFIG_APPLE_PMIC_IRQ)		+= irq-apple-pmic.o
+ obj-$(CONFIG_MCHP_EIC)			+= irq-mchp-eic.o
+ obj-$(CONFIG_SOPHGO_SG2042_MSI)		+= irq-sg2042-msi.o
+ obj-$(CONFIG_SUNPLUS_SP7021_INTC)	+= irq-sp7021-intc.o
+diff --git a/drivers/irqchip/irq-apple-pmic.c b/drivers/irqchip/irq-apple-pmic.c
+new file mode 100644
+index 000000000..ecf026cbf
+--- /dev/null
++++ b/drivers/irqchip/irq-apple-pmic.c
+@@ -0,0 +1,527 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Apple PMIC interrupt controller
++ *
++ * The Dialog D2186 PMU of the iPhone 6 (ADT "pmu,d2186", a child of the
++ * apple,i2c-pmic MFD) latches up to 104 events and signals them on one
++ * active-low line to an AP GPIO. The layout below is from the iOS 12
++ * AppleD2186PMU driver:
++ *
++ *   base + 0x00..0x0c  events, one bit per event. iOS never writes them;
++ *                      its "clear events" step is a read of all 13, so a
++ *                      read clears them.
++ *   base + 0x10..0x1d  status (current levels, not touched here)
++ *   base + 0x20..0x2c  mask, 1 = masked. iOS masks everything at start.
++ *
++ * Event n is bit n % 8 of register n / 8. Events 24..44 are PMU GPIO 0..20,
++ * event 3 is VBUS detect and event 88 the RTC alarm.
++ *
++ * Only events that have a user are unmasked. A broken PMU or a stuck line
++ * must not take the rest of the system with it, so the driver gives up on
++ * the parent interrupt (and says so once) when it sees an interrupt storm
++ * or repeated I2C errors. The irq domain stays registered either way, so
++ * the users of the events still probe.
++ */
++
++#include <linux/bitops.h>
++#include <linux/debugfs.h>
++#include <linux/device.h>
++#include <linux/interrupt.h>
++#include <linux/irq.h>
++#include <linux/irqdomain.h>
++#include <linux/jiffies.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/pm.h>
++#include <linux/regmap.h>
++#include <linux/seq_file.h>
++#include <linux/string.h>
++
++#define APMIC_IRQ_NREGS		13
++#define APMIC_IRQ_NIRQS		(APMIC_IRQ_NREGS * 8)
++#define APMIC_IRQ_STATUS	0x10
++#define APMIC_IRQ_NSTATUS	14
++#define APMIC_IRQ_MASK		0x20
++
++/* Storm guard: more runs than this in one second, or this many in a row
++ * that find no event, and the parent interrupt is switched off.
++ */
++#define APMIC_IRQ_STORM_RUNS	100
++#define APMIC_IRQ_STORM_IDLE	20
++#define APMIC_IRQ_MAX_ERRORS	10
++
++static bool enable = true;
++module_param(enable, bool, 0444);
++MODULE_PARM_DESC(enable, "Request the parent interrupt (0 = register the domain only)");
++
++static bool trace;
++module_param(trace, bool, 0644);
++MODULE_PARM_DESC(trace, "Log every non-empty event read (ratelimited)");
++
++struct apple_pmic_irq {
++	struct device *dev;
++	struct regmap *regmap;
++	struct irq_domain *domain;
++	unsigned int base;
++	int parent_irq;		/* > 0 once requested */
++	bool parent_wake;	/* enable_irq_wake() held on the parent */
++	bool suspending;	/* only wake events stay unmasked */
++	bool dead;		/* parent interrupt switched off */
++
++	struct mutex lock;	/* bus lock, registers and the state below */
++	u8 mask[APMIC_IRQ_NREGS];	/* wanted by the irq core, 1 = masked */
++	u8 hw_mask[APMIC_IRQ_NREGS];	/* last written to the PMU */
++	u8 wake[APMIC_IRQ_NREGS];	/* 1 = wake enabled */
++	u8 deferred[APMIC_IRQ_NREGS];	/* read while masked for suspend */
++
++	/* statistics, for debugfs */
++	unsigned long window;
++	unsigned int window_runs;
++	unsigned int idle_runs;
++	unsigned int errors;
++	u64 runs;
++	u64 spurious;
++	u64 read_errors;
++	u8 last[APMIC_IRQ_NREGS];
++	u8 seen[APMIC_IRQ_NREGS];
++	u32 count[APMIC_IRQ_NIRQS];
++	struct dentry *debugfs;
++};
++
++/* Called with the lock held */
++static void apple_pmic_irq_sync(struct apple_pmic_irq *pi)
++{
++	unsigned int i;
++	int ret;
++
++	/* Without a parent interrupt keep the PMU line quiet */
++	if (pi->parent_irq <= 0 || pi->dead)
++		return;
++
++	for (i = 0; i < APMIC_IRQ_NREGS; i++) {
++		u8 want = pi->mask[i];
++
++		if (pi->suspending)
++			want |= (u8)~pi->wake[i];
++
++		if (want == pi->hw_mask[i])
++			continue;
++
++		ret = regmap_write(pi->regmap, pi->base + APMIC_IRQ_MASK + i,
++				   want);
++		if (ret) {
++			dev_err_ratelimited(pi->dev,
++					    "failed to write mask %u: %d\n",
++					    i, ret);
++			continue;
++		}
++		pi->hw_mask[i] = want;
++	}
++}
++
++static void apple_pmic_irq_mask(struct irq_data *d)
++{
++	struct apple_pmic_irq *pi = irq_data_get_irq_chip_data(d);
++
++	pi->mask[d->hwirq / 8] |= BIT(d->hwirq % 8);
++}
++
++static void apple_pmic_irq_unmask(struct irq_data *d)
++{
++	struct apple_pmic_irq *pi = irq_data_get_irq_chip_data(d);
++
++	pi->mask[d->hwirq / 8] &= ~BIT(d->hwirq % 8);
++}
++
++/*
++ * The PMU latches each event on its own: the edge or level of the PMU GPIO
++ * inputs is set by their config registers (which this driver leaves alone),
++ * the other events are fixed. Accept whatever the user asks for.
++ */
++static int apple_pmic_irq_set_type(struct irq_data *d, unsigned int type)
++{
++	return 0;
++}
++
++static int apple_pmic_irq_set_wake(struct irq_data *d, unsigned int on)
++{
++	struct apple_pmic_irq *pi = irq_data_get_irq_chip_data(d);
++
++	if (on)
++		pi->wake[d->hwirq / 8] |= BIT(d->hwirq % 8);
++	else
++		pi->wake[d->hwirq / 8] &= ~BIT(d->hwirq % 8);
++
++	return 0;
++}
++
++static void apple_pmic_irq_bus_lock(struct irq_data *d)
++{
++	struct apple_pmic_irq *pi = irq_data_get_irq_chip_data(d);
++
++	mutex_lock(&pi->lock);
++}
++
++static void apple_pmic_irq_bus_sync_unlock(struct irq_data *d)
++{
++	struct apple_pmic_irq *pi = irq_data_get_irq_chip_data(d);
++	bool want_wake = memchr_inv(pi->wake, 0, sizeof(pi->wake));
++
++	if (pi->parent_irq > 0 && want_wake != pi->parent_wake) {
++		if (want_wake) {
++			if (!enable_irq_wake(pi->parent_irq))
++				pi->parent_wake = true;
++		} else {
++			disable_irq_wake(pi->parent_irq);
++			pi->parent_wake = false;
++		}
++	}
++
++	apple_pmic_irq_sync(pi);
++	mutex_unlock(&pi->lock);
++}
++
++static const struct irq_chip apple_pmic_irq_chip = {
++	.name			= "apple-pmic",
++	.irq_mask		= apple_pmic_irq_mask,
++	.irq_unmask		= apple_pmic_irq_unmask,
++	.irq_disable		= apple_pmic_irq_mask,
++	.irq_enable		= apple_pmic_irq_unmask,
++	.irq_set_type		= apple_pmic_irq_set_type,
++	.irq_set_wake		= apple_pmic_irq_set_wake,
++	.irq_bus_lock		= apple_pmic_irq_bus_lock,
++	.irq_bus_sync_unlock	= apple_pmic_irq_bus_sync_unlock,
++};
++
++static int apple_pmic_irq_map(struct irq_domain *domain, unsigned int virq,
++			      irq_hw_number_t hwirq)
++{
++	struct apple_pmic_irq *pi = domain->host_data;
++
++	irq_set_chip_data(virq, pi);
++	irq_set_chip(virq, &apple_pmic_irq_chip);
++	irq_set_nested_thread(virq, true);
++	if (pi->parent_irq > 0)
++		irq_set_parent(virq, pi->parent_irq);
++	irq_set_noprobe(virq);
++
++	return 0;
++}
++
++static void apple_pmic_irq_unmap(struct irq_domain *domain, unsigned int virq)
++{
++	irq_set_nested_thread(virq, false);
++	irq_set_chip_and_handler(virq, NULL, NULL);
++	irq_set_chip_data(virq, NULL);
++}
++
++static const struct irq_domain_ops apple_pmic_irq_domain_ops = {
++	.map	= apple_pmic_irq_map,
++	.unmap	= apple_pmic_irq_unmap,
++	.xlate	= irq_domain_xlate_twocell,
++};
++
++/* Called with the lock held, from the parent's thread. */
++static void apple_pmic_irq_give_up(struct apple_pmic_irq *pi, const char *why)
++{
++	pi->dead = true;
++	disable_irq_nosync(pi->parent_irq);
++	dev_err(pi->dev,
++		"%s, PMU interrupts off until reboot (last events %*ph)\n",
++		why, APMIC_IRQ_NREGS, pi->last);
++}
++
++/* Called with the lock held. Returns false if the parent was switched off. */
++static bool apple_pmic_irq_guard(struct apple_pmic_irq *pi, bool idle)
++{
++	if (time_after(jiffies, pi->window + HZ)) {
++		pi->window = jiffies;
++		pi->window_runs = 0;
++	}
++
++	pi->idle_runs = idle ? pi->idle_runs + 1 : 0;
++
++	if (++pi->window_runs > APMIC_IRQ_STORM_RUNS) {
++		apple_pmic_irq_give_up(pi, "interrupt storm");
++		return false;
++	}
++
++	if (pi->idle_runs >= APMIC_IRQ_STORM_IDLE) {
++		apple_pmic_irq_give_up(pi, "line stuck without events");
++		return false;
++	}
++
++	return true;
++}
++
++static irqreturn_t apple_pmic_irq_thread(int irq, void *data)
++{
++	struct apple_pmic_irq *pi = data;
++	u8 ev[APMIC_IRQ_NREGS];
++	unsigned long pending;
++	unsigned int i, bit;
++	bool any, kept;
++	int ret;
++
++	mutex_lock(&pi->lock);
++
++	if (pi->dead) {
++		mutex_unlock(&pi->lock);
++		return IRQ_NONE;
++	}
++
++	pi->runs++;
++
++	ret = regmap_bulk_read(pi->regmap, pi->base, ev, sizeof(ev));
++	if (ret) {
++		pi->read_errors++;
++		dev_err_ratelimited(pi->dev, "failed to read events: %d\n",
++				    ret);
++		if (++pi->errors >= APMIC_IRQ_MAX_ERRORS)
++			apple_pmic_irq_give_up(pi, "too many I2C errors");
++		else
++			apple_pmic_irq_guard(pi, true);
++		mutex_unlock(&pi->lock);
++		return IRQ_NONE;
++	}
++	pi->errors = 0;
++
++	any = memchr_inv(ev, 0, sizeof(ev));
++	kept = memchr_inv(pi->deferred, 0, sizeof(pi->deferred));
++	if (any) {
++		memcpy(pi->last, ev, sizeof(ev));
++		if (trace)
++			dev_info_ratelimited(pi->dev, "events %*ph\n",
++					     APMIC_IRQ_NREGS, ev);
++	} else if (!kept) {
++		pi->spurious++;
++	}
++
++	if (!apple_pmic_irq_guard(pi, !any && !kept)) {
++		mutex_unlock(&pi->lock);
++		return IRQ_HANDLED;
++	}
++
++	for (i = 0; i < APMIC_IRQ_NREGS; i++) {
++		pending = ev[i];
++		for_each_set_bit(bit, &pending, 8)
++			pi->count[i * 8 + bit]++;
++		pi->seen[i] |= ev[i];
++
++		/*
++		 * Events of users that are only masked for suspend are kept
++		 * for resume, the rest of the masked ones are dropped (the
++		 * read has cleared them).
++		 */
++		ev[i] |= pi->deferred[i];
++		pi->deferred[i] = ev[i] & pi->hw_mask[i] & ~pi->mask[i];
++		ev[i] &= ~pi->hw_mask[i];
++	}
++
++	mutex_unlock(&pi->lock);
++
++	for (i = 0; i < APMIC_IRQ_NREGS; i++) {
++		pending = ev[i];
++		for_each_set_bit(bit, &pending, 8) {
++			unsigned int virq = irq_find_mapping(pi->domain,
++							     i * 8 + bit);
++
++			if (virq)
++				handle_nested_irq(virq);
++		}
++	}
++
++	return any || kept ? IRQ_HANDLED : IRQ_NONE;
++}
++
++static int apple_pmic_irq_state_show(struct seq_file *s, void *unused)
++{
++	struct apple_pmic_irq *pi = s->private;
++	u8 status[APMIC_IRQ_NSTATUS], hw[APMIC_IRQ_NREGS];
++	int ret_status, ret_mask;
++	unsigned int i;
++
++	mutex_lock(&pi->lock);
++
++	/* Status and mask reads have no side effects, events would clear */
++	ret_status = regmap_bulk_read(pi->regmap, pi->base + APMIC_IRQ_STATUS,
++				      status, sizeof(status));
++	ret_mask = regmap_bulk_read(pi->regmap, pi->base + APMIC_IRQ_MASK,
++				    hw, sizeof(hw));
++
++	seq_printf(s, "parent_irq: %d%s%s\n", pi->parent_irq,
++		   pi->dead ? " (off)" : "", pi->parent_wake ? " wake" : "");
++	seq_printf(s, "runs: %llu spurious: %llu read_errors: %llu\n",
++		   pi->runs, pi->spurious, pi->read_errors);
++	seq_printf(s, "mask:     %*ph\n", APMIC_IRQ_NREGS, pi->mask);
++	seq_printf(s, "hw_mask:  %*ph\n", APMIC_IRQ_NREGS, pi->hw_mask);
++	if (ret_mask)
++		seq_printf(s, "pmu_mask: error %d\n", ret_mask);
++	else
++		seq_printf(s, "pmu_mask: %*ph\n", APMIC_IRQ_NREGS, hw);
++	seq_printf(s, "wake:     %*ph\n", APMIC_IRQ_NREGS, pi->wake);
++	seq_printf(s, "deferred: %*ph\n", APMIC_IRQ_NREGS, pi->deferred);
++	seq_printf(s, "last:     %*ph\n", APMIC_IRQ_NREGS, pi->last);
++	seq_printf(s, "seen:     %*ph\n", APMIC_IRQ_NREGS, pi->seen);
++	if (ret_status)
++		seq_printf(s, "status:   error %d\n", ret_status);
++	else
++		seq_printf(s, "status:   %*ph\n", APMIC_IRQ_NSTATUS, status);
++	for (i = 0; i < APMIC_IRQ_NIRQS; i++)
++		if (pi->count[i])
++			seq_printf(s, "event %u (reg %u bit %u): %u\n", i,
++				   i / 8, i % 8, pi->count[i]);
++
++	mutex_unlock(&pi->lock);
++
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(apple_pmic_irq_state);
++
++static int apple_pmic_irq_request_parent(struct apple_pmic_irq *pi, int irq)
++{
++	u8 ev[APMIC_IRQ_NREGS];
++	int ret;
++
++	/* Mask everything and drop what the bootloader left behind */
++	memset(pi->hw_mask, 0xff, sizeof(pi->hw_mask));
++	ret = regmap_bulk_write(pi->regmap, pi->base + APMIC_IRQ_MASK,
++				pi->hw_mask, sizeof(pi->hw_mask));
++	if (ret)
++		return dev_err_probe(pi->dev, ret, "failed to mask events\n");
++
++	ret = regmap_bulk_read(pi->regmap, pi->base, ev, sizeof(ev));
++	if (ret)
++		return dev_err_probe(pi->dev, ret, "failed to clear events\n");
++	memcpy(pi->seen, ev, sizeof(ev));
++	memcpy(pi->last, ev, sizeof(ev));
++	dev_info(pi->dev, "events at probe: %*ph\n", APMIC_IRQ_NREGS, ev);
++
++	ret = devm_request_threaded_irq(pi->dev, irq, NULL,
++					apple_pmic_irq_thread,
++					IRQF_ONESHOT | IRQF_NO_AUTOEN,
++					dev_name(pi->dev), pi);
++	if (ret)
++		return dev_err_probe(pi->dev, ret,
++				     "failed to request interrupt %d\n", irq);
++
++	pi->window = jiffies;
++	pi->parent_irq = irq;
++	enable_irq(irq);
++
++	return 0;
++}
++
++static int apple_pmic_irq_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct apple_pmic_irq *pi;
++	u32 reg;
++	int irq, ret;
++
++	ret = of_property_read_u32_index(dev->of_node, "reg", 0, &reg);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to read reg\n");
++
++	pi = devm_kzalloc(dev, sizeof(*pi), GFP_KERNEL);
++	if (!pi)
++		return -ENOMEM;
++
++	pi->dev = dev;
++	pi->base = reg;
++	memset(pi->mask, 0xff, sizeof(pi->mask));
++	memset(pi->hw_mask, 0xff, sizeof(pi->hw_mask));
++
++	pi->regmap = dev_get_regmap(dev->parent, NULL);
++	if (!pi->regmap)
++		return dev_err_probe(dev, -ENODEV, "parent has no regmap\n");
++
++	ret = devm_mutex_init(dev, &pi->lock);
++	if (ret)
++		return ret;
++
++	irq = platform_get_irq_optional(pdev, 0);
++	if (irq == -EPROBE_DEFER)
++		return irq;
++
++	pi->domain = irq_domain_create_linear(dev_fwnode(dev), APMIC_IRQ_NIRQS,
++					      &apple_pmic_irq_domain_ops, pi);
++	if (!pi->domain)
++		return dev_err_probe(dev, -ENOMEM, "failed to add irq domain\n");
++
++	/*
++	 * From here on probe succeeds: if the parent interrupt can't be used,
++	 * the users of the events still probe and simply never see one.
++	 */
++	if (!enable)
++		dev_info(dev, "disabled by the enable parameter\n");
++	else if (irq <= 0)
++		dev_err(dev, "no parent interrupt: %d\n", irq);
++	else
++		apple_pmic_irq_request_parent(pi, irq);
++
++	platform_set_drvdata(pdev, pi);
++
++	pi->debugfs = debugfs_create_dir(dev_name(dev), NULL);
++	debugfs_create_file("state", 0400, pi->debugfs, pi,
++			    &apple_pmic_irq_state_fops);
++
++	return 0;
++}
++
++static int apple_pmic_irq_suspend_late(struct device *dev)
++{
++	struct apple_pmic_irq *pi = dev_get_drvdata(dev);
++
++	/* Leave only the wake events unmasked, like iOS before sleep */
++	mutex_lock(&pi->lock);
++	pi->suspending = true;
++	apple_pmic_irq_sync(pi);
++	mutex_unlock(&pi->lock);
++
++	return 0;
++}
++
++static int apple_pmic_irq_resume_early(struct device *dev)
++{
++	struct apple_pmic_irq *pi = dev_get_drvdata(dev);
++	bool kick;
++
++	mutex_lock(&pi->lock);
++	pi->suspending = false;
++	apple_pmic_irq_sync(pi);
++	kick = pi->parent_irq > 0 && !pi->dead &&
++	       memchr_inv(pi->deferred, 0, sizeof(pi->deferred));
++	mutex_unlock(&pi->lock);
++
++	/* Deliver what was read while those events were masked */
++	if (kick)
++		irq_wake_thread(pi->parent_irq, pi);
++
++	return 0;
++}
++
++static const struct dev_pm_ops apple_pmic_irq_pm_ops = {
++	LATE_SYSTEM_SLEEP_PM_OPS(apple_pmic_irq_suspend_late,
++				 apple_pmic_irq_resume_early)
++};
++
++static const struct of_device_id apple_pmic_irq_of_match[] = {
++	{ .compatible = "apple,adi-pmic-irq" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, apple_pmic_irq_of_match);
++
++static struct platform_driver apple_pmic_irq_driver = {
++	.probe = apple_pmic_irq_probe,
++	.driver = {
++		.name = "apple-pmic-irq",
++		.of_match_table = apple_pmic_irq_of_match,
++		.pm = pm_sleep_ptr(&apple_pmic_irq_pm_ops),
++		.suppress_bind_attrs = true,
++	},
++};
++builtin_platform_driver(apple_pmic_irq_driver);

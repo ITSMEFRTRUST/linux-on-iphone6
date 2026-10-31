@@ -1,0 +1,36 @@
+#!/bin/bash
+# mknet - build tools/net-user.tgz: TLS for the phone's busybox wget (Alpine's ssl_client, libssl/libcrypto are
+# already in tools/wifi-user.tgz) + the Mozilla CA bundle at the standard path /etc/ssl/certs/ca-certificates.crt
+# (also /etc/ssl/cert.pem). bin/mkblob untars it into the initramfs. Untar at / on a running phone to test.
+# usage: bin/mknet   (needs network for the apk downloads; stage lives in var/net-alpine, gitignored)
+set -e
+cd "$(dirname "$0")/.."
+APK=dl/apk/x/sbin/apk.static
+[ -x $APK ] || { echo "no apk.static (run ui/fetch-deps.sh first)"; exit 1; }
+R=${R:-var/net-alpine}
+# same Alpine release as tools/wifi-user.tgz (v3.22): ssl_client links the libssl.so.3 / libcrypto.so.3 shipped there
+REPO=https://dl-cdn.alpinelinux.org/alpine/${REL:-v3.22}
+rm -rf $R; mkdir -p $R
+$APK --arch aarch64 --root $R --initdb --usermode --no-scripts --allow-untrusted \
+	-X $REPO/main add ssl_client ca-certificates-bundle nftables readline ncurses-libs >/dev/null
+mkdir -p $R/etc/ssl/certs
+[ -f $R/etc/ssl/certs/ca-certificates.crt ] || { echo "no CA bundle in ca-certificates-bundle"; exit 1; }
+[ -e $R/etc/ssl/cert.pem ] || ln -s certs/ca-certificates.crt $R/etc/ssl/cert.pem
+for l in $(readelf -d $R/usr/bin/ssl_client | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p'); do
+	case $l in libssl.so.3|libcrypto.so.3|libc.musl-aarch64.so.1) ;; *) echo "ssl_client needs unexpected $l"; exit 1 ;; esac
+done
+# nft's closure: everything it needs is shipped here — including readline + ncurses, because the
+# firewall hook (44) runs before the BT bundle that also carries libreadline is unpacked
+NFTLIBS="libnftables.so.1 libnftnl.so.11 libmnl.so.0 libjansson.so.4 libgmp.so.10 libreadline.so.8 libncursesw.so.6"
+for f in $R/usr/sbin/nft $(for l in $NFTLIBS; do echo $R/usr/lib/$l; done); do
+	[ -e $f ] || { echo "missing $f"; exit 1; }
+	for l in $(readelf -d $f | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p'); do
+		case " $NFTLIBS libc.musl-aarch64.so.1 " in *" $l "*) ;; *) echo "${f##*/} needs unexpected $l"; exit 1 ;; esac
+	done
+done
+# the versioned files the sonames point to
+LIBS=$(for l in $NFTLIBS; do echo usr/lib/$l usr/lib/$(readlink $R/usr/lib/$l); done)
+tar -C $R --owner=0 --group=0 --numeric-owner -czf tools/net-user.tgz.new \
+	usr/bin/ssl_client etc/ssl/certs/ca-certificates.crt etc/ssl/cert.pem usr/sbin/nft $LIBS
+mv tools/net-user.tgz.new tools/net-user.tgz
+ls -la tools/net-user.tgz; tar tvzf tools/net-user.tgz

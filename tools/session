@@ -1,0 +1,14 @@
+#!/bin/sh
+# session - first-sound run, step by step. Runs ON THE PHONE (/tmp has i2c mem nco.cmd mcamaster tone ampon).
+# usage: sh /tmp/session STEP     1 charger  2 mca  3 measure  4 silence  5 amp  6 tone  7 off
+case ${1:-} in
+1) echo sn2400 0x75 > /sys/bus/i2c/devices/i2c-1/new_device 2>/dev/null; sleep 2
+   cat /sys/class/power_supply/sn2400-charger/current_now ;;
+2) sh /tmp/mcamaster ;;
+3) /tmp/tone m 300 ;;
+4) /tmp/tone z 2 ;;
+5) sh /tmp/ampon ${2:-d8} ;;
+6) /tmp/tone p ${2:-2} ${3:-3} ${4:-1} ;;
+7) sh /tmp/ampon off; /tmp/mem w 0x20a0a8018 0 w 0x20a0a9010 0 >/dev/null; echo stopped ;;
+*) echo "usage: session 1..7" ;;
+esac

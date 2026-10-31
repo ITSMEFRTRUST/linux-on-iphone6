@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 23:01:06 +0000
+Subject: [PATCH 015/138] ASoC: cs35l33: Fix the boost peak current step check
+
+BST_PEAK_CTL counts 15.625 mA steps above 1.85 A, but the driver checks
+that the whole current is a multiple of 15.625 mA. 1.85 A is not one, so
+only off-grid values pass and get rounded down. Check the offset from
+1.85 A instead. The iPhone 6 value 2.75625 A (0xaa, from iOS) is
+rejected today.
+
+TODO before sending: Fixes: tag (driver's initial commit; tree is shallow here)
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ sound/soc/codecs/cs35l33.c | 11 +++++------
+ 1 file changed, 5 insertions(+), 6 deletions(-)
+
+diff --git a/sound/soc/codecs/cs35l33.c b/sound/soc/codecs/cs35l33.c
+index 8661e6628..8b2a73cbb 100644
+--- a/sound/soc/codecs/cs35l33.c
++++ b/sound/soc/codecs/cs35l33.c
+@@ -849,17 +849,16 @@ static int cs35l33_set_bst_ipk(struct snd_soc_component *component, unsigned int
+ 		goto err;
+ 	}
+ 
+-	if (bst % 15625) {
+-		dev_err(component->dev, "Current not a multiple of 15625uA (%d)\n",
++	/* 15.625 mA steps above the 1.85 A minimum */
++	if ((bst - 1850000) % 15625) {
++		dev_err(component->dev,
++			"Current not 1850000uA plus a multiple of 15625uA (%d)\n",
+ 			bst);
+ 		ret = -EINVAL;
+ 		goto err;
+ 	}
+ 
+-	while (bst > 1850000) {
+-		bst -= 15625;
+-		steps++;
+-	}
++	steps = (bst - 1850000) / 15625;
+ 
+ 	regmap_write(cs35l33->regmap, CS35L33_BST_PEAK_CTL,
+ 		steps+0x70);
